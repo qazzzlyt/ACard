@@ -101,3 +101,4 @@ ui_index = 1  # test, show Chinese ui
 config_path, config = load_config()
 app = QApplication(sys.argv)
 open_anki()
+# test
