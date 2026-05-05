@@ -13,7 +13,8 @@
 
 
 ## LunaTranslator Native DLLs
-## Special thanks to the arthur of LunaTranslator HIllya51
+## Special thanks to the arthor of LunaTranslator HIllya51
+## This project received consent from HIllya51
 
 This project redistributes several DLL binaries derived from:
 
