@@ -16,7 +16,7 @@ https://github.com/qazzzlyt/ACard/releases/latest/download/ACard.exe
 
 
 ## LunaTranslator Native DLLs
-## Special thanks to the arthor of LunaTranslator HIllya51
+## Special thanks to the author of LunaTranslator HIllya51
 ## This project received consent from HIllya51
 
 This project redistributes several DLL binaries derived from:
