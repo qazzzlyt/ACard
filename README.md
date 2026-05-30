@@ -40,6 +40,6 @@ Used components:
 Commit:
 461b74e2e27822d84d548f8c3a4cedfa799ae8c7
 
-Support me at: afdian.com/a/ACard
+Support me at: https://afdian.com/a/ACard
 
 Free code signing provided by SignPath.io, certificate by SignPath Foundation.
