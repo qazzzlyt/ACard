@@ -339,6 +339,9 @@ UI_TEXT = {
     'cut': ('Cut', '剪切'),
     'copy': ('Copy', '复制'),
     'paste': ('Paste', '粘贴'),
+    'undo': ('Undo', '撤销'),
+    'redo': ('Redo', '重做'),
+    'search': ('Search', '搜索'),
     'hotkey': ('Hotkey', '快捷键'),
     'use_scroll': ('↑↑↑↑↑Use arrow keys or scroll wheel to playback↑↑↑↑↑',
                    '↑↑↑↑↑按"方向键"或"滑动鼠标滚轮"控制回放↑↑↑↑↑'),
@@ -948,6 +951,7 @@ class OcrHandle(c_void_p):
 
 GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
 
 
 def show_and_exclude_from_capture(window):
@@ -958,7 +962,7 @@ def show_and_exclude_from_capture(window):
         hwnd = int(window.winId())
         ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                     ex_style | WS_EX_NOACTIVATE)
+                                     ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         user32.SetWindowDisplayAffinity(hwnd, 0)
         ok = user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
 
@@ -2048,6 +2052,8 @@ def anki_new_note_after(anki_new_note_time_stamp,anki_id, word):
 
 
 def anki_upload_media(media_byte, filename):
+    filename = re.sub(r'[\\/:*?"<>|]', "", filename)
+    filename = filename.lstrip(" .")
     b64 = base64.b64encode(media_byte).decode("utf-8")
     return invoke("storeMediaFile", filename=filename, data=b64)
 
@@ -4058,22 +4064,60 @@ def on_hotkey_captured():
     window.hotkey_btn.setText(hotkey_to_str(config['hotkey']))
 
 
+def open_default_search(term):
+    term = term.strip()
+    if not term:
+        return
+    try:
+        import winreg, shlex
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
+        ) as k:
+            prog_id = winreg.QueryValueEx(k, "ProgId")[0]
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,
+                            prog_id + r"\shell\open\command") as k:
+            command = winreg.QueryValueEx(k, "")[0]
+        exe = shlex.split(command, posix=False)[0].strip('"')
+        subprocess.Popen([exe, term])
+        return
+    except Exception:
+        pass
+    import webbrowser
+    from urllib.parse import quote_plus
+    webbrowser.open("https://www.google.com/search?q=" + quote_plus(term))
+
+
 def show_custom_context_menu(widget, pos, font_size):
     menu = QMenu(widget)
     menu.setFont(QFont("Microsoft YaHei", font_size))
     menu.setStyleSheet(
-        "QMenu::item:selected { background-color: #444; color: white; }")
+        "QMenu::item:selected { background-color: #444; color: white; }"
+        "QMenu::item:disabled { color: #bbb; }")
 
     cut = menu.addAction(ui('cut'))
     copy = menu.addAction(ui('copy'))
     paste = menu.addAction(ui('paste'))
+    menu.addSeparator()
+    undo = menu.addAction(ui('undo'))
+    redo = menu.addAction(ui('redo')) 
+    menu.addSeparator()
+    search = menu.addAction(ui('search'))
 
     cut.triggered.connect(widget.cut)
     copy.triggered.connect(widget.copy)
     paste.triggered.connect(widget.paste)
+    undo.triggered.connect(widget.undo)
+    redo.triggered.connect(widget.redo)
+    selected = widget.selectedText()
+    search.triggered.connect(lambda: open_default_search(selected))
 
     cut.setEnabled(widget.hasSelectedText())
     copy.setEnabled(widget.hasSelectedText())
+    paste.setEnabled(bool(QApplication.clipboard().text()))
+    undo.setEnabled(widget.isUndoAvailable())
+    redo.setEnabled(widget.isRedoAvailable())
+    search.setEnabled(bool(selected))
 
     menu.exec_(widget.mapToGlobal(pos))
 
@@ -4979,6 +5023,7 @@ def anki_create_model():
           const progEl = document.getElementById("ap-progress");
           const hStart = document.getElementById("ap-h-start");
           const hEnd = document.getElementById("ap-h-end");
+          const HIT_OUTER = parseFloat(getComputedStyle(track).getPropertyValue("--hit-outer")) || 0;
           const zoomEl = document.getElementById("ap-zoom");
           const zoomCanvas = document.getElementById("ap-zoom-canvas");
           const STORAGE_KEY = "ap-range:" + filename;
@@ -5042,6 +5087,10 @@ def anki_create_model():
               hStart.style.left = sp + "%";
               hEnd.style.left = ep + "%";
               const trackW = track.clientWidth;
+              const startAnchor = (sp / 100) * trackW;
+              const endAnchor = (ep / 100) * trackW;
+              hStart.style.setProperty("--hit-outer", Math.max(0, Math.min(HIT_OUTER, startAnchor)) + "px");
+              hEnd.style.setProperty("--hit-outer", Math.max(0, Math.min(HIT_OUTER, trackW - endAnchor)) + "px");
               const gapPx = ((ep - sp) / 100) * trackW;
               const visualW = Math.max(0, Math.min(20, gapPx - 2));
               const startVis = hStart.querySelector(".ap-handle-visual");
@@ -5376,6 +5425,7 @@ def anki_create_model():
               dragging = null;
               dragRect = null;
               zoomEl.style.display = 'none';
+              updateUI();
           }
           addTracked(hStart, "pointerdown", onDown);
           addTracked(hEnd, "pointerdown", onDown);
@@ -6092,8 +6142,9 @@ class LoopbackRecorder:
         with self.lock:
             chunks = list(self.ring)
         if not chunks:
-            snip.audio = b''
-            return
+            if 'snip' in globals():
+                snip.audio = b''
+                return
 
         print(f"first chunk time: {chunks[0][1]:.3f}")
         print(f"last chunk time:  {chunks[-1][1]:.3f}")
@@ -6300,7 +6351,7 @@ window = MainWindow()
 bridge.anki_new_note_done.connect(anki_new_note_after,Qt.BlockingQueuedConnection)
 window.restore_position()
 window.setStyleSheet("background-color: #f0f0f0; color: #000000;")
-window.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+window.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
 window.setWindowOpacity(0.9)
 show_and_exclude_from_capture(window)
 set_qt_layout()
