@@ -4064,28 +4064,30 @@ def on_hotkey_captured():
     window.hotkey_btn.setText(hotkey_to_str(config['hotkey']))
 
 
+google_reachable = False
+
+
+def check_google_reachable():
+    global google_reachable
+    try:
+        urlopen(Request("https://www.google.com/generate_204",
+                        headers={"User-Agent": "Mozilla/5.0"}),
+                timeout=5)
+        google_reachable = True
+    except Exception:
+        google_reachable = False
+
+
 def open_default_search(term):
     term = term.strip()
-    if not term:
-        return
-    try:
-        import winreg, shlex
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
-        ) as k:
-            prog_id = winreg.QueryValueEx(k, "ProgId")[0]
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,
-                            prog_id + r"\shell\open\command") as k:
-            command = winreg.QueryValueEx(k, "")[0]
-        exe = shlex.split(command, posix=False)[0].strip('"')
-        subprocess.Popen([exe, term])
-        return
-    except Exception:
-        pass
+
     import webbrowser
     from urllib.parse import quote_plus
-    webbrowser.open("https://www.google.com/search?q=" + quote_plus(term))
+    if google_reachable:
+        url = "https://www.google.com/search?q=" + quote_plus(term)
+    else:
+        url = "https://www.bing.com/search?q=.com/s?wd=" + quote_plus(term)
+    webbrowser.open(url)
 
 
 def show_custom_context_menu(widget, pos, font_size):
@@ -6016,6 +6018,7 @@ anki_thread = threading.Thread(target=open_anki,
                                args=(anki_path, ),
                                daemon=True)
 anki_thread.start()  # test
+threading.Thread(target=check_google_reachable,daemon=True).start()
 check_dup()
 processing = 3  # global variable to check if some thread is in processing, 0 = in processing, 1 = after new note before audio analysis, 2 = after audio analysis before audio range add to anki, 3 = all done
 session = None  # moji session
