@@ -1196,6 +1196,12 @@ def screenshot_qimg_rgb(sct, mon):
     return qimg.convertToFormat(QImage.Format_RGB888), width, height
 
 
+def prune_play_log():
+    # drop plays whose end is older than the audio buffer window
+    cutoff = time.time() - BUFFER_SECONDS
+    play_log[:] = [(s, e) for (s, e) in list(play_log) if e >= cutoff]
+
+
 class Snip(QWidget):
 
     def __init__(self):
@@ -1335,6 +1341,7 @@ class Snip(QWidget):
         show_and_exclude_from_capture(self)
         #self.activateWindow()
         self.audio = None
+        prune_play_log()
 
     def eventFilter(self, obj, event):
 
@@ -3997,6 +4004,7 @@ def on_pick_anki():
 
 
 _audio_stop_event = threading.Event()
+play_log = []  # (start_time, end_time) wall-clock of each playback
 
 
 def play_audio(event):
@@ -4065,6 +4073,7 @@ def play_audio(event):
             output=True,
             output_device_index=output_device_index)  # None = use default
 
+        play_start = time.time()
         offset = 0
         while offset < len(pcm_data) and not local_stop.is_set():
             chunk = pcm_data[offset:offset + chunk_size]
@@ -4097,6 +4106,7 @@ def play_audio(event):
         stream.stop_stream()
         stream.close()
         p.terminate()
+        play_log.append((play_start, time.time()))
 
     def _rms(pcm, dtype, channels, n_frames):
         """Calculate RMS of first n_frames."""
@@ -4466,6 +4476,25 @@ def analyze_audio(audio_bytes, audio_start_time, rms, rms_moving_average,
                     (subtitle_sentences[i][0] - subtitle_diff_min) /
                     (subtitle_diff_ideal - subtitle_diff_min), 1)
                 break
+
+    for i in range(len(play_log)):
+        s = play_log[i][0]
+        e = play_log[i][1]
+        if e < subtitle_start_time or subtitle_end_time < s:
+            pass
+        elif s < subtitle_start_time and subtitle_end_time < e:
+            subtitle_end_time = subtitle_start_time
+        elif s < subtitle_start_time and e < subtitle_end_time:
+            subtitle_start_time = e
+        elif subtitle_start_time < s and subtitle_end_time < e:
+            subtitle_end_time = s
+        elif subtitle_start_time < s and e < subtitle_end_time:
+            seg_a = s - subtitle_start_time
+            seg_b = subtitle_end_time - e
+            if seg_a * 2 < seg_b:  # normally take before, if too short, take after
+                subtitle_start_time = e
+            else:
+                subtitle_end_time = s
 
     print(f"audio_start_time={audio_start_time:.3f}")
     print(f"audio_end_time={snip.audio_end_time:.3f}")
@@ -6235,6 +6264,7 @@ max_fps = [row[:]
            for row in config['max_fps']]  # Copy to avoid modifying config
 max_record_time = max_fps[-1][0]
 AUDIO_BEFORE_SNIP_SECOND = 60  # when a snip is taken, take this seconds before the snip time as draft audio for further analysis
+BUFFER_SECONDS = max_record_time + AUDIO_BEFORE_SNIP_SECOND
 AUDIO_AFTER_SNIP_SECOND = 15
 
 
@@ -6247,8 +6277,6 @@ class LoopbackRecorder:
 
     BYTES_PER_SAMPLE = CHANNELS * (BITS // 8)
     BYTES_PER_SEC = RATE * BYTES_PER_SAMPLE
-
-    BUFFER_SECONDS = max_record_time + AUDIO_BEFORE_SNIP_SECOND
 
     MAX_BYTES = BYTES_PER_SEC * BUFFER_SECONDS
 
