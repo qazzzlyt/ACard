@@ -314,7 +314,7 @@ BASE = get_base()
 dll = CDLL(os.path.join(BASE, 'CVUtils.dll'))
 native_dll = CDLL(os.path.join(BASE, 'NativeUtils.dll'))
 
-from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow, QWidget, QMenu, QSlider, QToolTip, QLabel, QVBoxLayout, QLineEdit, QHBoxLayout, QToolButton, QStyle, QStyleOptionSlider, QStackedWidget, QComboBox, QPushButton, QSystemTrayIcon, QMenu, QAction
+from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow, QWidget, QMenu, QSlider, QToolTip, QLabel, QVBoxLayout, QLineEdit, QTextEdit, QSizePolicy, QHBoxLayout, QToolButton, QStyle, QStyleOptionSlider, QStackedWidget, QComboBox, QPushButton, QSystemTrayIcon, QMenu, QAction
 from PyQt5.QtCore import Qt, QRect, QEvent, QObject, pyqtSignal, QTimer, QBuffer, QIODevice, QPoint, QMetaObject
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QImage, QCursor, QFont, QIcon
 
@@ -816,9 +816,9 @@ def on_press(key):
             if hasattr(canonical, 'char'
                        ) and canonical.char and canonical.char.lower() == 'c':
                 if window.isVisible():
-                    selected = window.label_spell.selectedText(
-                    ) or window.label_pron.selectedText(
-                    ) or window.label_excerpt.selectedText()
+                    selected = (widget_selected_text(window.label_spell)
+                                or widget_selected_text(window.label_pron)
+                                or widget_selected_text(window.label_excerpt))
                     if selected:
                         window.copy_text_signal.emit(selected)
     elif hotkey_mode == 2:
@@ -966,9 +966,10 @@ def show_and_exclude_from_capture(window):
         user32.SetWindowDisplayAffinity(hwnd, 0)
         ok = user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
 
-
     #if not ok:
     #raise WinError(get_last_error())
+
+
 def frame_interview(fps, cut_target, delete_frame_index):
     # It took me 2 weeks to come up with this algorithm. Quite difficult to fully explain in comments. Contact me if you need more detail. Github qazzzlyt
     # The short explanation is, it takes screenshot and delete old ones, like a deque with maxium length
@@ -1139,6 +1140,9 @@ def screenshot_thread():
         if high_cpu_seconds > 5:
             highest_fps = min(2, highest_fps)
             print('cpu is ' + str(cpu))  # test test need delete
+
+        if hotkey_mode == 2 or processing < 2:
+            highest_fps = min(1, highest_fps)
 
         lowest_frame_interval = 1000 / highest_fps
 
@@ -1548,10 +1552,16 @@ def resize_window_height():
     # search row
     h += window.word.sizeHint().height()
     # labels
-    for label in [window.label_spell, window.label_pron, window.label_excerpt]:
-        if label.text():
-            lh = label.heightForWidth(content_width)
-            h += lh if lh > 0 else label.sizeHint().height()
+    for box in [window.label_spell, window.label_pron]:
+        box.setVisible(True)
+        h += box.sizeHint().height()
+    ex = window.label_excerpt
+    ex.setVisible(True)
+    doc = ex.document()
+    doc.setTextWidth(content_width)
+    eh = int(math.ceil(doc.size().height())) + 8
+    ex.setFixedHeight(eh)
+    h += eh
     # screenshot
     if window.label_screenshot.pixmap():
         h += window.label_screenshot.sizeHint().height()
@@ -1565,7 +1575,7 @@ def after_display(word_info, word, points, audio_bytes, snip_index,
     global processing
     # create new note in anki
     word_info['word'] = word
-    word_info['word_position'] = '[' + str(points[0].x()) + ',' + str(
+    word_info['position'] = '[' + str(points[0].x()) + ',' + str(
         points[0].y()) + '],[' + str(points[1].x()) + ',' + str(
             points[1].y()) + '],[' + str(points[2].x()) + ',' + str(
                 points[2].y()) + '],[' + str(points[3].x()) + ',' + str(
@@ -1629,7 +1639,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
             audio_name = anki_upload_media(audio_mp3, word + str(anki_new_note_time_stamp) + '.mp3')
             if audio_name:
                 fields['audio'] = f'<img src="{audio_name["result"]}">'  # pretend to be a img so anki will not auto delete it. if label it as a sound, anki will force to auto play it, which i do not want
-                fields['audio_range'] = f"{float(play_start_time)},{float(play_end_time)}"
+                fields['range'] = f"{float(play_start_time)},{float(play_end_time)}"
         invoke("updateNoteFields",
                 note={
                     "id": anki_id_processed,
@@ -1978,6 +1988,9 @@ def compute_hog(qimg_full, rect_small):
 
 
 def window_display_word(spell, pron, excerpt, fuzzy, pixmap, change_picture, btn_enabled):
+    fw = QApplication.focusWidget()
+    if fw in (window.label_spell, window.label_pron, window.label_excerpt):
+        fw.clearFocus()
     if change_picture:
         window_change_picture(pixmap)
     window.label_spell.setText(spell.strip())
@@ -1986,10 +1999,12 @@ def window_display_word(spell, pron, excerpt, fuzzy, pixmap, change_picture, btn
         lf = '<br><br>'
     else:
         lf = ''
-    window.label_excerpt.setText(excerpt.strip().removesuffix('<div><br></div>') + lf + fuzzy.strip())
+    window.label_excerpt.setHtml(excerpt.strip().removesuffix('<div><br></div>') + lf + fuzzy.strip())
     set_btn_status(btn_enabled)
+    set_result_editable(btn_enabled)   # not-found -> read-only
     toggle_to_main()
     resize_window_height()
+    update_save_btn_state()
 
 
 def window_change_picture(pixmap):
@@ -2005,8 +2020,9 @@ def window_change_picture(pixmap):
 
 
 def window_display_word_blank():
-    window_display_word(ui('not_found'), '', '', '', '', True, False)
     window.anki_id = None
+    window_display_word('', '', '', '', '', True, False)
+
 
 
 anki_last_new_note = (None,None)  # 0 = time stamp 1 = anki_id
@@ -2047,6 +2063,7 @@ def anki_new_note_after(anki_new_note_time_stamp,anki_id, word):
     if len(anki_list) > 20:
         anki_list.pop()
     window.anki_id = anki_id
+    set_save_baseline()
     processing = 1
     threading.Thread(target=anki_sync, daemon=True).start()
 
@@ -2085,11 +2102,12 @@ def anki_get_and_display(anki_id, anki_check):
     if m:
         mp3_bytes = anki_download_media(m.group(1))
         window.audio_wav = mp3_to_wav(mp3_bytes) if mp3_bytes else None
-        window.start_sec, window.end_sec = map(float, fields['audio_range']['value'].split(','))
-        print(f"[WRITE get_and_display] id={anki_id} range={fields['audio_range']['value']} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
+        window.start_sec, window.end_sec = map(float, fields['range']['value'].split(','))
+        print(f"[WRITE get_and_display] id={anki_id} range={fields['range']['value']} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
     else:
         window.audio_wav = None
     window.anki_id = anki_id
+    set_save_baseline()
     
 
 def anki_delete_note():  # test need more detailed delete
@@ -2254,19 +2272,34 @@ def refresh_word():
         window_display_word(word_info['spell'], word_info['pron'],
                             word_info['excerpt'], word_info['fuzzy'], None,
                             False, True)
-        word_info['word'] = word
-        invoke("updateNoteFields",
-               note={
-                   "id": int(window.anki_id),
-                   "fields": word_info
-               })
-        for i in range(len(anki_list)):
-            if str(anki_list[i][0]) == str(window.anki_id):
-                anki_list[i][1] = word
-                break
-        processing = 3
-        threading.Thread(target=anki_sync, daemon=True).start()
     processing = 3
+
+
+
+def save_word_qt_to_anki():
+    global processing
+    if not window.anki_id:          # nothing to update if no note shown
+        return
+    word = window.word.text()
+    word_info = {
+        'word': word,
+        'spell': window.label_spell.text(),
+        'pron': window.label_pron.text(),
+        'excerpt': window.label_excerpt.toHtml(),
+        'fuzzy': '',  # excerpt box already merges excerpt + fuzzy; clear fuzzy to avoid duplicates
+    }
+    invoke("updateNoteFields",
+            note={
+                "id": int(window.anki_id),
+                "fields": word_info
+            })
+    for i in range(len(anki_list)):
+        if str(anki_list[i][0]) == str(window.anki_id):
+            anki_list[i][1] = word
+            break
+    set_save_baseline()             # content == saved now -> grey out save
+    processing = 3
+    threading.Thread(target=anki_sync, daemon=True).start()
 
 
 def refresh_history_menu():
@@ -3547,6 +3580,54 @@ SRC_LANGS = ["日本語", "中文", "English"]
 DST_LANGS = ["日本語", "中文", "English"]
 
 
+def widget_selected_text(widget):
+    if isinstance(widget, QLineEdit):
+        return widget.selectedText()
+    if isinstance(widget, QTextEdit):
+        return widget.textCursor().selectedText()
+    return ''
+
+
+def clear_widget_selection(widget):
+    if isinstance(widget, QLineEdit):
+        widget.deselect()
+    elif isinstance(widget, QTextEdit):
+        cursor = widget.textCursor()
+        cursor.clearSelection()
+        widget.setTextCursor(cursor)
+
+
+def setup_editable_result_box(widget, all_boxes):
+    base_cls = type(widget)
+    orig_press = widget.mousePressEvent
+
+    def press(event, w=widget, op=orig_press):
+        if not w.isReadOnly():
+            # temporarily allow activation so editing works (window is no-activate)
+            hwnd = int(window.winId())
+            ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                         ex_style & ~WS_EX_NOACTIVATE)
+            windll.user32.SetForegroundWindow(hwnd)
+        for other in all_boxes:
+            if other is not w:
+                clear_widget_selection(other)
+        op(event)
+        if not w.isReadOnly():
+            w.setFocus()
+
+    widget.mousePressEvent = press
+
+    def focus_out(event, w=widget, cls=base_cls):
+        hwnd = int(window.winId())
+        ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                     ex_style | WS_EX_NOACTIVATE)
+        cls.focusOutEvent(w, event)
+
+    widget.focusOutEvent = focus_out
+
+
 def set_qt_layout():
     window.anki_id = None
 
@@ -3658,11 +3739,17 @@ def set_qt_layout():
     window.word.focusOutEvent = word_focus_out
 
     window.search_btn = QToolButton(window)
-    window.search_btn.setText('📝')
+    window.search_btn.setText('🔍')
     window.search_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
     window.search_btn.clicked.connect(refresh_word)
     window.word.returnPressed.connect(window.search_btn.animateClick)
     row.addWidget(window.search_btn)
+
+    window.save_btn = QToolButton(window)
+    window.save_btn.setText('💾')
+    window.save_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    window.save_btn.clicked.connect(save_word_qt_to_anki)
+    row.addWidget(window.save_btn)
 
     window.delete_btn = QToolButton(window)
     window.delete_btn.setText('✖')
@@ -3673,58 +3760,62 @@ def set_qt_layout():
 
     set_btn_status(False)
 
-    window.label_spell = QLabel("", central)
+    sel_style = "selection-background-color: #3399ff; selection-color: white;"
+
+    window.label_spell = QLineEdit("", central)
     window.label_spell.setAlignment(Qt.AlignHCenter)
-    window.label_spell.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    window.label_spell.setFrame(False)
     window.label_spell.setStyleSheet(
-        "QLabel {selection-background-color: #3399ff;selection-color: white;}")
+        "QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 1px; " + sel_style + " }"
+        "QLineEdit:focus { background: #ffffff; border: 1px solid #3399ff; }")
     font = QFont("Microsoft YaHei", font_size_large)
     font.setBold(True)
     window.label_spell.setFont(font)
     main_layout.addWidget(window.label_spell)
 
-    window.label_pron = QLabel("", central)
+    window.label_pron = QLineEdit("", central)
     window.label_pron.setAlignment(Qt.AlignHCenter)
-    window.label_pron.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    window.label_pron.setFrame(False)
     window.label_pron.setStyleSheet(
-        "QLabel {selection-background-color: #3399ff;selection-color: white;}")
+        "QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 1px; " + sel_style + " }"
+        "QLineEdit:focus { background: #ffffff; border: 1px solid #3399ff; }")
     font = QFont("Microsoft YaHei", font_size_small)
     font.setBold(False)
     window.label_pron.setFont(font)
     main_layout.addWidget(window.label_pron)
 
-    window.label_excerpt = QLabel("", central)
-    window.label_excerpt.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-    window.label_excerpt.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    window.label_excerpt = QTextEdit(central)
+    window.label_excerpt.setAcceptRichText(False)   # paste as plain text: keep newlines, drop bold/size
+    window.label_excerpt.setAlignment(Qt.AlignLeft)
+    window.label_excerpt.setFrameStyle(QTextEdit.NoFrame)
+    window.label_excerpt.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    window.label_excerpt.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    window.label_excerpt.document().setDocumentMargin(0)
     window.label_excerpt.setStyleSheet(
-        "QLabel {selection-background-color: #3399ff;selection-color: white;}")
-    window.label_excerpt.setWordWrap(True)
+        "QTextEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; " + sel_style + " }"
+        "QTextEdit:focus { background: #ffffff; border: 1px solid #3399ff; }")
     font = QFont("Microsoft YaHei", font_size_small)
     font.setBold(False)
     window.label_excerpt.setFont(font)
     main_layout.addWidget(window.label_excerpt)
+    window.label_excerpt.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
-    for label in [window.label_spell, window.label_pron, window.label_excerpt]:
-        label.setContextMenuPolicy(Qt.CustomContextMenu)
-        label.customContextMenuRequested.connect(
-            lambda pos, w=label: show_copy_context_menu(
-                w, pos, font_size_small))
+    #window.label_pron.setVisible(False)
+    #window.label_excerpt.setVisible(False)
 
-    def make_clear_others(source_label):
-        orig = source_label.mousePressEvent
+    result_boxes = [window.label_spell, window.label_pron, window.label_excerpt]
+    for box in result_boxes:
+        box.setContextMenuPolicy(Qt.CustomContextMenu)
+        box.customContextMenuRequested.connect(
+            lambda pos, w=box: show_custom_context_menu(w, pos, font_size_small))
+        setup_editable_result_box(box, result_boxes)
 
-        def handler(event):
-            for label in [
-                    window.label_spell, window.label_pron, window.label_excerpt
-            ]:
-                if label is not source_label:
-                    label.setSelection(0, 0)
-            orig(event)
 
-        source_label.mousePressEvent = handler
-
-    for label in [window.label_spell, window.label_pron, window.label_excerpt]:
-        make_clear_others(label)
+    # save lights up whenever any field changes (search result or manual edit)
+    window.word.textChanged.connect(update_save_btn_state)
+    window.label_spell.textChanged.connect(update_save_btn_state)
+    window.label_pron.textChanged.connect(update_save_btn_state)
+    window.label_excerpt.textChanged.connect(update_save_btn_state)
 
     window.label_screenshot = QLabel("", central)
     main_layout.addWidget(window.label_screenshot)
@@ -3838,6 +3929,48 @@ def set_qt_layout():
     donate_row.addWidget(patreon_btn)
 
     settings_layout.addLayout(donate_row)
+
+
+_RESULT_STYLE_RO = {
+    QLineEdit: "QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 1px; selection-background-color: #3399ff; selection-color: white; }",
+    QTextEdit: "QTextEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; selection-background-color: #3399ff; selection-color: white; }",
+}
+_RESULT_STYLE_EDIT = {
+    QLineEdit: _RESULT_STYLE_RO[QLineEdit] + "QLineEdit:focus { background: #ffffff; border: 1px solid #3399ff; }",
+    QTextEdit: _RESULT_STYLE_RO[QTextEdit] + "QTextEdit:focus { background: #ffffff; border: 1px solid #3399ff; }",
+}
+
+
+def set_result_editable(editable):
+    # spell/pron/excerpt are editable only when a real note is shown;
+    # read-only mode keeps text selectable but shows no focus highlight
+    styles = _RESULT_STYLE_EDIT if editable else _RESULT_STYLE_RO
+    for box in (window.label_spell, window.label_pron, window.label_excerpt):
+        box.setReadOnly(not editable)
+        box.setStyleSheet(styles[type(box)])
+
+
+def current_fields():
+    return {
+        'word': window.word.text(),
+        'spell': window.label_spell.text(),
+        'pron': window.label_pron.text(),
+        'excerpt': window.label_excerpt.toHtml(),
+    }
+
+
+def set_save_baseline():
+    # snapshot current content as "saved"; call on load / create / after save
+    window._saved_fields = current_fields()
+    update_save_btn_state()
+
+
+def update_save_btn_state(*_):
+    # light up save only when there is a note AND content differs from the snapshot
+    changed = (window.anki_id is not None
+               and getattr(window, '_saved_fields', None) != current_fields())
+    window.save_btn.setEnabled(changed)
+    window.save_btn.setStyleSheet('' if changed else 'color: grey;')
 
 
 def set_btn_status(enabled):
@@ -4081,7 +4214,14 @@ def check_google_reachable():
 def open_default_search(term):
     term = term.strip()
 
+    # append a "meaning" keyword based on the source language for better web results
+    src = config.get('src_lang', SRC_LANGS[0])
+    suffix = {'日本語': '意味', '中文': '意思', 'English': 'meaning'}.get(src, '')
+    if term and suffix:
+        term = term + ' ' + suffix
+
     import webbrowser
+
     from urllib.parse import quote_plus
     if google_reachable:
         url = "https://www.google.com/search?q=" + quote_plus(term)
@@ -4111,15 +4251,24 @@ def show_custom_context_menu(widget, pos, font_size):
     paste.triggered.connect(widget.paste)
     undo.triggered.connect(widget.undo)
     redo.triggered.connect(widget.redo)
-    selected = widget.selectedText()
+    selected = widget_selected_text(widget)
     search.triggered.connect(lambda: open_default_search(selected))
 
-    cut.setEnabled(widget.hasSelectedText())
-    copy.setEnabled(widget.hasSelectedText())
-    paste.setEnabled(bool(QApplication.clipboard().text()))
-    undo.setEnabled(widget.isUndoAvailable())
-    redo.setEnabled(widget.isRedoAvailable())
-    search.setEnabled(bool(selected))
+    read_only = widget.isReadOnly()
+    if isinstance(widget, QTextEdit):
+        undo_avail = widget.document().isUndoAvailable()
+        redo_avail = widget.document().isRedoAvailable()
+    else:
+        undo_avail = widget.isUndoAvailable()
+        redo_avail = widget.isRedoAvailable()
+    has_sel = bool(selected)
+    cut.setEnabled(has_sel and not read_only)
+    copy.setEnabled(has_sel)
+    paste.setEnabled(bool(QApplication.clipboard().text()) and not read_only)
+    undo.setEnabled(undo_avail and not read_only)
+    redo.setEnabled(redo_avail and not read_only)
+    search.setEnabled(has_sel)
+
 
     menu.exec_(widget.mapToGlobal(pos))
 
@@ -4442,8 +4591,10 @@ def analyze_audio(audio_bytes, audio_start_time, rms, rms_moving_average,
             min_gap_frame_left -= 1
         if min_gap_frame_left < 0:
             trim_start_frame_left -= 1
-            if abs(i - subtitle_start_frame_to_right_to_left) > trim_start_frame_total:
-                trim_start_frame_left -= 3
+            overshoot = abs(i - subtitle_start_frame_to_right_to_left) - trim_start_frame_total
+            if overshoot > 0:
+                # Decay faster the further we overshoot the target window
+                trim_start_frame_left -= 3 + overshoot // 10
         if trim_start_frame_left <= 0:
             trim_start_frame = i
             break
@@ -4788,9 +4939,9 @@ def anki_create_model():
            if (!fname) return;
            if (!window.top._apCache) window.top._apCache = {};
    
-           // Parse audio_range field
+           // Parse range field
            var playTime = null;
-           var rawPT = "{{audio_range}}".trim();
+           var rawPT = "{{range}}".trim();
            if (rawPT) {
                var parts = rawPT.split(",");
                if (parts.length === 2) {
@@ -4963,7 +5114,7 @@ def anki_create_model():
              sv.style.left = displayEl.offsetLeft + 'px';
              sv.style.top = displayEl.offsetTop + 'px';
              document.getElementById('pl').setAttribute('points',
-             [{{word_position}}].map(function(p) { return p[0]*rx + ',' + p[1]*ry; }).join(' '));
+             [{{position}}].map(function(p) { return p[0]*rx + ',' + p[1]*ry; }).join(' '));
          }
          renderScreenshot();
          drawBox();
@@ -5269,7 +5420,7 @@ def anki_create_model():
                   if (initStart === null) {
                   let pt = prerenderedPlayTime;
                   if (!pt) {
-                      const raw = "{{audio_range}}".trim();
+                      const raw = "{{range}}".trim();
                       if (raw) {
                           const parts = raw.split(",");
                           if (parts.length === 2) {
@@ -5319,7 +5470,7 @@ def anki_create_model():
                   });
           })();
           const ZOOM_W = 140, ZOOM_H = 44, ZOOM_SEC = 0.5;
-          const SHOW_ZOOM = false; // 放大镜开关: 改成 true 即可恢复
+          const SHOW_ZOOM = false; // zoom magnifier tog4
           function updateZoom() {
               if (!SHOW_ZOOM || !duration || !dragging) return;
               const t = dragging === 'start' ? startT : endT;
@@ -5411,7 +5562,7 @@ def anki_create_model():
               const dx = p.x - lastClientX;
               lastClientX = p.x;
               const vDist = Math.abs(p.y - downClientY);
-              const speed = Math.max(0.12, 1 - vDist / 350);
+              const speed = Math.max(0.125, 1 - vDist / 200);
               const timeDelta = (dx / dragRect.width) * duration * speed;
               if (dragging === "start") {
                   startT = Math.max(0, Math.min(startT + timeDelta, endT - 0.05));
@@ -5690,7 +5841,7 @@ body.landscape #text-wrap {
   /* ---- handle geometry: tune these, everything below derives from them ---- */
   --vis-w: 20px;     /* visible bracket width (the display box) */
   --hit-up: 20px;    /* hit area extends this far above the display box */
-  --hit-down: 30px;  /* hit area extends this far below the display box */
+  --hit-down: 20px;  /* hit area extends this far below the display box */
   --hit-outer: 50px;  /* hit area past the bracket line (anchored side) */
   --hit-inner: 5px; /* hit area past the bracket's open side */
 }
@@ -5823,9 +5974,9 @@ body.landscape #text-wrap {
         "fuzzy",
         "screenshot",
         "word",
-        "word_position",
+        "position",
         "audio",
-        "audio_range",
+        "range",
         "time",
     ]
     if MODEL_NAME not in (invoke("modelNames") or {}).get("result", []):
@@ -6329,6 +6480,16 @@ def show_tip():
     else:
         tip = alltip[1]
     window.label_spell.setText(random.choice(tip)[ui_index])
+    mon = snip.sct.monitors[config['monitor_index']]
+    fit_w = window.label_spell.fontMetrics().horizontalAdvance(
+        window.label_spell.text()) + 40           # actual text pixel width + margins
+    floor = max(360, int(mon['width'] * 0.2))      # lower bound: keep excerpt readable
+    cap = int(mon['width'] * 0.5)                   # upper bound: avoid over-wide window
+    window.setFixedWidth(max(floor, min(fit_w, cap)))
+    resize_window_height()
+    set_result_editable(False)         # tip is read-only
+    update_save_btn_state()            # no note yet -> save greyed
+
 
 
 def on_quit():
