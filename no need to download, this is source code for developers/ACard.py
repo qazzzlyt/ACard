@@ -1136,7 +1136,7 @@ def screenshot_thread():
             high_cpu_seconds += 1 / highest_fps
         else:
             high_cpu_seconds -= 2 / highest_fps
-            high_cpu_seconds = max(high_cpu_seconds, 0)
+            high_cpu_seconds = min(max(high_cpu_seconds, 0), 10)
         if high_cpu_seconds > 5:
             highest_fps = min(2, highest_fps)
             print('cpu is ' + str(cpu))  # test test need delete
