@@ -4008,6 +4008,10 @@ play_log = []  # (start_time, end_time) wall-clock of each playback
 
 
 def play_audio(event):
+    # clicking the screenshot must not leave a result box in edit mode
+    fw = QApplication.focusWidget()
+    if fw in (window.label_spell, window.label_pron, window.label_excerpt):
+        fw.clearFocus()
     check_processing(2)
 
     def worker():
