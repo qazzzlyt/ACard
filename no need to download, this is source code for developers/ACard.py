@@ -73,11 +73,14 @@ def _generate_exit_bat():
             f':retry\n'
             f'set /a count+=1\n'
             f'if %count% gtr 120 goto delmei\n'
-            f'move /y "{new_exe}" "{cur}" >nul 2>&1\n'
+            # copy overwrites the existing file object in place, so the
+            # desktop icon keeps its position (move = delete + recreate)
+            f'copy /y "{new_exe}" "{cur}" >nul 2>&1\n'
             f'if errorlevel 1 (\n'
             f'    ping -n 2 127.0.0.1 >nul\n'
             f'    goto retry\n'
             f')\n'
+            f'del "{new_exe}"\n'
             f'del "{p}"\n'
         )
     else:
@@ -179,7 +182,7 @@ import datetime
 import uuid
 import sys, psutil
 # Beta expiry date
-BETA_EXPIRY = datetime.date(2026, 6, 30)
+BETA_EXPIRY = datetime.date(2026, 7, 31)
 # Allowed MAC addresses (last 8 hex digits, lowercase, no separators)
 ALLOWED_MAC_SUFFIXES = [
     '2489',  # add allowed suffixes here
@@ -300,6 +303,7 @@ from pathlib import Path
 import pyaudio
 import numpy as np
 import xml.etree.ElementTree as ET
+import unicodedata
 from ctypes import wintypes, CDLL, create_unicode_buffer, CFUNCTYPE, WINFUNCTYPE, Structure, WinDLL, windll, byref, cast, POINTER, pointer, cdll, string_at, sizeof, c_char, c_bool, c_char_p, c_float, c_int, c_int32, c_uint64, c_void_p, c_wchar_p, c_long, c_longlong, c_ulong, c_short, c_size_t
 
 
@@ -1621,8 +1625,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     audio_bytes, play_start_time, play_end_time, debug_frames = analyze_audio(
         audio_bytes, audio_start_time, rms, rms_moving_average,
         frame_duration_ms, snip_index_in_sentences, subtitle_sentences)
-    audio_bytes_normalized = normalize_audio(audio_bytes, rms)
-    audio_wav = pcm_to_wav_bytes(audio_bytes_normalized)  #test
+    audio_wav = pcm_to_wav_bytes(audio_bytes)
 
     anki_id_processed = None
     anki_last_new_note_snapshot = anki_last_new_note  # avoid anki_last_new_note changed during matching
@@ -2335,6 +2338,106 @@ def on_click_snip():
     bridge.click_snip.emit()
 
 
+LOOKUP_ORDER = {
+    # primary first; fallbacks limited to the FROM language, then English
+    ('日本語', '日本語'): ('daijirin', 'jmdict'),
+    ('日本語', '中文'): ('moji', 'daijirin', 'jmdict'),
+    ('日本語', 'English'): ('jmdict', 'daijirin'),
+    ('中文', '日本語'): ('shogakukan', 'xiandai', 'hanying'),
+    ('中文', '中文'): ('xiandai', 'hanying'),
+    ('中文', 'English'): ('hanying', 'xiandai'),
+    ('English', '日本語'): ('genius', 'oxford_en'),
+    ('English', '中文'): ('oxford_zh', 'oxford_en'),
+    ('English', 'English'): ('oxford_en',),
+}
+SRC_LANG_CODE = {'日本語': 'ja', '中文': 'zh', 'English': 'en'}
+
+
+def get_english_base_forms(word):
+    """Rule-based English inflection reversal, most likely first.
+    Irregular forms (ate, mice...) resolve via build-time aliases instead."""
+    cands = [word]
+    w = word.lower()
+
+    def add(x):
+        if len(x) >= 2 and x not in cands:
+            cands.append(x)
+    if w.endswith('ies') and len(w) > 4:
+        add(word[:-3] + 'y')
+    if w.endswith('es') and len(w) > 3:
+        add(word[:-2])
+        add(word[:-1])
+    elif w.endswith('s') and len(w) > 3 and not w.endswith('ss'):
+        add(word[:-1])
+    if w.endswith('ied') and len(w) > 4:
+        add(word[:-3] + 'y')
+    if w.endswith('ed') and len(w) > 3:
+        add(word[:-2])
+        add(word[:-1])
+        if len(w) > 4 and w[-3] == w[-4]:
+            add(word[:-3])          # stopped -> stop
+    if w.endswith('ing') and len(w) > 4:
+        add(word[:-3])
+        add(word[:-3] + 'e')        # making -> make
+        if len(w) > 5 and w[-4] == w[-5]:
+            add(word[:-4])          # running -> run
+    if w.endswith('ier') and len(w) > 4:
+        add(word[:-3] + 'y')        # easier -> easy
+    if w.endswith('iest') and len(w) > 5:
+        add(word[:-4] + 'y')
+    if w.endswith('er') and len(w) > 3:
+        add(word[:-2])
+        add(word[:-1])
+    if w.endswith('est') and len(w) > 4:
+        add(word[:-3])
+        add(word[:-2])
+    return cands
+
+
+def _norm_key(s):
+    """Match build_dict.py key normalization: NFKC + strip all whitespace."""
+    if not s:
+        return ''
+    s = unicodedata.normalize('NFKC', s)
+    return re.sub(r'\s+', '', s)
+
+
+def _key_rows(c, dic, w):
+    return c.execute(
+        "SELECT e.spell, e.pron, e.excerpt, k.key FROM keys k "
+        "JOIN entries e ON e.id = k.entry_id "
+        "WHERE k.dict = ? AND k.key = ? ORDER BY k.rowid",
+        (dic, w)).fetchall()
+
+
+def _lookup_one(c, dic, lang, w):
+    # precedence: case-exact key > alias > case-insensitive key
+    rows = _key_rows(c, dic, w)
+    for r in rows:
+        if r['key'] == w:
+            return r
+    first = None
+    for a in c.execute(
+            "SELECT target FROM aliases WHERE lang = ? AND alias = ?",
+            (lang, w)).fetchall():
+        trows = _key_rows(c, dic, a['target'])
+        hit = None
+        for r in trows:
+            if r['key'] == a['target']:
+                hit = r
+                break
+        if hit is None and trows:
+            hit = trows[0]
+        if hit is not None:
+            if first is None:
+                first = hit
+            if hit['excerpt']:  # first alias target with content wins
+                return hit
+    if first is not None and first['excerpt']:
+        return first
+    if rows:
+        return rows[0]
+    return first
 def search_dict(word):
     result = {
         "spell": word,
@@ -2343,28 +2446,97 @@ def search_dict(word):
         "fuzzy": "",
     }
     word = re.sub(
-        r'^[^\w\u3040-\u30ff\u4e00-\u9fff]+|[^\w\u3040-\u30ff\u4e00-\u9fff]+$',
+        r'^[^\w぀-ヿ一-鿿]+|[^\w぀-ヿ一-鿿]+$',
         '', word)  # remove potential wrong sign from ocr
     src = config.get('src_lang', SRC_LANGS[0])
     dst = config.get('dst_lang', DST_LANGS[0])
-    if src == '日本語' and dst == '日本語':
-        return search_daijirin(word, result)
-    elif src == '日本語' and dst == '中文':
-        return search_moji(word, result)
-    elif src == '日本語' and dst == 'English':
-        return search_jmdict(word, result)
-    elif src == '中文' and dst == '日本語':
-        return search_shogakukan(word, result)
-    elif src == '中文' and dst == '中文':
-        return search_xiandai(word, result)
-    elif src == '中文' and dst == 'English':
-        return search_hanying(word, result)
-    elif src == 'English' and dst == '日本語':
-        return search_genius(word, result)
-    elif src == 'English' and dst == '中文':
-        return search_oald(word, result, show_zh=True)
-    elif src == 'English' and dst == 'English':
-        return search_oald(word, result, show_zh=False)
+    order = LOOKUP_ORDER.get((src, dst))
+    if not order:
+        return result
+    _conn_dict_ready.wait()
+    try:
+        c = _conn_dict.cursor()
+        lang = SRC_LANG_CODE[src]
+
+        if src == '日本語':
+            candidates = get_base_forms(word)
+            hira = kata_to_hira(word)
+            if hira != word:
+                candidates += get_base_forms(hira)
+        elif src == '中文':
+            if not _trad_map:
+                _load_trad_map(_conn_dict)
+            candidates = [word, _to_simp(word)]
+        else:
+            candidates = get_english_base_forms(word)
+        cands = []
+        for w in candidates:
+            n = _norm_key(w)
+            if n and n not in cands:
+                cands.append(n)
+
+        # main hit: primary dict first, then the allowed fallbacks. Only
+        # high matches (exact after conjugation/kana/alias transforms) can
+        # pull in another language; empty hits never block the chain.
+        row = None
+        empty_hit = None
+        for dic in order:
+            for w in cands:
+                r = _lookup_one(c, dic, lang, w)
+                if r is None:
+                    continue
+                if r['excerpt']:
+                    row = r
+                    break
+                if empty_hit is None:
+                    empty_hit = r
+            if row:
+                break
+        if row is None:
+            row = empty_hit
+        if row:
+            result["spell"] = row["spell"]
+            result["pron"] = row["pron"] or ""
+            result["excerpt"] = row["excerpt"] or ""
+
+        # fuzzy: prefix matches from the PRIMARY dict only, so the fuzzy
+        # area stays in the configured language
+        fuzzy_entries = []
+        seen = {result["spell"]} if row else set()
+        for w in cands:
+            frows = c.execute(
+                "SELECT e.spell, e.pron, e.excerpt FROM keys k "
+                "JOIN entries e ON e.id = k.entry_id "
+                "WHERE k.dict = ? AND k.key LIKE ? AND k.key != ? "
+                "GROUP BY e.id ORDER BY MIN(k.rowid) LIMIT 8",
+                (order[0], w + '%', w)).fetchall()
+            for r in frows:
+                if r["spell"] in seen or not r["excerpt"]:
+                    continue
+                seen.add(r["spell"])
+                fuzzy_entries.append(r)
+            if len(fuzzy_entries) >= 4:
+                break
+
+        # promote first fuzzy to main only if nothing was found at all
+        if not row and fuzzy_entries:
+            r0 = fuzzy_entries.pop(0)
+            result["spell"] = r0["spell"]
+            result["pron"] = r0["pron"] or ""
+            result["excerpt"] = r0["excerpt"] or ""
+
+        blocks = []
+        for r in fuzzy_entries[:3]:
+            header = f'{r["spell"]}　{r["pron"]}'.strip()
+            blocks.append(f'{header}<br>{r["excerpt"]}')
+        result["fuzzy"] = "<br><br>".join(blocks)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"dict search fail: {e}")
+
+    return result
 
 
 def get_base_forms(word):
@@ -2596,48 +2768,6 @@ def kata_to_hira(s):
     )
 
 
-def search_hanying(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        if not _trad_map:
-            _load_trad_map(_conn_dict)
-
-        simp_word = _to_simp(word)
-
-        # --- Exact match ---
-        row = c.execute(
-            "SELECT spell, pron, excerpt FROM entries WHERE spell=?",
-            (word, )).fetchone()
-        if not row and simp_word != word:
-            row = c.execute(
-                "SELECT spell, pron, excerpt FROM entries WHERE spell=?",
-                (simp_word, )).fetchone()
-
-        if row:
-            result["spell"] = row["spell"]
-            result["pron"] = row["pron"] or ""
-            result["excerpt"] = row["excerpt"] or ""
-
-        # --- Prefix fuzzy match ---
-        fuzzy_rows = c.execute(
-            "SELECT spell, pron, excerpt FROM entries WHERE spell LIKE ? AND spell != ? LIMIT 3",
-            (f"{simp_word}%", simp_word)).fetchall()
-
-        blocks = []
-        for r in fuzzy_rows:
-            header = f'{r["spell"]}　{r["pron"]}' if r["pron"] else r["spell"]
-            excerpt = r["excerpt"] or ""
-            blocks.append(f'{header}<br>{excerpt}')
-        result["fuzzy"] = "<br><br>".join(blocks)
-
-    except Exception as e:
-        print(f"hanying search fail: {e}")
-
-    return result
-
-
 _trad_map = {}
 
 
@@ -2650,596 +2780,6 @@ def _load_trad_map(conn):
 def _to_simp(word):
     """Convert traditional Chinese characters to simplified using char map."""
     return ''.join(_trad_map.get(c, c) for c in word)
-
-
-def search_xiandai(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        # Load trad map on first call if not yet loaded
-        if not _trad_map:
-            _load_trad_map(_conn_dict)
-
-        simp_word = _to_simp(word)
-
-        # --- Exact match (try original first, then simplified) ---
-        row = c.execute(
-            "SELECT spell, pron, excerpt FROM entries WHERE spell=?",
-            (word, )).fetchone()
-        if not row and simp_word != word:
-            row = c.execute(
-                "SELECT spell, pron, excerpt FROM entries WHERE spell=?",
-                (simp_word, )).fetchone()
-
-        if row:
-            result["spell"] = row["spell"]
-            result["pron"] = row["pron"] or ""
-            result["excerpt"] = row["excerpt"] or ""
-
-        # --- Prefix fuzzy match ---
-        fuzzy_rows = c.execute(
-            "SELECT spell, pron, excerpt FROM entries WHERE spell LIKE ? AND spell != ? LIMIT 3",
-            (f"{simp_word}%", simp_word)).fetchall()
-
-        blocks = []
-        for r in fuzzy_rows:
-            header = f'{r["spell"]}　{r["pron"]}' if r["pron"] else r["spell"]
-            excerpt = r["excerpt"] or ""
-            blocks.append(f'{header}<br>{excerpt}')
-        result["fuzzy"] = "<br><br>".join(blocks)
-
-    except Exception as e:
-        print(f"xiandai search fail: {e}")
-
-    return result
-
-
-def search_daijirin(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        def fmt_excerpt(senses, pos):
-            lines = []
-            if pos:
-                lines.append(f'<i>{pos}</i>')
-            for i, s in enumerate(senses[:3], 1):
-                lines.append(f'{i}. {s}')
-            return '<br>'.join(lines)
-
-        def fetch_exact(w):
-            row = c.execute("SELECT * FROM entries WHERE kanji=?",
-                            (w, )).fetchone()
-            if not row:
-                row = c.execute("SELECT * FROM entries WHERE reading=?",
-                                (w, )).fetchone()
-            return row
-
-        # --- Exact match with base form fallback ---
-        row = None
-        for candidate in get_base_forms(word):
-            row = fetch_exact(candidate)
-            if not row:
-                redir = c.execute("SELECT target FROM redirects WHERE alias=?",
-                                  (candidate, )).fetchone()
-                if redir:
-                    aliases = c.execute(
-                        "SELECT alias FROM redirects WHERE target=? AND alias NOT LIKE '%【%'",
-                        (redir["target"], )).fetchall()
-                    for a in aliases:
-                        row = fetch_exact(a["alias"])
-                        if row:
-                            break
-            if row:
-                break
-
-        if row:
-            senses = json.loads(row["senses"] or "[]")
-            result["spell"] = row["kanji"] or row["reading"]
-            result["pron"] = row["reading"] + (row["accent"] or "")
-            result["excerpt"] = fmt_excerpt(senses, row["pos"])
-
-        # --- Fuzzy: walk base forms as prefixes ---
-        seen_kanji = set()
-        fuzzy_rows = []
-        for candidate in get_base_forms(word):
-            rows = c.execute(
-                "SELECT * FROM entries WHERE kanji LIKE ? AND kanji != ? LIMIT 4",
-                (f"{candidate}%", word)).fetchall()
-            if not rows:
-                rows = c.execute(
-                    "SELECT * FROM entries WHERE reading LIKE ? AND reading != ? LIMIT 4",
-                    (f"{candidate}%", word)).fetchall()
-            for r in rows:
-                key = r["kanji"] or r["reading"]
-                if key not in seen_kanji:
-                    seen_kanji.add(key)
-                    fuzzy_rows.append(r)
-            if len(fuzzy_rows) >= 4:
-                break
-
-        # Promote first fuzzy to main entry if no exact match
-        if not row and fuzzy_rows:
-            r0 = fuzzy_rows[0]
-            senses = json.loads(r0["senses"] or "[]")
-            result["spell"] = r0["kanji"] or r0["reading"]
-            result["pron"] = (r0["reading"] or "") + (r0["accent"] or "")
-            result["excerpt"] = fmt_excerpt(senses, r0["pos"])
-            fuzzy_rows = fuzzy_rows[1:]
-
-        blocks = []
-        for r in fuzzy_rows:
-            senses = json.loads(r["senses"] or "[]")
-            reading = (r["reading"] or "") + (r["accent"] or "")
-            header = f'{r["kanji"] or reading}'.strip()
-            excerpt = fmt_excerpt(senses, r["pos"])
-            blocks.append(f'{header}<br>{excerpt}')
-        result["fuzzy"] = '<br><br>'.join(blocks)
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"daijirin search fail: {e}")
-
-    return result
-
-
-def search_oald(word, result, show_zh=True):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        def resolve(w):
-            row = c.execute(
-                "SELECT target FROM redirects WHERE alias=? COLLATE NOCASE",
-                (w, )).fetchone()
-            return row["target"] if row else w
-
-        def fmt_excerpt(senses, zh):
-            lines = []
-            for i, s in enumerate(senses[:3], 1):
-                defn = s.get("def_zh" if zh else "def_en", "")
-                if defn:
-                    lines.append(f"{i}. {defn}")
-            return "<br>".join(lines)
-
-        # --- Exact match ---
-        target = resolve(word)
-        row = c.execute("SELECT * FROM entries WHERE word=? COLLATE NOCASE",
-                        (target, )).fetchone()
-        if row:
-            senses = json.loads(row["senses"] or "[]")
-            result["spell"] = row["word"]
-            result["pron"] = row["phon_uk"]
-            pos_str = f'<i>{row["pos"]}</i>　' if row["pos"] else ""
-            result["excerpt"] = pos_str + fmt_excerpt(senses, show_zh)
-
-        # --- Fuzzy ---
-        fuzzy_rows = c.execute(
-            "SELECT * FROM entries WHERE word LIKE ? COLLATE NOCASE AND word != ? LIMIT 3",
-            (f"{word}%", target)).fetchall()
-
-        fuzzy_blocks = []
-        for r in fuzzy_rows:
-            senses = json.loads(r["senses"] or "[]")
-            excerpt = fmt_excerpt(senses, show_zh)
-            fuzzy_blocks.append(
-                f'{r["word"]} {r["phon_uk"]}<br><i>{r["pos"]}</i>　{excerpt}')
-
-        result["fuzzy"] = "<br><br>".join(fuzzy_blocks)
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"oald search fail: {e}")
-
-    return result
-
-
-def _parse_genius(val):
-    # spell: strip rank and hdot tags
-    m = re.search(r'<headword class="main"[^>]*>(.*?)</headword>', val)
-    spell_raw = m.group(1) if m else ''
-    spell = re.sub(r'<rank[^>]*>.*?</rank>', '', spell_raw)
-    spell = re.sub(r'<hdot>.*?</hdot>', '', spell)
-    spell = re.sub(r'<hhyphen>.*?</hhyphen>', '', spell)
-    spell = re.sub(r'<[^>]+>', '', spell).strip()
-
-    # pron: content between hatsuon tags
-    pron_m = re.search(r'<hatsuon_start>.*?</hatsuon_start>(.*?)<hatsuon_end>',
-                       val, re.DOTALL)
-    pron = re.sub(r'<[^>]+>', '', pron_m.group(1)).strip() if pron_m else ''
-
-    # pos: first red FM pos tag
-    pos_m = re.search(r'<pos class="red FM">(.*?)</pos>', val)
-    pos = re.sub(r'<[^>]+>', '', pos_m.group(1)).strip() if pos_m else ''
-
-    # excerpt: top 3 numbered senses, bold meanings only
-    sense_groups = re.findall(
-        r'<MeaningG[^>]*class="[^"]*語義[^"]*"[^>]*>(.*?)</MeaningG>', val,
-        re.DOTALL)
-    lines = []
-    for sg in sense_groups[:3]:
-        num_m = re.search(r'<gogibangou[^>]*>(\d+)</gogibangou>', sg)
-        if not num_m:
-            continue
-        bolds = re.findall(r'<b>(.*?)</b>', sg)
-        bolds = [re.sub(r'<[^>]+>', '', b).strip() for b in bolds if b.strip()]
-        if bolds:
-            lines.append(f"({num_m.group(1)}) {'・'.join(bolds[:3])}")
-
-    # fallback for proper nouns / single-sense entries
-    if not lines:
-        pos_group = re.search(
-            r'<MeaningG[^>]*class="[^"]*品詞[^"]*"[^>]*>(.*?)</MeaningG>', val,
-            re.DOTALL)
-        if pos_group:
-            text = re.sub(r'<[^>]+>', '', pos_group.group(1)).strip()
-            text = re.sub(r'^━━\s*\S+\s*', '', text).strip()
-            m = re.search(r'[。．.]', text)
-            lines.append(text[:m.start() + 1] if m else text[:500])
-
-    excerpt = '<br>'.join(lines)
-
-    return spell, pron, pos, excerpt
-
-
-def search_genius(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        row = c.execute("SELECT value FROM dict WHERE key=?",
-                        (word, )).fetchone()
-        if not row:
-            row = c.execute(
-                "SELECT value FROM dict WHERE key=? COLLATE NOCASE",
-                (word, )).fetchone()
-
-        if row:
-            val = row[0]
-            # Follow links
-            for _ in range(5):
-                if val.startswith('@@@LINK='):
-                    r2 = c.execute("SELECT value FROM dict WHERE key=?",
-                                   (val[8:].strip(), )).fetchone()
-                    val = r2[0] if r2 else val
-                    if not val.startswith('@@@LINK='):
-                        break
-                else:
-                    break
-            spell, pron, pos, excerpt = _parse_genius(val)
-            result["spell"] = spell
-            result["pron"] = f'/{pron}/' if pron else ''
-            result["excerpt"] = f'[{pos}] {excerpt}' if pos else excerpt
-
-        # Fuzzy: prefix match
-        fuzzy_rows = c.execute(
-            "SELECT key, value FROM dict WHERE key LIKE ? AND lower(key) != lower(?) LIMIT 5",
-            (f"{word}%", word)).fetchall()
-        fuzzy_blocks = []
-        for r in fuzzy_rows:
-            val = r['value']
-            if val.startswith('@@@LINK='):
-                continue
-            # skip compound/child entries
-            if '<headword class="child">' in val:
-                continue
-            s, p, po, ex = _parse_genius(val)
-            if not s:
-                continue
-            header = f"{s} /{p}/" if p else s
-            fuzzy_blocks.append(
-                f"{header}<br>[{po}] {ex}" if po else f"{header}<br>{ex}")
-        result["fuzzy"] = "<br><br>".join(fuzzy_blocks[:3])
-
-    except Exception as e:
-        print(f"genius search fail: {e}")
-
-    return result
-
-
-def _parse_moji_mdx(html):
-    spell = pron = accent = excerpt = ""
-
-    m = re.search(r'class="entry_name">(.*?)</h3>', html)
-    if m:
-        full = re.sub(r'<[^>]+>', '', m.group(1))
-        m2 = re.match(r'^(.*?)【(.*?)】$', full.strip())
-        if m2:
-            spell = m2.group(1).strip()
-            reading = m2.group(2).strip()
-            am = re.search(r'[①②③④⑤⑥⑦⑧⑨⑩◎]$', reading)
-            if am:
-                accent = am.group(0)
-                pron = reading[:am.start()].strip()
-            else:
-                pron = reading
-        else:
-            spell = full.strip()
-
-    pos_list = re.findall(r'class="cixing_title">(.*?)</div>', html)
-    pos = "·".join(
-        re.sub(r'<[^>]+>', '', p).strip() for p in pos_list[:2] if p.strip())
-
-    exps = re.findall(r'class="explanation">(.*?)</div>', html)
-    exps_clean = [
-        re.sub(r'<[^>]+>', '', e).strip() for e in exps[:3] if e.strip()
-    ]
-
-    parts = []
-    if pos:
-        parts.append(f"[{pos}]")
-    parts.extend(exps_clean)
-    excerpt = " ".join(parts)
-
-    return spell, pron, accent, excerpt
-
-
-def search_moji(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        # --- Exact match with base form fallback ---
-        row = None
-        matched_word = None
-        for candidate in get_base_forms(word):
-            row = c.execute("SELECT value FROM dict WHERE key=?",
-                            (candidate, )).fetchone()
-            if not row:
-                row = c.execute("SELECT value FROM dict WHERE key LIKE ?",
-                                (f"{candidate}【%", )).fetchone()
-            if row:
-                matched_word = candidate
-                break
-
-        # --- Resolve redirects and set main entry on exact match ---
-        if row:
-            val = row[0]
-            for _ in range(5):
-                if val.startswith("@@@LINK="):
-                    r2 = c.execute("SELECT value FROM dict WHERE key=?",
-                                   (val[8:].strip(), )).fetchone()
-                    val = r2[0] if r2 else val
-                    if not val.startswith("@@@LINK="):
-                        break
-                else:
-                    m = re.search(r'href="entry://(.*?)"', val)
-                    if m:
-                        r2 = c.execute("SELECT value FROM dict WHERE key=?",
-                                       (m.group(1).strip(), )).fetchone()
-                        if r2:
-                            val = r2[0]
-                            continue
-                    break
-            spell, pron, accent, excerpt = _parse_moji_mdx(val)
-            result["spell"] = spell
-            result["pron"] = pron + accent
-            result["excerpt"] = excerpt
-
-        # --- Fuzzy: fetch value together; no re-query later ---
-        seen_keys = set()
-        fuzzy_rows = []
-        for candidate in get_base_forms(word):
-            rows = c.execute(
-                "SELECT key, value FROM dict WHERE key GLOB ? AND key LIKE '%【%' LIMIT 4",
-                (f"{candidate}*", )).fetchall()
-            for r in rows:
-                key = r["key"]
-                headword = re.sub(r'【.*?】', '', key).strip()
-                if matched_word and headword == matched_word:
-                    continue  # skip the entry already shown as main
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    fuzzy_rows.append(r)
-            if len(fuzzy_rows) >= 4:
-                break
-
-        # --- Promote first fuzzy to main only if no exact match ---
-        if not row and fuzzy_rows:
-            spell, pron, accent, excerpt = _parse_moji_mdx(fuzzy_rows[0]["value"])
-            result["spell"] = spell
-            result["pron"] = pron + accent
-            result["excerpt"] = excerpt
-            fuzzy_rows = fuzzy_rows[1:]
-
-        # --- Always show at most 3 fuzzy blocks ---
-        fuzzy_blocks = []
-        for r in fuzzy_rows[:3]:
-            fs, fp, fa, fe = _parse_moji_mdx(r["value"])
-            if fs:
-                fuzzy_blocks.append(f"{fs}　{fp + fa}<br>{fe}")
-        result["fuzzy"] = "<br><br>".join(fuzzy_blocks)
-
-    except Exception as e:
-        print(f"moji mdx search fail: {e}")
-
-    return result
-
-
-SKIP_LABELS = {
-    "熟語", "関連", "異読", "成語", "囲み", "主見出し", "発音", "比較", "日:中", "用法", "市制", "大写",
-    "地支", "１", "２", "３", "４", "５"
-}
-NOTE_LABELS = {"補足", "参考", "注意", "語法", "語源", "反義"}
-
-
-def tokenize_shogakukan(html):
-    tokens = []
-    parts = re.split(r'(<[^>]+>)', html)
-    current_color = None
-    buffer = []
-    for part in parts:
-        if not part:
-            continue
-        tag = re.match(r'<font[^>]*color\s*=\s*["\']?\s*(\w+)["\']?', part,
-                       re.IGNORECASE)
-        if tag:
-            text = "".join(buffer).strip()
-            if text:
-                tokens.append((current_color or "plain", text))
-            buffer = []
-            current_color = tag.group(1).lower()
-        elif part.lower() == '</font>':
-            text = "".join(buffer).strip()
-            if text:
-                tokens.append((current_color or "plain", text))
-            buffer = []
-            current_color = None
-        elif re.match(r'<(br|p)[\s/]*>', part, re.IGNORECASE):
-            text = "".join(buffer).strip()
-            if text:
-                tokens.append((current_color or "plain", text))
-            buffer = []
-        elif part.startswith('<'):
-            pass
-        else:
-            buffer.append(part)
-    text = "".join(buffer).strip()
-    if text:
-        tokens.append((current_color or "plain", text))
-    return tokens
-
-
-def parse_shogakukan(html):
-    result = {"spell": "", "pron": "", "excerpt": ""}
-    header = re.search(
-        r'<font[^>]*color\s*=\s*["\']?\s*red["\']?[^>]*>【(.*?)】</font>', html,
-        re.IGNORECASE)
-    if not header:
-        return result
-    result["spell"] = header.group(1).strip()
-    before = html[:header.start()]
-    result["pron"] = re.sub(r'<[^>]+>', '', before).strip()
-
-    tokens = tokenize_shogakukan(html[header.end():])
-
-    sense_lines = []
-    current_line = []
-    skip_example = False
-    skip_block = False
-    domain = ""
-    sense_count = 0
-    in_note_paren = False
-
-    i = 0
-    while i < len(tokens):
-        color, text = tokens[i]
-
-        if color == "green":
-            if text == "例：":
-                skip_example = True
-            elif re.match(r'^〈.+〉$', text):
-                domain = text
-                skip_block = False
-            i += 1
-            continue
-
-        if color == "blue":
-            if not skip_example and not skip_block:
-                current_line.append(text)
-            i += 1
-            continue
-
-        if color in ("black", "plain"):
-            if text == "(" and i + 1 < len(tokens) and tokens[i +
-                                                              1][0] == "red":
-                label = tokens[i + 1][1]
-                label_name = label[1:-1] if re.match(r'^【.+】$', label) else ""
-                if label_name in NOTE_LABELS:
-                    in_note_paren = True
-                    i += 1
-                    continue
-
-            if in_note_paren:
-                if "）" in text:
-                    _, after_paren = text.split("）", 1)
-                    rest = after_paren.strip()
-                    if rest and not skip_example and not skip_block:
-                        current_line.append(rest)
-                    in_note_paren = False
-                i += 1
-                continue
-
-            sense_match = re.match(r'^\((\d+)\)(.*)', text)
-            if sense_match:
-                if current_line:
-                    sense_lines.append(" ".join(current_line))
-                    current_line = []
-                skip_example = False
-                skip_block = False
-                in_note_paren = False
-                sense_count += 1
-                if sense_count > 5:
-                    break
-                num = sense_match.group(1)
-                rest = sense_match.group(2).strip()
-                prefix = f"({num})"
-                if domain:
-                    prefix = f"{domain} {prefix}"
-                    domain = ""
-                current_line.append(f"{prefix} {rest}" if rest else prefix)
-            else:
-                if not skip_example and not skip_block:
-                    current_line.append(text)
-            i += 1
-            continue
-
-        if color == "red":
-            skip_example = False
-            if re.match(r'^【.+】$', text):
-                label = text[1:-1]
-                if label in SKIP_LABELS:
-                    skip_block = True
-                    in_note_paren = False
-                    if current_line:
-                        sense_lines.append(" ".join(current_line))
-                        current_line = []
-                elif label in NOTE_LABELS:
-                    if in_note_paren:
-                        current_line.append(f"[{label}]")
-                    else:
-                        if current_line:
-                            sense_lines.append(" ".join(current_line))
-                            current_line = []
-                        current_line.append(f"[{label}]")
-            i += 1
-            continue
-
-        i += 1
-
-    if current_line:
-        sense_lines.append(" ".join(current_line))
-    if domain:
-        sense_lines.insert(0, domain)
-    result["excerpt"] = "<br>".join(sense_lines)
-    return result
-
-
-def search_shogakukan(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-        row = c.execute("SELECT value FROM dict WHERE key=?",
-                        (word, )).fetchone()
-        if not row:
-            row = c.execute("SELECT value FROM dict WHERE TRIM(key)=?",
-                            (word, )).fetchone()
-        if row:
-            val = row[0]
-            if val.startswith("@@@LINK="):
-                row2 = c.execute("SELECT value FROM dict WHERE key=?",
-                                 (val[8:].strip(), )).fetchone()
-                val = row2[0] if row2 else val
-            parsed = parse_shogakukan(val)
-            result["spell"] = parsed["spell"]
-            result["pron"] = parsed["pron"]
-            result["excerpt"] = parsed.get("excerpt", "")
-    except Exception as e:
-        print(f"shogakukan search fail: {e}")
-    return result
 
 
 POS_MAP = {
@@ -3336,82 +2876,6 @@ POS_MAP = {
     "copula": "Copula",
     "unclassified": "Uncl",
 }
-
-
-def _format_excerpt(senses):
-    lines = []
-    for s in senses[:3]:
-        glosses = ', '.join(s.get('glosses', []))
-        pos = shorten_pos(s.get('pos', []))
-        lines.append(f"[{pos}] {glosses}" if pos else glosses)
-    return "<br>".join(lines)
-
-
-def search_jmdict(word, result):
-    _conn_dict_ready.wait()
-    try:
-        c = _conn_dict.cursor()
-
-        # --- Exact match with base form fallback ---
-        row = None
-        for candidate in get_base_forms(word):
-            row = c.execute(
-                "SELECT kanji, reading, senses FROM entries WHERE kanji = ? LIMIT 1",
-                (candidate, )).fetchone()
-            if not row:
-                row = c.execute(
-                    "SELECT kanji, reading, senses FROM entries WHERE reading = ? LIMIT 1",
-                    (candidate, )).fetchone()
-            if row:
-                break
-
-        if row:
-            result["spell"] = row["kanji"] if row["kanji"] else row["reading"]
-            result["pron"] = row["reading"]
-            result["excerpt"] = _format_excerpt(json.loads(row["senses"]))
-
-        # --- Fuzzy: GLOB prefix uses index range; main entry pre-excluded ---
-        seen_kanji = set()
-        if row:
-            seen_kanji.add(row["kanji"] or row["reading"])
-        fuzzy_rows = []
-        for candidate in get_base_forms(word):
-            rows = c.execute(
-                "SELECT kanji, reading, senses FROM entries WHERE kanji GLOB ? LIMIT 4",
-                (f"{candidate}*", )).fetchall()
-            if not rows:
-                rows = c.execute(
-                    "SELECT kanji, reading, senses FROM entries WHERE reading GLOB ? LIMIT 4",
-                    (f"{candidate}*", )).fetchall()
-            for r in rows:
-                key = r["kanji"] or r["reading"]
-                if key not in seen_kanji:
-                    seen_kanji.add(key)
-                    fuzzy_rows.append(r)
-            if len(fuzzy_rows) >= 4:
-                break
-
-        # --- Promote first fuzzy to main only if no exact match ---
-        if not row and fuzzy_rows:
-            r0 = fuzzy_rows[0]
-            result["spell"] = r0["kanji"] if r0["kanji"] else r0["reading"]
-            result["pron"] = r0["reading"]
-            result["excerpt"] = _format_excerpt(json.loads(r0["senses"]))
-            fuzzy_rows = fuzzy_rows[1:]
-
-        # --- Always show at most 3 fuzzy blocks ---
-        fuzzy_blocks = []
-        for r in fuzzy_rows[:3]:
-            header = f"{r['kanji']} | {r['reading']}" if r['reading'] else r['kanji']
-            excerpt = _format_excerpt(json.loads(r['senses']))
-            fuzzy_blocks.append(f"{header}<br>{excerpt}")
-
-        result["fuzzy"] = "<br><br>".join(fuzzy_blocks)
-
-    except Exception as e:
-        print(f"jmdict search fail: {e}")
-
-    return result
 
 
 def shorten_pos(parts_of_speech):
@@ -4383,17 +3847,6 @@ def pcm_to_wav_bytes(pcm_data, rate=44100, channels=2, bits=16):
     return buf.getvalue()
 
 
-def normalize_audio(audio_bytes, rms, target_peak_rms=0.09):
-    average_rms = np.mean(
-        rms[rms >= np.percentile(rms, 80)])  # take top 20% to calculate rms
-    if average_rms <= target_peak_rms:
-        return audio_bytes
-    gain = target_peak_rms / (average_rms + 1e-6)
-    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-    samples = np.clip(samples * gain, -32768, 32767)
-    return samples.astype(np.int16).tobytes()
-
-
 def detect_audio(audio_bytes, frame_duration_ms):
     rate = recorder.RATE
     channels = recorder.CHANNELS
@@ -5362,10 +4815,33 @@ def anki_create_model():
                   rafId = null;
               }
           }
+          let volCache = { s: -1, e: -1, vol: 1 };
+          function computeVol() {
+              // Peak normalization over the SELECTED range: one constant
+              // gain per segment (no compression), pushed to just under
+              // full scale (no clipping). Checks every channel.
+              volCache = { s: startT, e: endT, vol: 1 };
+              if (!audioBuffer) return;
+              const sr = audioBuffer.sampleRate;
+              const s0 = Math.max(0, Math.floor(startT * sr));
+              let peak = 0;
+              for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+                  const data = audioBuffer.getChannelData(ch);
+                  const s1 = Math.min(Math.floor(endT * sr), data.length);
+                  for (let i = s0; i < s1; i++) {
+                      const a = Math.abs(data[i]);
+                      if (a > peak) peak = a;
+                  }
+              }
+              if (peak < 0.001) return;          // silence: leave it alone
+              volCache.vol = Math.min(0.5 / peak, 8);
+          }
           function playRangeInternal() {
               stopCurrent();
               if (!audioBuffer || !audioCtx || !duration) return;
               if (audioCtx.state === "suspended") audioCtx.resume();
+              if (volCache.s !== startT || volCache.e !== endT) computeVol();
+              const vol = volCache.vol;
               const source = audioCtx.createBufferSource();
               const gain = audioCtx.createGain();
               source.buffer = audioBuffer;
@@ -5397,18 +4873,20 @@ def anki_create_model():
                   Math.min(endVol / MAX_VOL, 1) * MAX_FADE_S,
                   playDur * 0.5
               );
+
               const now = audioCtx.currentTime;
               if (fadeInS > 0) {
                   gain.gain.setValueAtTime(0, now);
-                  gain.gain.linearRampToValueAtTime(1, now + fadeInS);
+                  gain.gain.linearRampToValueAtTime(vol, now + fadeInS);
               } else {
-                  gain.gain.setValueAtTime(1, now);
+                  gain.gain.setValueAtTime(vol, now);
               }
               if (fadeOutS > 0) {
                   const fadeOutStart = now + playDur - fadeOutS;
-                  gain.gain.setValueAtTime(1, fadeOutStart);
+                  gain.gain.setValueAtTime(vol, fadeOutStart);
                   gain.gain.linearRampToValueAtTime(0, fadeOutStart + fadeOutS);
               }
+
               window.top._audio = {
                   node: source,
                   gain: gain,
@@ -5498,7 +4976,8 @@ def anki_create_model():
                   .then(onDecoded)
                   .catch((err) => {
                   document.querySelector(".ap-wrap").innerHTML =
-                      '<div style="color:#c00">Failed to load: ' + filename + "</div>";
+                      '<div style="color:#c00">Failed to load: ' + filename +
+                      '<br>Check if sync is finished</div>';
                   console.log("Audio load failed:", err);
                   });
           })();
@@ -5607,7 +5086,10 @@ def anki_create_model():
               e.preventDefault();
           }
           function onUp() {
-              if (dragging) saveRange();
+              if (dragging) {
+                  saveRange();
+                  computeVol();   // precompute loudness for the new range
+              }
               dragging = null;
               dragRect = null;
               zoomEl.style.display = 'none';
@@ -5681,12 +5163,15 @@ def anki_create_model():
    </div>
 </div>
 <div style="text-align: center">
+   <span id="etymSpell" style="display: none">{{spell}}</span>
    <a
       id="etymBtn"
-      data-spell="{{spell}}"
       href="#"
       onclick="
-      var spell = this.dataset.spell;
+      var d = document.createElement('div');
+      d.innerHTML = document.getElementById('etymSpell').innerHTML.replace(/<[^>]*>/g, ' ');
+
+      var spell = d.textContent.split(String.fromCharCode(160)).join(' ').replace(/ +/g, ' ').trim();
       var kw = /[぀-ヿ㐀-鿿]/u.test(spell) ? '語源' : 'Origin';
       var base = window.useGoogle
           ? 'https://www.google.com/search?q='
@@ -5803,7 +5288,8 @@ def anki_create_model():
 
     {
     const btn = document.getElementById('etymBtn');
-    const kw = /[぀-ヿ㐀-鿿]/u.test(btn.dataset.spell) ? '語源' : 'Origin';
+    const spellText = document.getElementById('etymSpell').textContent;
+    const kw = /[぀-ヿ㐀-鿿]/u.test(spellText) ? '語源' : 'Origin';
     btn.textContent = kw;
     btn.dataset.kw = kw;
     }
@@ -5979,24 +5465,26 @@ body.landscape #text-wrap {
     BACK_TEMPLATE = BACK_TEMPLATE.strip('\n')
     CSS = CSS.strip('\n')
 
-    if ui_index == 0:
+    if ui_index == 1:
         SYNC_UI = (
-            ('time字段为空', 'field "time" is empty'),
-            ('先同步另一设备，再打开同一词条',
-             'sync another device first, then open the same note'),
-            ('导入完成，更新了', 'Import complete, '),
-            ('条记录', 'records updated'),
-            ('解析失败：', 'Error: '),
-            ('1.复制以下文本<br>2.点击Anki的"编辑"<br>3.找到"time"字段并黏贴<br>4.同步本设备<br>5.同步另一设备<br>6.在另一设备打开 <span style="text-decoration:underline">同一词条</span> 并点击"导入音频时间"',
-             '1.Copy below text<br>2.Click "Edit" in Anki<br>3.Paste to field "time"<br>4.Sync this device<br>5.Sync another device<br>6.On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"'
+            ('field "time" is empty', 'time字段为空'),
+            ('sync another device first, then open the same note',
+             '先同步另一设备，再打开同一词条'),
+            ('Import complete, ', '导入完成，更新了'),
+            ('records updated', '条记录'),
+            ('Error: ', '解析失败：'),
+            ('1.Copy below text<br>2.Click "Edit" in Anki<br>3.Paste to field "time"<br>4.Sync this device<br>5.Sync another device<br>6.On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"',
+             '1.复制以下文本<br>2.点击Anki的"编辑"<br>3.找到"time"字段并黏贴<br>4.同步本设备<br>5.同步另一设备<br>6.在另一设备打开 <span style="text-decoration:underline">同一词条</span> 并点击"导入音频时间"'
              ),
-            ('复制音频时间', 'Copy Audio Time'),
-            ('导入音频时间', 'Import Audio Time'),
-            ('关闭', 'Close'),
+            ('Copy Audio Time', '复制音频时间'),
+            ('Import Audio Time', '导入音频时间'),
+            ('Close', '关闭'),
+            ('Failed to load:', '文件获取失败'),
+            ('Check if sync is finished', '检查同步是否完成'),
         )
 
-        for zh, en in SYNC_UI:
-            BACK_TEMPLATE = BACK_TEMPLATE.replace(zh, en)
+        for en, zh in SYNC_UI:
+            BACK_TEMPLATE = BACK_TEMPLATE.replace(en, zh)
 
     need_update_config = False
 
@@ -6211,56 +5699,28 @@ hotkey_mode = 1  # -1 = ignore all, 0 = config, 1 = main, 2 = in snip
 keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 last_moji_search_time = 0
 anki_sync_running = False
-DICT_FILE_MAP = {
-    ('日本語', '日本語'): 'daijirin.db',
-    ('日本語', '中文'): 'moji.db',
-    ('日本語', 'English'): 'jmdict.db',
-    ('中文', '日本語'): 'shogakukan.db',
-    ('中文', '中文'): 'xiandai.db',
-    ('中文', 'English'): 'hanying.db',
-    ('English', '日本語'): 'genius.db',
-    ('English', '中文'): 'oxford.db',
-    ('English', 'English'): 'oxford.db',
-}
+_dict_loading = False
 
 
-def _init_dict(expected_key):
+def _init_dict():
     global _conn_dict
-    filename = DICT_FILE_MAP.get(expected_key)
-    if not filename:
+    path = os.path.join(BASE, 'dict.db')
+    if not os.path.exists(path):
+        print(f'dict.db not found at {path}')
         return
-    conn = sqlite3.connect(os.path.join(BASE, filename),
-                           check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    if _current_dict_key != expected_key:
-        conn.close()
-        return
     _conn_dict = conn
-    # only load trad map for Chinese dictionaries
-    if expected_key[0] == '中文':
-        _load_trad_map(_conn_dict)
     _conn_dict_ready.set()
 
 
 def start_dict():
-    global _current_dict_key, _conn_dict
-
-    new_key = (config.get('src_lang',
-                          SRC_LANGS[0]), config.get('dst_lang', DST_LANGS[0]))
-    new_file = DICT_FILE_MAP.get(new_key)
-    old_file = DICT_FILE_MAP.get(_current_dict_key)
-
-    if new_file == old_file:  # same file, no reload needed
-        _current_dict_key = new_key
-        return
-
-    _conn_dict_ready.clear()
-    if _conn_dict:
-        _conn_dict.close()
-        _conn_dict = None
-
-    _current_dict_key = new_key
-    threading.Thread(target=_init_dict, args=(new_key, ), daemon=True).start()
+    # one unified dict.db serves every language pair: open it once,
+    # switching languages needs no reload
+    global _dict_loading
+    if _conn_dict is None and not _dict_loading:
+        _dict_loading = True
+        threading.Thread(target=_init_dict, daemon=True).start()
 
 
 start_dict()
