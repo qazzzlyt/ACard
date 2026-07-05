@@ -1,4 +1,4 @@
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -246,7 +246,14 @@ class Tee:
             s.flush()
 
 
+_log_file = None
+_log_path = None
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_KEEP_BYTES = 3 * 1024 * 1024
+
+
 def setup_logging():
+    global _log_file, _log_path
     # Determine where the exe (or script) lives
     if getattr(sys, 'frozen', False):
         exe_dir = os.path.dirname(sys.executable)
@@ -259,7 +266,35 @@ def setup_logging():
     # Tee to both original console and log file
     sys.stdout = Tee(sys.__stdout__, log_file)
     sys.stderr = Tee(sys.__stderr__, log_file)
+    _log_file = log_file
+    _log_path = log_path
     print(f'=== {datetime.now().isoformat()} ===')
+
+
+def rotate_log_if_needed():
+    # Run once at exit: if the log grew past the cap, trim it in place,
+    # keeping only the newest tail so there is only ever one file.
+    # Second call is a no-op.
+    global _log_file
+    if _log_file is None:
+        return
+    log_file, _log_file = _log_file, None
+    # Detach std streams so any late write can't hit a closed file
+    sys.stdout = sys.__stdout__ or open(os.devnull, 'w')
+    sys.stderr = sys.__stderr__ or open(os.devnull, 'w')
+    try:
+        log_file.close()
+        if os.path.getsize(_log_path) > LOG_MAX_BYTES:
+            with open(_log_path, 'rb') as f:
+                f.seek(-LOG_KEEP_BYTES, os.SEEK_END)
+                tail = f.read()
+            newline = tail.find(b'\n')  # drop the possibly half-cut first line
+            if newline != -1:
+                tail = tail[newline + 1:]
+            with open(_log_path, 'wb') as f:
+                f.write(tail)
+    except Exception:
+        pass
 
 
 setup_logging()
@@ -666,7 +701,7 @@ def _wm_to_btn_str(wParam, lParam):
 
 
 def _mouse_hook_proc(nCode, wParam, lParam):
-    global lock_length, _rb_down_suppressed, last_slider_time_ms
+    global lock_length, _rb_down_suppressed, last_slider_time_ms, hide_on_click
 
     def passthrough():
         return windll.user32.CallNextHookEx(None, nCode, wParam,
@@ -697,8 +732,9 @@ def _mouse_hook_proc(nCode, wParam, lParam):
         if wParam == WM_LBUTTONDOWN:
             if window.isVisible():
                 info = cast(lParam, POINTER(MSLLHOOKSTRUCT))[0]
-                if QApplication.activePopupWidget() is None and not window.geometry().contains(QPoint(info.pt.x,info.pt.y)):
+                if QApplication.activePopupWidget() is None and not window.geometry().contains(QPoint(info.pt.x,info.pt.y)) and hide_on_click:
                     window.hide_signal.emit()
+                    hide_on_click = False
         return passthrough()
 
     elif hotkey_mode == 2:
@@ -1493,7 +1529,7 @@ class Snip(QWidget):
 
 def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                         audio_bytes, audio_start_time, audio_end_time):
-    global window, lock_length, processing
+    global window, lock_length, processing, hide_on_click
     processing = 0
     ocr_result = run_ocr(image, ocr, on_error, 2)
 
@@ -1530,6 +1566,7 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             #window.setMaximumSize(16777215, 16777215)
             refresh_window(False)
             show_and_exclude_from_capture(window)
+            hide_on_click = True
             if window.isMinimized():
                 window.showNormal()
                 window.raise_()
@@ -1542,6 +1579,7 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             window_display_word_blank()
             refresh_window(False)
             show_and_exclude_from_capture(window)
+            hide_on_click = True
             if window.isMinimized():
                 window.showNormal()
                 window.raise_()
@@ -1573,6 +1611,18 @@ def resize_window_height():
     eh = int(math.ceil(doc.size().height())) + 8
     ex.setFixedHeight(eh)
     h += eh
+    # fuzzy box: sized like excerpt, hidden entirely when empty
+    fz = window.label_fuzzy
+    if fz.toPlainText().strip():
+        fz.setVisible(True)
+        doc = fz.document()
+        doc.setTextWidth(content_width)
+        fh = int(math.ceil(doc.size().height())) + 8
+        fz.setFixedHeight(fh)
+        h += fh
+    else:
+        fz.setVisible(False)
+
     # screenshot
     if window.label_screenshot.pixmap():
         h += window.label_screenshot.sizeHint().height()
@@ -1613,19 +1663,41 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
         time.strftime("%Y%m%d_%H%M%S",
                         time.localtime(audio_start_time)))  #test need delete
     
-    subtitle_sentences, snip_index_in_sentences = detect_subtitle(
-        points, snip_index, audio_start_time, audio_end_time, audio_bytes,
-        rect, word, ocr, on_error,
-        folder_path)  # test need delete, do not need audio bytes
+    os.makedirs(folder_path, exist_ok=True)  #test need delete
+
+    snip_hog, subtitle_sentences, snip_index_in_sentences, rect_small, rect_expanded, direction = detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect)
+    ambiguous_diff_max = 0.15
+    detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
+    
+    #test need delete
+    import csv
+    with open(os.path.join(folder_path, "sentences.csv"), "w",
+              newline="") as f:
+        csv.writer(f).writerows(
+            [["diff_snip", "diff_last", "frame_time", "ocr_same", "ocr_type"]
+             ] + list(subtitle_sentences))
+
     frame_duration_ms = 20
+
     rms, rms_moving_average = detect_audio(audio_bytes, frame_duration_ms)
-    print(
-        f"audio_bytes length: {len(audio_bytes)/recorder.BYTES_PER_SEC:.3f}s, rms frames: {len(rms)}"
-    )
-    audio_bytes, play_start_time, play_end_time, debug_frames = analyze_audio(
-        audio_bytes, audio_start_time, rms, rms_moving_average,
-        frame_duration_ms, snip_index_in_sentences, subtitle_sentences)
+    print(f"audio_bytes length: {len(audio_bytes)/recorder.BYTES_PER_SEC:.3f}s, rms frames: {len(rms)}")
     audio_wav = pcm_to_wav_bytes(audio_bytes)
+    window.end_byte = None       # end of THIS capture is not known yet
+    window.audio_wav = audio_wav
+
+    start_byte, start_frame = analyze_audio_start(audio_bytes, audio_start_time, rms, rms_moving_average,
+                  frame_duration_ms, snip_index_in_sentences,
+                  subtitle_sentences, ambiguous_diff_max)
+    processing = 2
+
+    detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
+    end_byte, end_frame = analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
+                frame_duration_ms, snip_index_in_sentences,
+                subtitle_sentences, ambiguous_diff_max,start_frame)
+
+    audio_bytes_after_trim, play_start_time, play_end_time = analyze_audio_trim(frame_duration_ms, rms, rms_moving_average, start_byte, start_frame, end_byte, end_frame, audio_bytes)
+
+    audio_wav_after_trim = pcm_to_wav_bytes(audio_bytes_after_trim)
 
     anki_id_processed = None
     anki_last_new_note_snapshot = anki_last_new_note  # avoid anki_last_new_note changed during matching
@@ -1636,16 +1708,11 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
         with lock:
             if window.anki_id:
                 if anki_id_processed == int(window.anki_id):
-                    window.audio_wav = audio_wav
-                    window.start_sec = float(play_start_time)
-                    window.end_sec = float(play_end_time)
-                    print(f"[WRITE process_audio] id={anki_id_processed} start={play_start_time:.3f} end={play_end_time:.3f} wavlen={len(audio_wav) if audio_wav else 0}")  # debug
-
-        processing = 2
+                    print(f"[WRITE process_audio] id={anki_id_processed} start={play_start_time:.3f} end={play_end_time:.3f} wavlen={len(audio_wav_after_trim) if audio_wav_after_trim else 0}")  # debug
 
         fields = {}
-        if audio_wav:
-            audio_mp3 = wav_to_mp3(audio_wav)
+        if audio_wav_after_trim:
+            audio_mp3 = wav_to_mp3(audio_wav_after_trim)
             audio_name = anki_upload_media(audio_mp3, word + str(anki_new_note_time_stamp) + '.mp3')
             if audio_name:
                 fields['audio'] = f'<img src="{audio_name["result"]}">'  # pretend to be a img so anki will not auto delete it. if label it as a sound, anki will force to auto play it, which i do not want
@@ -1659,6 +1726,11 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     processing = 3
         
     # test need delete
+    with open(os.path.join(folder_path, "audio.mp3"), "wb") as f:
+        f.write(wav_to_mp3(pcm_to_wav_bytes(audio_bytes)))  # debug dump, moved off the critical path
+    debug_frames = (
+        start_byte, start_frame, end_byte, end_frame, play_start_time, play_end_time
+    )
     import csv
     SENTENCE_COLS = 5  # number of columns in sentences.csv
     with open(os.path.join(folder_path, 'sentences.csv'),
@@ -1781,6 +1853,7 @@ def quad_to_smaller_rect(points):
 
 def detect_subtitle(points, snip_index, audio_start_time, audio_end_time,
                     audio_bytes, rect, word, ocr, on_error, folder_path):
+    return
     global lock_length
 
     # same direction with original ocr
@@ -1819,59 +1892,11 @@ def detect_subtitle(points, snip_index, audio_start_time, audio_end_time,
     if rect_expanded.bottom() > screen_h - 1:
         rect_expanded.setBottom(screen_h - 1)
 
-    # loop left to find start
-    last_hog = snip_hog
-    ocr_budget_ambiguous = 3
-    ocr_budget_move = 2
-    diff_frame_draft_total = 0
-    rect_last_ocr = rect
-    for i in range(snip_index_in_sentences - 1, -1, -1):
-        ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, last_hog, diff_frame_draft_total = sentences_one_compare(
-            i, snip_index_in_sentences, snip_index, sentences, rect_last_ocr,
-            rect_small, rect_expanded, word, ocr_budget_ambiguous, snip_hog,
-            ocr_budget_move, direction, last_hog, diff_frame_draft_total,
-            folder_path)
-        screenshot[i - snip_index_in_sentences + snip_index][0].copy(
-            rect_small
-        ).save(
-            os.path.join(
-                folder_path,
-                f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
-            ))  #test need delete
+    detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,sentences,rect_small,rect_expanded,word,direction,folder_path)
 
-    # loop left to find end
-    last_hog = snip_hog
-    ocr_budget_ambiguous = 3
-    ocr_budget_move = 2
-    diff_frame_draft_total = 0
-    rect_last_ocr = rect
-    for i in range(snip_index_in_sentences + 1, len(sentences)):
-        ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, last_hog, diff_frame_draft_total = sentences_one_compare(
-            i, snip_index_in_sentences, snip_index, sentences, rect_last_ocr,
-            rect_small, rect_expanded, word, ocr_budget_ambiguous, snip_hog,
-            ocr_budget_move, direction, last_hog, diff_frame_draft_total,
-            folder_path)
-        screenshot[i - snip_index_in_sentences + snip_index][0].copy(
-            rect_small
-        ).save(
-            os.path.join(
-                folder_path,
-                f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
-            ))  #test need delete
+    detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,sentences,rect_small,rect_expanded,word,direction,folder_path)
 
-
-#    for i in range(lock_length):
-#        this_frame_time = screenshot[i][1]/1000
-#        if (snip_time - AUDIO_BEFORE_SNIP_SECOND) <= this_frame_time and this_frame_time <= (snip_time + AUDIO_AFTER_SNIP_SECOND):
-#            if i != snip_index:
-#                diff = float(np.linalg.norm(compute_hog(screenshot[i][0], rect_small) - snip_hog))
-#            else:
-#                diff = 0
-#                snip_index_in_sentences = len(sentences)
-#            sentences.append((diff,this_frame_time))
-#            screenshot[i][0].copy(rect_small).save(os.path.join(folder_path, f"{this_frame_time:.3f}.png"))  #test need delete
-
-#test need delete
+    #test need delete
     import csv
     with open(os.path.join(folder_path, "sentences.csv"), "w",
               newline="") as f:
@@ -1887,58 +1912,139 @@ def detect_subtitle(points, snip_index, audio_start_time, audio_end_time,
     return sentences, snip_index_in_sentences
 
 
-def sentences_one_compare(i, snip_index_in_sentences, snip_index, sentences,
+def detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect):
+    # same direction with original ocr
+    # this is because rect will be expanded vertically for further ocr
+    # if no adjustment here, the ocr is more likely to become vertical
+    rect_small = quad_to_smaller_rect(points)
+    w = rect_small.width()
+    h = rect_small.height()
+    if w >= h * 1.8:
+        direction = 0  # horizontal
+    elif h >= w * 1.8:
+        direction = 1  # vertical
+    else:
+        direction = 2  # auto
+
+    sentences = []
+    snip_hog = compute_hog(screenshot[snip_index][0], rect_small)
+
+    for i in range(lock_length):
+        this_frame_time = screenshot[i][1] / 1000
+        if audio_start_time <= this_frame_time and this_frame_time <= audio_end_time:
+            if i == snip_index:
+                snip_index_in_sentences = len(sentences)
+            sentences.append([
+                -1, -1, this_frame_time, -1, ''
+            ])  # (diff_snip,diff_last,time,ocr_same) test need delete last
+
+    # expand rect
+    expand = rect.height() * 5
+    rect_expanded = rect.adjusted(0, -expand, 0, expand)
+    screen_h = screenshot[snip_index][0].height()
+    if rect_expanded.top() < 0:
+        rect_expanded.setTop(0)
+    if rect_expanded.bottom() > screen_h - 1:
+        rect_expanded.setBottom(screen_h - 1)
+        
+    return snip_hog, sentences, snip_index_in_sentences, rect_small, rect_expanded, direction
+
+
+def detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path):
+    # loop left to find start
+    last_hog = snip_hog
+    ocr_budget_ambiguous = 3
+    ocr_budget_move = 2
+    diff_frame_draft_total = 0
+    rect_last_ocr = rect
+    for i in range(snip_index_in_sentences - 1, -1, -1):
+        ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, last_hog, diff_frame_draft_total = sentences_one_compare(
+            i, snip_index_in_sentences, snip_index, subtitle_sentences, rect_last_ocr,
+            rect_small, rect_expanded, word, ocr_budget_ambiguous, snip_hog,
+            ocr_budget_move, direction, last_hog, diff_frame_draft_total,ambiguous_diff_max,
+            folder_path)
+        screenshot[i - snip_index_in_sentences + snip_index][0].copy(
+            rect_small
+        ).save(
+            os.path.join(
+                folder_path,
+                f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
+            ))  #test need delete
+        
+
+def detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path):
+    # loop left to find end
+    last_hog = snip_hog
+    ocr_budget_ambiguous = 3
+    ocr_budget_move = 2
+    diff_frame_draft_total = 0
+    rect_last_ocr = rect
+    for i in range(snip_index_in_sentences + 1, len(subtitle_sentences)):
+        ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, last_hog, diff_frame_draft_total = sentences_one_compare(
+            i, snip_index_in_sentences, snip_index, subtitle_sentences, rect_last_ocr,
+            rect_small, rect_expanded, word, ocr_budget_ambiguous, snip_hog,
+            ocr_budget_move, direction, last_hog, diff_frame_draft_total, ambiguous_diff_max,
+            folder_path)
+        screenshot[i - snip_index_in_sentences + snip_index][0].copy(
+            rect_small
+        ).save(
+            os.path.join(
+                folder_path,
+                f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
+            ))  #test need delete
+
+
+def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sentences,
                           rect_last_ocr, rect_small, rect_expanded, word,
                           ocr_budget_ambiguous, snip_hog, ocr_budget_move,
                           direction, last_hog, diff_frame_draft_total,
-                          folder_path):
+                          ambiguous_diff_max,folder_path):
     ambiguous_diff_min = 0.04
-    ambiguous_diff_max = 0.12
 
     k = i - snip_index_in_sentences + snip_index
     this_hog = compute_hog(screenshot[k][0], rect_small)
     diff_snip = float(np.linalg.norm(this_hog - snip_hog))
-    sentences[i][0] = diff_snip
+    subtitle_sentences[i][0] = diff_snip
     diff_last = float(np.linalg.norm(this_hog - last_hog))
-    sentences[i][1] = diff_last
+    subtitle_sentences[i][1] = diff_last
     if diff_last > ambiguous_diff_min:
         if ambiguous_diff_min < diff_snip and diff_snip < ambiguous_diff_max and ocr_budget_ambiguous > 0:
             ocr_budget_ambiguous -= 1
-            sentences[i][4] = 1
+            subtitle_sentences[i][4] = 1
             rect_last_ocr, rect_small, this_hog = sentences_one_compare_ocr(
-                i, k, rect_last_ocr, direction, sentences, word, rect_expanded,
+                i, k, rect_last_ocr, direction, subtitle_sentences, word, rect_expanded,
                 rect_last_ocr, rect_small, this_hog, folder_path)
-        if diff_snip > ambiguous_diff_min and ocr_budget_move > 0 and sentences[
+        if diff_snip > ambiguous_diff_min and ocr_budget_move > 0 and subtitle_sentences[
                 i][3] != 1:
             ocr_budget_move -= 1
-            sentences[i][4] = 2
+            subtitle_sentences[i][4] = 2
             rect_last_ocr, rect_small, this_hog = sentences_one_compare_ocr(
-                i, k, rect_expanded, direction, sentences, word, rect_expanded,
+                i, k, rect_expanded, direction, subtitle_sentences, word, rect_expanded,
                 rect_last_ocr, rect_small, this_hog, folder_path)
 
-    if sentences[i][3] == 0 or (sentences[i][3] == -1
-                                and sentences[i][0] > ambiguous_diff_max
-                                and sentences[i][1] > ambiguous_diff_max):
+    if subtitle_sentences[i][3] == 0 or (subtitle_sentences[i][3] == -1
+                                and subtitle_sentences[i][0] > ambiguous_diff_max
+                                and subtitle_sentences[i][1] > ambiguous_diff_max):
         diff_frame_draft_total += 1
     if diff_frame_draft_total >= 2:  # avoid unnecessary ocr
         ocr_budget_ambiguous = 0
     return ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, this_hog, diff_frame_draft_total
 
 
-def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, sentences, word,
+def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences, word,
                               rect_expanded, rect_last_ocr, rect_small,
                               this_hog, folder_path):
     img = screenshot[k][0].copy(rect_to_ocr)
     ocr_result = run_ocr(img, ocr, on_error, direction)
     img.save(
         os.path.join(folder_path,
-                     f"{screenshot[k][1]/1000:.3f}-{sentences[i][4]}.png")
+                     f"{screenshot[k][1]/1000:.3f}-{subtitle_sentences[i][4]}.png")
     )  # need delete
     if ocr_result:
         matched = find_match_in_ocr_result(ocr_result, word)
         if matched:
-            sentences[i][3] = 1
-            if sentences[i][4] == 2:
+            subtitle_sentences[i][3] = 1
+            if subtitle_sentences[i][4] == 2:
                 coords = matched[1]
                 offset = rect_expanded.topLeft()
                 points = [
@@ -1952,7 +2058,7 @@ def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, sentences, word,
                 rect_small = quad_to_smaller_rect(points)
             this_hog = compute_hog(screenshot[k][0], rect_small)
         else:
-            sentences[i][3] = 0
+            subtitle_sentences[i][3] = 0
         print(f'{i}_rect_small.jpg: {ocr_result}')
     return rect_last_ocr, rect_small, this_hog
 
@@ -1998,18 +2104,17 @@ def compute_hog(qimg_full, rect_small):
 
 
 def window_display_word(spell, pron, excerpt, fuzzy, pixmap, change_picture, btn_enabled):
-    fw = QApplication.focusWidget()
-    if fw in (window.label_spell, window.label_pron, window.label_excerpt):
+    # QApplication.focusWidget() is None while our window is inactive
+    # (game in foreground), so ask the window for its focus child instead
+    fw = window.focusWidget()
+    if fw is not None:
         fw.clearFocus()
     if change_picture:
         window_change_picture(pixmap)
     window.label_spell.setText(spell.strip())
     window.label_pron.setText(pron.strip())
-    if excerpt and fuzzy:
-        lf = '<br><br>'
-    else:
-        lf = ''
-    window.label_excerpt.setHtml(excerpt.strip().removesuffix('<div><br></div>') + lf + fuzzy.strip())
+    window.label_excerpt.setHtml(excerpt.strip().removesuffix('<div><br></div>'))
+    window.label_fuzzy.setHtml((fuzzy or '').strip())
     set_btn_status(btn_enabled)
     set_result_editable(btn_enabled)   # not-found -> read-only
     toggle_to_main()
@@ -2112,8 +2217,18 @@ def anki_get_and_display(anki_id, anki_check):
     if m:
         mp3_bytes = anki_download_media(m.group(1))
         window.audio_wav = mp3_to_wav(mp3_bytes) if mp3_bytes else None
-        window.start_sec, window.end_sec = map(float, fields['range']['value'].split(','))
-        print(f"[WRITE get_and_display] id={anki_id} range={fields['range']['value']} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
+        start_sec, end_sec = map(float, fields['range']['value'].split(','))
+        # Anki persists seconds; runtime works in PCM bytes. Convert with
+        # the DECODED wav's own format (mp3 output may differ from capture)
+        if window.audio_wav:
+            with wave.open(io.BytesIO(window.audio_wav), 'rb') as wf:
+                bps = wf.getframerate() * wf.getnchannels() * wf.getsampwidth()
+                fb = wf.getnchannels() * wf.getsampwidth()
+            window.start_byte = int(start_sec * bps) // fb * fb
+            window.end_byte = int(end_sec * bps) // fb * fb
+        else:
+            window.start_byte = window.end_byte = 0
+        print(f"[WRITE get_and_display] id={anki_id} range={fields['range']['value']} bytes={window.start_byte}-{window.end_byte} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
     else:
         window.audio_wav = None
     window.anki_id = anki_id
@@ -2122,6 +2237,8 @@ def anki_get_and_display(anki_id, anki_check):
 
 def anki_delete_note():  # test need more detailed delete
     global anki_check_needed
+    if _play_session is not None:
+        _play_session.set_end(STOP_NOW)   # fade out audio of the note being deleted
     window.delete_btn.setChecked(True)
     check_processing(1)
     window.delete_btn.setChecked(False)
@@ -2285,19 +2402,23 @@ def refresh_word():
     processing = 3
 
 
-
 def save_word_qt_to_anki():
     global processing
     if not window.anki_id:          # nothing to update if no note shown
         return
+    # saving ends the edit: drop focus so no box stays in edit mode
+    fw = window.focusWidget()
+    if fw is not None:
+        fw.clearFocus()
     word = window.word.text()
     word_info = {
         'word': word,
         'spell': window.label_spell.text(),
         'pron': window.label_pron.text(),
         'excerpt': window.label_excerpt.toHtml(),
-        'fuzzy': '',  # excerpt box already merges excerpt + fuzzy; clear fuzzy to avoid duplicates
+        'fuzzy': window.label_fuzzy.toHtml() if window.label_fuzzy.toPlainText().strip() else '',
     }
+
     invoke("updateNoteFields",
             note={
                 "id": int(window.anki_id),
@@ -2313,6 +2434,8 @@ def save_word_qt_to_anki():
 
 
 def refresh_history_menu():
+    global hide_on_click
+    hide_on_click = False   # user opened history: they need the UI
     toggle_to_main()
     window.history_menu.clear()
     check_processing(1)
@@ -2458,15 +2581,25 @@ def search_dict(word):
         c = _conn_dict.cursor()
         lang = SRC_LANG_CODE[src]
 
+        trunc_forms = []
         if src == '日本語':
-            candidates = get_base_forms(word)
+            candidates = get_base_forms(word, with_trunc=False)
             hira = kata_to_hira(word)
             if hira != word:
-                candidates += get_base_forms(hira)
+                candidates += get_base_forms(hira, with_trunc=False)
+            # prefix truncations are NOT high matches: they may only
+            # rescue the primary dict, never pull in another language
+            for i in range(len(word) - 1, 1, -1):
+                trunc_forms.append(word[:i])
+                h = kata_to_hira(word[:i])
+                if h != word[:i]:
+                    trunc_forms.append(h)
         elif src == '中文':
             if not _trad_map:
                 _load_trad_map(_conn_dict)
             candidates = [word, _to_simp(word)]
+            for i in range(len(word) - 1, 1, -1):
+                trunc_forms += [word[:i], _to_simp(word[:i])]
         else:
             candidates = get_english_base_forms(word)
         cands = []
@@ -2474,6 +2607,11 @@ def search_dict(word):
             n = _norm_key(w)
             if n and n not in cands:
                 cands.append(n)
+        truncs = []
+        for w in trunc_forms:
+            n = _norm_key(w)
+            if n and n not in cands and n not in truncs:
+                truncs.append(n)
 
         # main hit: primary dict first, then the allowed fallbacks. Only
         # high matches (exact after conjugation/kana/alias transforms) can
@@ -2493,6 +2631,14 @@ def search_dict(word):
             if row:
                 break
         if row is None:
+            # partial-match rescue: truncated prefixes, PRIMARY dict only,
+            # content-bearing hits only
+            for w in truncs:
+                r = _lookup_one(c, order[0], lang, w)
+                if r is not None and r['excerpt']:
+                    row = r
+                    break
+        if row is None:
             row = empty_hit
         if row:
             result["spell"] = row["spell"]
@@ -2503,7 +2649,7 @@ def search_dict(word):
         # area stays in the configured language
         fuzzy_entries = []
         seen = {result["spell"]} if row else set()
-        for w in cands:
+        for w in cands + truncs:
             frows = c.execute(
                 "SELECT e.spell, e.pron, e.excerpt FROM keys k "
                 "JOIN entries e ON e.id = k.entry_id "
@@ -2539,10 +2685,12 @@ def search_dict(word):
     return result
 
 
-def get_base_forms(word):
+def get_base_forms(word, with_trunc=True):
     """
     Return candidate base forms to try, most likely first.
     Rule-based Japanese conjugation reversal, no external dependencies.
+    with_trunc=False: only conjugation/kana transforms ("high match"),
+    no prefix truncations.
     """
     candidates = [word]
 
@@ -2735,8 +2883,9 @@ def get_base_forms(word):
                 candidates.append(stem + s)
 
     # Add prefix truncation candidates, min length 2 (longest first)
-    for i in range(len(word) - 1, 1, -1):
-        candidates.append(word[:i])
+    if with_trunc:
+        for i in range(len(word) - 1, 1, -1):
+            candidates.append(word[:i])
 
     # Katakana -> hiragana fallback (mimetic words stored in hiragana)
     # Apply to word and to every candidate already collected, as a last resort.
@@ -3073,7 +3222,10 @@ def setup_editable_result_box(widget, all_boxes):
     orig_press = widget.mousePressEvent
 
     def press(event, w=widget, op=orig_press):
+        global hide_on_click
         if not w.isReadOnly():
+            # user started editing: they need the UI, disarm auto-hide
+            hide_on_click = False
             # temporarily allow activation so editing works (window is no-activate)
             hwnd = int(window.winId())
             ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -3129,14 +3281,27 @@ def set_qt_layout():
     title_bar.setContentsMargins(title_margin, 0, 0, 0)
     title_bar.setSpacing(0)
 
+    title_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+    title_widget.customContextMenuRequested.connect(
+        lambda pos: show_title_menu(title_widget.mapToGlobal(pos)))
+
+
+    btn_style = "QToolButton { border: none; color: white; } QToolButton:hover { background-color: #444; } QToolButton:checked { background-color: #666; }"
+    close_style = "QToolButton { border: none; color: white; } QToolButton:hover { background-color: #e81123; }"
+
     window.label_title = QLabel("ACard", title_widget)
     window.label_title.setFont(QFont("Microsoft YaHei", font_size_title))
     window.label_title.setStyleSheet("color: #ffffff;")
     title_bar.addWidget(window.label_title)
     title_bar.addStretch()
 
-    btn_style = "QToolButton { border: none; color: white; } QToolButton:hover { background-color: #444; } QToolButton:checked { background-color: #666; }"
-    close_style = "QToolButton { border: none; color: white; } QToolButton:hover { background-color: #e81123; }"
+    window.settings_btn = QToolButton(title_widget)
+    window.settings_btn.setText('⚙')
+    window.settings_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    window.settings_btn.setStyleSheet(btn_style)
+    window.settings_btn.clicked.connect(toggle_settings)
+    window.settings_btn.setCheckable(True)
+    title_bar.addWidget(window.settings_btn)
 
     window.history_btn = QToolButton(title_widget)
     window.history_btn.setText('🕘')
@@ -3149,19 +3314,11 @@ def set_qt_layout():
     window.history_btn.setMenu(window.history_menu)
     title_bar.addWidget(window.history_btn)
 
-    window.settings_btn = QToolButton(title_widget)
-    window.settings_btn.setText('⚙')
-    window.settings_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
-    window.settings_btn.setStyleSheet(btn_style)
-    window.settings_btn.clicked.connect(toggle_settings)
-    window.settings_btn.setCheckable(True)
-    title_bar.addWidget(window.settings_btn)
-
     window.close_btn = QToolButton(title_widget)
-    window.close_btn.setText('✕')
-    window.close_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
-    window.close_btn.clicked.connect(on_quit)
-    window.close_btn.setStyleSheet(close_style)
+    window.close_btn.setText('🗕')
+    window.close_btn.setFont(QFont('Segoe MDL2 Assets', font_size_btn))
+    window.close_btn.clicked.connect(window.hide)
+    window.close_btn.setStyleSheet(btn_style)
     title_bar.addWidget(window.close_btn)
 
     window.stack = QStackedWidget(central)
@@ -3271,10 +3428,21 @@ def set_qt_layout():
     main_layout.addWidget(window.label_excerpt)
     window.label_excerpt.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
+    window.label_fuzzy = QTextEdit(central)
+    window.label_fuzzy.setAcceptRichText(False)   # paste as plain text, same as excerpt
+    window.label_fuzzy.setFrameStyle(QTextEdit.NoFrame)
+    window.label_fuzzy.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    window.label_fuzzy.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    window.label_fuzzy.document().setDocumentMargin(0)
+    window.label_fuzzy.setStyleSheet(_FUZZY_STYLE_RO)
+    window.label_fuzzy.setFont(QFont("Microsoft YaHei", font_size_small))
+    main_layout.addWidget(window.label_fuzzy)
+    window.label_fuzzy.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
     #window.label_pron.setVisible(False)
     #window.label_excerpt.setVisible(False)
 
-    result_boxes = [window.label_spell, window.label_pron, window.label_excerpt]
+    result_boxes = [window.label_spell, window.label_pron, window.label_excerpt, window.label_fuzzy]
     for box in result_boxes:
         box.setContextMenuPolicy(Qt.CustomContextMenu)
         box.customContextMenuRequested.connect(
@@ -3287,6 +3455,8 @@ def set_qt_layout():
     window.label_spell.textChanged.connect(update_save_btn_state)
     window.label_pron.textChanged.connect(update_save_btn_state)
     window.label_excerpt.textChanged.connect(update_save_btn_state)
+    window.label_fuzzy.textChanged.connect(update_save_btn_state)
+
 
     window.label_screenshot = QLabel("", central)
     main_layout.addWidget(window.label_screenshot)
@@ -3367,7 +3537,7 @@ def set_qt_layout():
     window.anki_path_btn = QPushButton(
         config.get('anki_path') or ui('select_anki'))
     window.anki_path_btn.setFont(font_settings)
-    window.anki_path_btn.setMaximumWidth(180)
+
     window.anki_path_btn.clicked.connect(on_pick_anki)
     anki_row.addWidget(anki_label)
     anki_row.addWidget(window.anki_path_btn)
@@ -3401,6 +3571,37 @@ def set_qt_layout():
 
     settings_layout.addLayout(donate_row)
 
+    # align the left label column so all controls start at the same x
+    label_col = [lang_label, screen_label, hotkey_label, anki_label, donate_label]
+    col_w = max(l.sizeHint().width() for l in label_col)
+    for l in label_col:
+        l.setFixedWidth(col_w)
+
+    # compact right column: one uniform width for every row's control
+    # area, sized to the widest natural content so nothing gets cut
+    spacing = lang_row.spacing()
+    if spacing < 0:
+        spacing = 6
+    right_w = max(
+        window.src_lang.sizeHint().width() + arrow.sizeHint().width()
+        + window.dst_lang.sizeHint().width() + 2 * spacing,
+        window.screen_combo.sizeHint().width(),
+        window.hotkey_btn.sizeHint().width(),
+        afdian_btn.sizeHint().width() + patreon_btn.sizeHint().width() + spacing,
+    )
+    right_w = int(right_w * 1.4)   # widen the control column (tune the factor)
+    half = (right_w - arrow.sizeHint().width() - 2 * spacing) // 2
+    window.src_lang.setFixedWidth(half)
+    window.dst_lang.setFixedWidth(half)
+    window.screen_combo.setFixedWidth(right_w)
+    window.hotkey_btn.setFixedWidth(right_w)
+    window.anki_path_btn.setFixedWidth(right_w)
+    dhalf = (right_w - spacing) // 2
+    afdian_btn.setFixedWidth(dhalf)
+    patreon_btn.setFixedWidth(dhalf)
+    for row in (lang_row, screen_row, hotkey_row, anki_row, donate_row):
+        row.insertStretch(1)   # spring after the label: controls hug the right edge
+
 
 _RESULT_STYLE_RO = {
     QLineEdit: "QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 1px; selection-background-color: #3399ff; selection-color: white; }",
@@ -3412,13 +3613,20 @@ _RESULT_STYLE_EDIT = {
 }
 
 
+# fuzzy box keeps its separator line and own text color in both states
+_FUZZY_STYLE_RO = "QTextEdit { background: transparent; border: none; margin-top: 4px; color: #333333; selection-background-color: #3399ff; selection-color: white; }"
+_FUZZY_STYLE_EDIT = _FUZZY_STYLE_RO + "QTextEdit:focus { background: #ffffff; border: 1px solid #3399ff; border-radius: 4px; }"
+
+
 def set_result_editable(editable):
-    # spell/pron/excerpt are editable only when a real note is shown;
+    # spell/pron/excerpt/fuzzy are editable only when a real note is shown;
     # read-only mode keeps text selectable but shows no focus highlight
     styles = _RESULT_STYLE_EDIT if editable else _RESULT_STYLE_RO
     for box in (window.label_spell, window.label_pron, window.label_excerpt):
         box.setReadOnly(not editable)
         box.setStyleSheet(styles[type(box)])
+    window.label_fuzzy.setReadOnly(not editable)
+    window.label_fuzzy.setStyleSheet(_FUZZY_STYLE_EDIT if editable else _FUZZY_STYLE_RO)
 
 
 def current_fields():
@@ -3427,6 +3635,7 @@ def current_fields():
         'spell': window.label_spell.text(),
         'pron': window.label_pron.text(),
         'excerpt': window.label_excerpt.toHtml(),
+        'fuzzy': window.label_fuzzy.toHtml() if window.label_fuzzy.toPlainText().strip() else '',
     }
 
 
@@ -3467,129 +3676,194 @@ def on_pick_anki():
         window.anki_path_btn.setText(elided)
 
 
-_audio_stop_event = threading.Event()
 play_log = []  # (start_time, end_time) wall-clock of each playback
+
+# ---- decoupled start/end playback, integrated 2026-07-04 -------------------
+# Contract: play(start) may begin before END is known; set_end() feeds END
+# later from any thread. d >= F -> per-sample ramp landing exactly on the END
+# sample; d < F (incl. END already passed / STOP_NOW) -> full forward fade,
+# may overshoot END, never hard-cuts. F is loudness-adaptive (50..300 ms).
+CHUNK_FRAMES = 4096        # also the END poll granularity (~93 ms @ 44.1k)
+PROBE_SEC = 0.10           # loudness probe window for fade sizing
+FADE_MIN_SEC = 0.05
+FADE_MAX_SEC = 0.30
+FADE_REF_RMS = 2000.0      # int16 RMS that maps to the longest fade
+STOP_NOW = -1.0            # set_end(STOP_NOW): stop gracefully asap
+
+_play_session = None       # current AudioPlayback, replaced on each play
+
+
+class AudioPlayback:
+
+    def __init__(self, wav_bytes):
+        with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
+            self.rate = wf.getframerate()
+            self.channels = wf.getnchannels()
+            self.sampwidth = wf.getsampwidth()
+            pcm = wf.readframes(wf.getnframes())
+        dtype = np.int16 if self.sampwidth == 2 else np.int32
+        self.frames = np.frombuffer(pcm, dtype=dtype).reshape(-1, self.channels)
+        self.total = self.frames.shape[0]
+        self._end_frame = None     # frames, or -1 = stop now, or None = unknown
+        self.frame_bytes = self.sampwidth * self.channels
+        self._stop = threading.Event()
+        self._thread = None
+
+    def set_end(self, end_sec):
+        """end_sec: seconds from clip start, or STOP_NOW."""
+        if end_sec is not None and end_sec == STOP_NOW:
+            self._end_frame = -1
+        else:
+            self._end_frame = int(end_sec * self.rate)
+
+    def set_end_bytes(self, end_byte):
+        """end_byte: PCM byte offset from clip start (frame-aligned here)."""
+        self._end_frame = int(end_byte) // self.frame_bytes
+
+    def stop_now(self):
+        self._end_frame = -1
+
+    def abort(self):
+        # hard stop, only for "a new playback replaces this one"
+        self._stop.set()
+
+    def _rms(self, a, b):
+        a = max(0, min(int(a), self.total - 1))
+        b = max(a + 1, min(int(b), self.total))
+        seg = self.frames[a:b].astype(np.float32)
+        return float(np.sqrt(np.mean(seg * seg)))
+
+    def _fade_frames(self, probe_a, probe_b):
+        ratio = min(max(self._rms(probe_a, probe_b) / FADE_REF_RMS, 0.0), 1.0)
+        sec = FADE_MIN_SEC + (FADE_MAX_SEC - FADE_MIN_SEC) * ratio
+        return max(1, int(self.rate * sec))
+
+    def _gain_at(self, pos, target):
+        # current landing gain at pos, for click-free forward handoff
+        end_f, F = target
+        return float(min(max((end_f - pos) / F, 0.0), 1.0))
+
+    def _gen(self, start_frame):
+        """Yield gain-applied byte chunks until the stop rule fires."""
+        probe = int(self.rate * PROBE_SEC)
+        pos = start_frame
+        fade_in = min(self._fade_frames(pos, pos + probe),
+                      max(1, (self.total - pos) // 2))
+        target = None    # (end_frame, F) landing target
+        forward = None   # (ramp_start, F, g0) terminal forward fade
+        eof_target = (self.total,
+                      self._fade_frames(self.total - probe, self.total))
+        while pos < self.total and not self._stop.is_set():
+            if forward is None:
+                end = self._end_frame
+                if end is not None and end < 0:  # stop now
+                    forward = (pos, self._fade_frames(pos, pos + probe),
+                               self._gain_at(pos, target or eof_target))
+                elif end is not None:
+                    end_f = min(end, self.total)
+                    if target is None or target[0] != end_f:
+                        F = self._fade_frames(end_f - probe, end_f)
+                        if end_f - pos >= F:
+                            target = (end_f, F)
+                        else:
+                            forward = (pos,
+                                       self._fade_frames(pos, pos + probe),
+                                       self._gain_at(pos, target or eof_target))
+            if forward is not None:
+                ramp_start, F, g0 = forward
+                ramp_end = ramp_start + F
+                if ramp_end <= pos:
+                    break
+                n = min(CHUNK_FRAMES, self.total - pos, ramp_end - pos)
+                idx = np.arange(pos, pos + n)
+                g = g0 * np.clip((ramp_end - idx) / F, 0.0, 1.0)
+                stop_after = pos + n >= ramp_end
+            else:
+                end_f, F = target if target is not None else eof_target
+                n = min(CHUNK_FRAMES, end_f - pos)
+                if n <= 0:
+                    break
+                idx = np.arange(pos, pos + n)
+                g = np.ones(n, dtype=np.float64)
+                m = idx >= end_f - F
+                if m.any():
+                    g[m] = (end_f - idx[m]) / F
+                stop_after = pos + n >= end_f
+            m = idx < start_frame + fade_in
+            if m.any():
+                g[m] = g[m] * ((idx[m] - start_frame) / fade_in)
+            chunk = self.frames[pos:pos + n].astype(np.float32) * g[:, None]
+            yield chunk.astype(self.frames.dtype).tobytes()
+            pos += n
+            if stop_after:
+                break
+
+    def play(self, start_sec):
+        self._play_from(max(0, min(int(start_sec * self.rate), self.total - 1)))
+
+    def play_bytes(self, start_byte):
+        f = int(start_byte) // self.frame_bytes
+        self._play_from(max(0, min(f, self.total - 1)))
+
+    def _play_from(self, start_frame):
+        self._stop.clear()
+
+        def worker():
+            p = pyaudio.PyAudio()
+            # try default output device, fall back to first available
+            output_device_index = None
+            try:
+                p.get_default_output_device_info()
+            except OSError:
+                for i in range(p.get_device_count()):
+                    info = p.get_device_info_by_index(i)
+                    if info.get('maxOutputChannels', 0) > 0:
+                        output_device_index = i
+                        break
+                if output_device_index is None:
+                    p.terminate()
+                    return  # no output device at all, silently abort
+            stream = p.open(format=p.get_format_from_width(self.sampwidth),
+                            channels=self.channels, rate=self.rate,
+                            output=True,
+                            output_device_index=output_device_index)
+            play_start = time.time()
+            for data in self._gen(start_frame):
+                if self._stop.is_set():
+                    break
+                stream.write(data)
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            play_log.append((play_start, time.time()))
+
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
 
 
 def play_audio(event):
-    # clicking the screenshot must not leave a result box in edit mode
-    fw = QApplication.focusWidget()
-    if fw in (window.label_spell, window.label_pron, window.label_excerpt):
+    # clicking the screenshot must not leave a result box in edit mode;
+    # window.focusWidget() also works while the window is inactive
+    fw = window.focusWidget()
+    if fw is not None:
         fw.clearFocus()
     check_processing(2)
 
-    def worker():
-        global _audio_stop_event
+    global _play_session
+    if not hasattr(window, 'audio_wav') or not window.audio_wav:
+        return
+    if window.end_byte is not None and window.end_byte <= window.start_byte:
+        return
+    print(f"[READ play_audio] start_byte={window.start_byte} end_byte={window.end_byte} anki_id={window.anki_id}")  # debug
+    if _play_session is not None:
+        _play_session.abort()
+    _play_session = AudioPlayback(window.audio_wav)
+    _play_session.src_wav = window.audio_wav   # tag: which buffer this session plays
+    _play_session.play_bytes(window.start_byte)
+    if window.end_byte is not None:
+        _play_session.set_end_bytes(window.end_byte)
+    # else: END still being analyzed; analyze_audio_end pushes it live
 
-        if not hasattr(window, 'audio_wav') or not window.audio_wav:
-            return
-
-        # signal previous thread to stop
-        _audio_stop_event.set()
-        _audio_stop_event = threading.Event()
-        local_stop = _audio_stop_event
-
-        with wave.open(io.BytesIO(window.audio_wav), 'rb') as wf:
-            rate = wf.getframerate()
-            channels = wf.getnchannels()
-            sampwidth = wf.getsampwidth()
-            start_frame = int(window.start_sec * rate)
-            end_frame = int(window.end_sec * rate)
-            print(f"[READ play_audio] start={window.start_sec:.3f} end={window.end_sec:.3f} wav_real={wf.getnframes()/rate:.3f}s anki_id={window.anki_id}")  # debug
-            if start_frame >= end_frame:
-                return
-            wf.setpos(start_frame)
-            pcm_data = wf.readframes(end_frame - start_frame)
-
-        dtype = np.int16 if sampwidth == 2 else np.int32
-        chunk_size = 4096 * sampwidth * channels
-        total_frames = len(pcm_data) // (sampwidth * channels)
-
-        probe_frames = min(int(rate * 0.1), total_frames // 4)
-
-        rms_start = _rms(pcm_data, dtype, channels, probe_frames)
-        rms_end = _rms(pcm_data[-(probe_frames * sampwidth * channels):],
-                       dtype, channels, probe_frames)
-
-        fade_in_frames = min(_loudness_to_fade(rms_start, rate),
-                             total_frames // 2)
-        fade_out_frames = min(_loudness_to_fade(rms_end, rate),
-                              total_frames // 2)
-
-        p = pyaudio.PyAudio()
-
-        # Try default device first, fall back to first available output device
-        output_device_index = None
-        try:
-            # Check if a default output device exists
-            p.get_default_output_device_info()
-        except OSError:
-            # No default device — find the first available output device
-            for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
-                if info.get('maxOutputChannels', 0) > 0:
-                    output_device_index = i
-                    break
-            if output_device_index is None:
-                p.terminate()
-                return  # No output device at all, silently abort
-
-        stream = p.open(
-            format=p.get_format_from_width(sampwidth),
-            channels=channels,
-            rate=rate,
-            output=True,
-            output_device_index=output_device_index)  # None = use default
-
-        play_start = time.time()
-        offset = 0
-        while offset < len(pcm_data) and not local_stop.is_set():
-            chunk = pcm_data[offset:offset + chunk_size]
-            samples = np.frombuffer(chunk, dtype=dtype).copy()
-            frame_offset = offset // (sampwidth * channels)
-
-            # fade in at start
-            for i in range(len(samples) // channels):
-                global_frame = frame_offset + i
-                if global_frame < fade_in_frames:
-                    vol = global_frame / fade_in_frames
-                    samples[i * channels:(i + 1) *
-                            channels] = (samples[i * channels:(i + 1) *
-                                                 channels].astype(np.float32) *
-                                         vol).astype(dtype)
-
-            # fade out near end or when stopped
-            for i in range(len(samples) // channels):
-                remaining_frames = total_frames - frame_offset - i
-                if remaining_frames < fade_out_frames:
-                    vol = remaining_frames / fade_out_frames
-                    samples[i * channels:(i + 1) *
-                            channels] = (samples[i * channels:(i + 1) *
-                                                 channels].astype(np.float32) *
-                                         vol).astype(dtype)
-
-            stream.write(samples.tobytes())
-            offset += chunk_size
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-        play_log.append((play_start, time.time()))
-
-    def _rms(pcm, dtype, channels, n_frames):
-        """Calculate RMS of first n_frames."""
-        samples = np.frombuffer(pcm[:n_frames * channels *
-                                    np.dtype(dtype).itemsize],
-                                dtype=dtype).astype(np.float32)
-        return np.sqrt(np.mean(samples**2))
-
-    def _loudness_to_fade(rms, rate, min_sec=0.05, max_sec=0.3, ref=2000.0):
-        """Map RMS loudness to fade duration in frames. Louder = longer fade."""
-        ratio = np.clip(rms / ref, 0.0, 1.0)
-        fade_sec = min_sec + (max_sec - min_sec) * ratio
-        return int(rate * fade_sec)
-
-    threading.Thread(target=worker, daemon=True).start()
 
 
 def on_src_lang_changed(index):
@@ -3690,6 +3964,8 @@ def check_google_reachable():
 
 
 def open_default_search(term):
+    global hide_on_click
+    hide_on_click = False
     term = term.strip()
 
     # append a "meaning" keyword based on the source language for better web results
@@ -3805,6 +4081,8 @@ def _reinit_snip_main_thread():
 
 
 def toggle_settings():
+    global hide_on_click
+    hide_on_click = False   # user opened settings: they need the UI
     if window.stack.currentIndex() == 0:
         toggle_to_setting()
     else:
@@ -3821,9 +4099,20 @@ def toggle_to_setting():
     window.stack.setCurrentIndex(1)
     window.settings_btn.setChecked(True)
 
+    def re_elide():
+        # re-fit the anki path to the button's current width
+        path = config.get('anki_path')
+        if path:
+            metrics = window.anki_path_btn.fontMetrics()
+            window.anki_path_btn.setText(
+                metrics.elidedText(path, Qt.ElideMiddle,
+                                   window.anki_path_btn.width() - 10))
+
+    QTimer.singleShot(0, re_elide)   # after the page is laid out
+
 
 def check_processing(target_processing_stage):
-    for i in range(100):
+    for i in range(40):
         if processing >= target_processing_stage:
             break
         else:
@@ -3872,15 +4161,267 @@ def detect_audio(audio_bytes, frame_duration_ms):
     return rms, rms_moving_average
 
 
+def analyze_audio_start(audio_bytes, audio_start_time, rms, rms_moving_average,
+                  frame_duration_ms, snip_index_in_sentences,
+                  subtitle_sentences, ambiguous_diff_max):
+    subtitle_start_time = 0
+    # get start and end from subtitle
+    subtitle_diff_left = 1
+    subtitle_diff_triggered = False
+
+    for i in range(snip_index_in_sentences, -1, -1):
+        if subtitle_sentences[i][3] == -1:
+            if subtitle_sentences[i][0] < ambiguous_diff_max or (
+                    subtitle_sentences[i][1] < ambiguous_diff_max
+                    and not subtitle_diff_triggered):
+                matched = True
+            else:
+                matched = False
+        elif subtitle_sentences[i][3] == 0:
+            matched = False
+        elif subtitle_sentences[i][3] == 1:
+            matched = True
+        if matched:
+            subtitle_start_time = subtitle_sentences[i][2]
+        else:
+            subtitle_diff_left -= 1
+            subtitle_diff_triggered = True
+            if subtitle_diff_left <= 0:
+                break
+    
+    for i in range(len(play_log)):
+        s = play_log[i][0]
+        e = play_log[i][1]
+        if s < subtitle_start_time and subtitle_start_time < e:
+            subtitle_start_time = e
+
+    subtitle_start_frame = time_to_audio_frame(audio_start_time,
+                                               frame_duration_ms, len(rms),
+                                               subtitle_start_time)
+
+    # shift start to middle to find first letter
+    one_letter_audio_ms = 100
+    letter_audio_frame_target = one_letter_audio_ms // frame_duration_ms
+    letter_audio_frame_now = 0
+    for i in range(subtitle_start_frame, len(rms)):
+        if rms[i] > 0.005:
+            letter_audio_frame_now += 1
+        else:
+            letter_audio_frame_now -= 2
+            letter_audio_frame_now = max(letter_audio_frame_now, 0)
+        if letter_audio_frame_now >= letter_audio_frame_target:
+            subtitle_start_frame_to_middle = i
+            break
+    else:
+        subtitle_start_frame_to_middle = subtitle_start_frame
+
+    # shift start to side to find blank
+    blank_audio_ms_start = 200
+    blank_frame_target_start = blank_audio_ms_start // frame_duration_ms
+    blank_frame_now = 0
+    for i in range(subtitle_start_frame_to_middle, -1, -1):
+        if rms[i] < 0.01 or rms[i] < rms_moving_average[i]:
+            blank_frame_now += 1
+        else:
+            blank_frame_now -= 2
+            blank_frame_now = max(blank_frame_now, 0)
+        if blank_frame_now >= blank_frame_target_start:
+            subtitle_start_frame_to_middle_to_side = i
+            break
+    else:
+        subtitle_start_frame_to_middle_to_side = 0
+
+    subtitle_start_frame_to_middle_to_side_after_blank_frame, search_ms = check_blank_frame(subtitle_start_frame_to_middle_to_side,-200,rms,rms_moving_average,frame_duration_ms,0)
+    start_byte_frame = int(subtitle_start_frame_to_middle_to_side_after_blank_frame *
+                           frame_duration_ms * recorder.BYTES_PER_SEC / 1000)
+    start_byte = snap_to_min_energy(audio_bytes, start_byte_frame,
+                                        recorder.BYTES_PER_SAMPLE,
+                                        recorder.BYTES_PER_SEC, search_ms)
+    
+    window.start_byte = start_byte
+
+    return start_byte, subtitle_start_frame_to_middle_to_side_after_blank_frame
+
+
+def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
+                  frame_duration_ms, snip_index_in_sentences,
+                  subtitle_sentences,ambiguous_diff_max,start_frame):
+    subtitle_end_time = 0
+    subtitle_diff_left = 1
+    subtitle_diff_triggered = False
+
+    for i in range(snip_index_in_sentences, len(subtitle_sentences)):
+        if subtitle_sentences[i][3] == -1:
+            if subtitle_sentences[i][0] < ambiguous_diff_max or (
+                    subtitle_sentences[i][1] < ambiguous_diff_max
+                    and not subtitle_diff_triggered):
+                matched = True
+            else:
+                matched = False
+        elif subtitle_sentences[i][3] == 0:
+            matched = False
+        elif subtitle_sentences[i][3] == 1:
+            matched = True
+        if matched:
+            subtitle_end_time = subtitle_sentences[i][2]
+        else:
+            subtitle_diff_left -= 1
+            subtitle_diff_triggered = True
+            if subtitle_diff_left <= 0:
+                break
+    
+    subtitle_end_frame = time_to_audio_frame(audio_start_time,
+                                            frame_duration_ms, len(rms),
+                                            subtitle_end_time)
+
+    # shift end to middle to find first letter
+    one_letter_audio_ms = 100
+    letter_audio_frame_target = one_letter_audio_ms // frame_duration_ms
+    letter_audio_frame_now = 0
+    for i in range(subtitle_end_frame, -1, -1):
+        if rms[i] > 0.005:
+            letter_audio_frame_now += 1
+        else:
+            letter_audio_frame_now -= 2
+            letter_audio_frame_now = max(letter_audio_frame_now, 0)
+        if letter_audio_frame_now >= letter_audio_frame_target:
+            subtitle_end_frame_to_middle = i
+            break
+    else:
+        subtitle_end_frame_to_middle = subtitle_end_frame
+
+    # shift end to side to find blank
+    blank_audio_ms_end = 200
+    blank_frame_target_end = blank_audio_ms_end // frame_duration_ms
+    blank_frame_now = 0
+    for i in range(subtitle_end_frame_to_middle, len(rms)):
+        if rms[i] < 0.01 or rms[i] < rms_moving_average[i]:
+            blank_frame_now += 1
+        else:
+            blank_frame_now -= 2
+            blank_frame_now = max(blank_frame_now, 0)
+        if blank_frame_now >= blank_frame_target_end:
+            subtitle_end_frame_to_middle_to_side = i
+            break
+    else:
+        subtitle_end_frame_to_middle_to_side = len(rms) - 1
+
+
+    subtitle_end_frame_to_middle_to_side_after_blank_frame, search_ms = check_blank_frame(subtitle_end_frame_to_middle_to_side,400,rms,rms_moving_average,frame_duration_ms,0)
+    subtitle_end_frame_to_middle_to_side_after_blank_frame = max(subtitle_end_frame_to_middle_to_side_after_blank_frame,start_frame)
+
+    end_bytes_frame = int(subtitle_end_frame_to_middle_to_side_after_blank_frame *
+                         frame_duration_ms * recorder.BYTES_PER_SEC / 1000)
+    end_byte = snap_to_min_energy(audio_bytes, end_bytes_frame ,
+                                        recorder.BYTES_PER_SAMPLE,
+                                        recorder.BYTES_PER_SEC, search_ms)
+    
+    window.end_byte = end_byte
+    # deliver END to the live session if it is playing THIS capture
+    if _play_session is not None and getattr(_play_session, 'src_wav', None) is window.audio_wav:
+        _play_session.set_end_bytes(end_byte)
+
+    return end_byte, subtitle_end_frame_to_middle_to_side_after_blank_frame
+    # check if abnormal number
+    #if subtitle_start_frame_to_right > subtitle_end_frame_to_left:
+        #subtitle_start_frame_to_right = subtitle_start_frame
+        #subtitle_end_frame_to_left = subtitle_end_frame
+
+
+def analyze_audio_trim(frame_duration_ms, rms, rms_moving_average, start_byte, start_frame, end_byte, end_frame, audio_bytes):
+
+    # trim a bigger range compared to play time
+    min_gap_ms = 80
+    min_gap_frame = int(min_gap_ms / frame_duration_ms)
+
+    min_gap_frame_left = min_gap_frame
+    trim_start_frame = -1
+    trim_time_target_before_play_start = 3.5
+    trim_start_frame_total = int(trim_time_target_before_play_start * 1000 /
+                                frame_duration_ms)
+    trim_start_frame_left = trim_start_frame_total
+    for i in range(start_frame, -1, -1):
+        if rms[i] > 0.015:
+            min_gap_frame_left = min_gap_frame
+        else:
+            min_gap_frame_left -= 1
+        if min_gap_frame_left < 0:
+            trim_start_frame_left -= 1
+            overshoot = abs(i - start_frame) - trim_start_frame_total
+            if overshoot > 0:
+                # Decay faster the further we overshoot the target window
+                trim_start_frame_left -= 3 + overshoot // 10
+        if trim_start_frame_left <= 0:
+            trim_start_frame = i
+            break
+
+    min_gap_frame_left = min_gap_frame
+    trim_end_frame = -1
+    trim_time_target_after_play_end = 3
+    trim_end_frame_total = int(trim_time_target_after_play_end * 1000 /
+                              frame_duration_ms)
+    trim_end_frame_left = trim_end_frame_total
+    for i in range(end_frame, len(rms)):
+        if rms[i] > 0.015:
+            min_gap_frame_left = min_gap_frame
+        else:
+            min_gap_frame_left -= 1
+        if min_gap_frame_left < 0:
+            trim_end_frame_left -= 1
+            if abs(i - end_frame) > trim_end_frame_total:
+                trim_end_frame_left -= 2
+        if trim_end_frame_left <= 0:
+            trim_end_frame = i
+            break
+
+    if trim_start_frame == -1:
+        trim_start_bytes = start_byte
+    else:
+        trim_start_frame, search_ms = check_blank_frame(trim_start_frame,-2000,rms,rms_moving_average,frame_duration_ms,0.01)
+        trim_start_frame = min(trim_start_frame, start_frame)
+        trim_start_bytes = int(trim_start_frame * frame_duration_ms *
+                               recorder.BYTES_PER_SEC / 1000)
+        trim_start_bytes = snap_to_min_energy(audio_bytes, trim_start_bytes,
+                                              recorder.BYTES_PER_SAMPLE,
+                                              recorder.BYTES_PER_SEC, search_ms)
+
+    if trim_end_frame == -1:
+        trim_end_bytes = end_byte
+    else:
+        trim_end_frame, search_ms = check_blank_frame(trim_end_frame,1000,rms,rms_moving_average,frame_duration_ms,0.01)
+        trim_end_frame = max(trim_end_frame,end_frame)
+        trim_end_bytes = int(trim_end_frame * frame_duration_ms *
+                             recorder.BYTES_PER_SEC / 1000)
+        trim_end_bytes = snap_to_min_energy(audio_bytes, trim_end_bytes,
+                                            recorder.BYTES_PER_SAMPLE,
+                                            recorder.BYTES_PER_SEC, search_ms)
+
+    if trim_start_bytes == trim_end_bytes:
+        trim_start_bytes = 0
+        trim_end_bytes = len(audio_bytes) - 1
+
+    play_start_bytes_remove_blank = start_byte - trim_start_bytes
+    play_end_bytes_remove_blank = end_byte - trim_start_bytes
+
+    play_end_bytes_remove_blank = min(play_end_bytes_remove_blank,trim_end_bytes - trim_start_bytes)
+    
+    play_start_time = max(play_start_bytes_remove_blank / recorder.BYTES_PER_SEC, 0)
+    play_end_time = max(play_end_bytes_remove_blank / recorder.BYTES_PER_SEC, 0)
+
+    return audio_bytes[
+        trim_start_bytes:
+        trim_end_bytes], play_start_time, play_end_time
+
 def analyze_audio(audio_bytes, audio_start_time, rms, rms_moving_average,
                   frame_duration_ms, snip_index_in_sentences,
                   subtitle_sentences):
+    return
     subtitle_start_time = 0
     subtitle_end_time = 0
 
     # get start and end from subtitle
     subtitle_diff_min = 0.04
-    subtitle_diff_ideal = 0.12
+    subtitle_diff_ideal = 0.15
 
     subtitle_start_quality = 0
     subtitle_diff_left = 1
@@ -4976,7 +5517,7 @@ def anki_create_model():
                   .then(onDecoded)
                   .catch((err) => {
                   document.querySelector(".ap-wrap").innerHTML =
-                      '<div style="color:#c00">Failed to load: ' + filename +
+                      '<div style="color:#c00">Failed to load audio'+
                       '<br>Check if sync is finished</div>';
                   console.log("Audio load failed:", err);
                   });
@@ -5294,6 +5835,112 @@ def anki_create_model():
     btn.dataset.kw = kw;
     }
 </script>
+
+<div id="dbg-panel" style="margin-top: 32px; text-align: left; font-family: monospace; font-size: 10px; line-height: 1.5; color: #999; white-space: pre-wrap; -webkit-user-select: text; user-select: text"></div>
+<script>
+   // --- canvas blank-after-lock probe: OBSERVE ONLY, no repair ---
+   (function () {
+       var W = window.top;
+       if (!W._imgDbg) W._imgDbg = { log: [], blank: 0, timer: null };
+       var D = W._imgDbg;
+       var am = `{{audio}}`.match(/src="([^"]+)"/);
+       D.fname = am ? am[1] : '';
+       D.everPainted = false;
+       D.lastState = null;
+       D.freshBlankLogged = false;
+       var NL = String.fromCharCode(10);
+
+       function ts() {
+           var d = new Date();
+           function p(n) { return (n < 10 ? '0' : '') + n; }
+           return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+       }
+       function render() {
+           var el = document.getElementById('dbg-panel');
+           if (el) el.textContent = D.log.slice(-12).join(NL);
+       }
+       function log(msg) {
+           D.log.push(ts() + ' ' + msg);
+           if (D.log.length > 60) D.log.shift();
+           render();
+       }
+       function sample() {
+           var canvas = document.getElementById('word-img-canvas');
+           if (!canvas || canvas.style.display === 'none') return 'nocanvas';
+           if (!canvas.width || !canvas.height) return 'nosize';
+           try {
+               var ctx = canvas.getContext('2d');
+               var sum = 0;
+               var pts = [[0.5, 0.5], [0.25, 0.25], [0.75, 0.75], [0.25, 0.75]];
+               for (var i = 0; i < pts.length; i++) {
+                   var d = ctx.getImageData(
+                       Math.floor(canvas.width * pts[i][0]),
+                       Math.floor(canvas.height * pts[i][1]), 1, 1).data;
+                   sum += d[0] + d[1] + d[2] + d[3];
+               }
+               return sum === 0 ? 'blank' : 'painted';
+           } catch (e) {
+               return 'err:' + e.name;
+           }
+       }
+       function bitmapState() {
+           // liveness test on an OFFSCREEN canvas: never touches the visible one
+           var cache = W._apCache && W._apCache[D.fname];
+           if (!cache || !cache.bitmap) return 'bm-missing';
+           try {
+               var c = document.createElement('canvas');
+               c.width = 8;
+               c.height = 8;
+               var x = c.getContext('2d');
+               x.drawImage(cache.bitmap, 0, 0, 8, 8);
+               var d = x.getImageData(0, 0, 8, 8).data;
+               var sum = 0;
+               for (var i = 0; i < d.length; i++) sum += d[i];
+               return sum === 0 ? 'bm-dead' : 'bm-alive';
+           } catch (e) {
+               return 'bm-err:' + e.name;
+           }
+       }
+       function check(src) {
+           var st = sample();
+           if (st === 'painted') D.everPainted = true;
+           if (st !== D.lastState) {
+               var flipped = D.lastState !== null;
+               D.lastState = st;
+               if (st === 'blank' && D.everPainted) {
+                   D.blank += 1;
+                   log(src + ' BLANK #' + D.blank + ' | ' + bitmapState());
+               } else if (flipped) {
+                   log(src + ' ' + st);
+               }
+           }
+           if (st === 'blank' && !D.everPainted && !D.freshBlankLogged) {
+               D.freshBlankLogged = true;
+               log(src + ' render-blank | ' + bitmapState());
+           }
+       }
+
+       if (D.timer) clearInterval(D.timer);
+       D.timer = setInterval(function () { check('t'); }, 3000);
+       if (!document._imgDbgArmed) {
+           document._imgDbgArmed = true;
+           var evs = ['visibilitychange', 'pageshow', 'pagehide', 'focus', 'blur', 'resume', 'freeze'];
+           for (var i = 0; i < evs.length; i++) {
+               (function (ev) {
+                   var tgt = (ev === 'focus' || ev === 'blur') ? window : document;
+                   tgt.addEventListener(ev, function () {
+                       log('ev:' + ev + (ev === 'visibilitychange' ? '/' + document.visibilityState : ''));
+                       check('ev');
+                   });
+               })(evs[i]);
+           }
+           log('probe armed');
+       } else {
+           log('card shown');
+       }
+       render();
+   })();
+</script>
 """
     CSS = """img {
   max-width: 100%;
@@ -5479,7 +6126,7 @@ body.landscape #text-wrap {
             ('Copy Audio Time', '复制音频时间'),
             ('Import Audio Time', '导入音频时间'),
             ('Close', '关闭'),
-            ('Failed to load:', '文件获取失败'),
+            ('Failed to load:', '音频获取失败'),
             ('Check if sync is finished', '检查同步是否完成'),
         )
 
@@ -5983,6 +6630,14 @@ def show_tip():
     update_save_btn_state()            # no note yet -> save greyed
 
 
+def show_title_menu(global_pos):
+    # Same quit menu as the tray icon
+    menu = QMenu()
+    action_quit = QAction(ui('quit'), menu)
+    action_quit.triggered.connect(on_quit)
+    menu.addAction(action_quit)
+    menu.exec_(global_pos)
+
 
 def on_quit():
     threading.Thread(target=anki_sync_on_quit, daemon=True).start()
@@ -5990,6 +6645,7 @@ def on_quit():
     tray.hide()              # remove tray icon
     recorder.stop()          # stop native audio capture thread
     _generate_exit_bat()     # generate bat: delete _MEI (and apply update if pending)
+    rotate_log_if_needed()   # close log and rotate if it grew past the cap
     try:
         psutil.Process(os.getpid()).parent().kill()  # kill PyInstaller bootloader
     except Exception:
@@ -6002,6 +6658,13 @@ def anki_sync_on_quit():
         requests.post(ANKI_URL, json={"action": "sync","params": {},"version": 6},timeout=10).json()
 
 
+def tray_show(reason):
+    global hide_on_click
+    if reason == QSystemTrayIcon.Trigger:
+        hide_on_click = False   # manual summon: disarm auto-hide until next lookup
+        window.show()
+
+
 print('ver ' + __version__)
 window = MainWindow()
 bridge.anki_new_note_done.connect(anki_new_note_after,Qt.BlockingQueuedConnection)
@@ -6010,6 +6673,7 @@ window.setStyleSheet("background-color: #f0f0f0; color: #000000;")
 window.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
 window.setWindowOpacity(0.9)
 show_and_exclude_from_capture(window)
+hide_on_click = False
 set_qt_layout()
 
 show_tip()
@@ -6027,8 +6691,7 @@ action_quit.triggered.connect(on_quit)
 menu.addAction(action_quit)
 tray.setContextMenu(menu)
 tray.show()
-tray.activated.connect(lambda reason: window.show()
-                       if reason == QSystemTrayIcon.Trigger else None)
+tray.activated.connect(tray_show)
 keyboard_listener.start()
 time.sleep(0.3)  # test need delete
 print(f"keyboard_listener alive: {keyboard_listener.is_alive()}"
