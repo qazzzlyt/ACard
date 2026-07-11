@@ -31,6 +31,58 @@ def _parse_ver(tag: str):
     except ValueError:
         return (0,)
 
+def _staging_dir() -> Path:
+    """Same drive as the exe (the two-stage swap needs that), but invisible
+    to the user: LOCALAPPDATA when the exe sits on the system drive, else a
+    hidden folder at the exe drive's root."""
+    cur = _current_exe()
+    local = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / _APP_NAME
+    if local.drive.lower() == cur.drive.lower():
+        return local / "update"
+    return Path(cur.drive + "\\") / f"{_APP_NAME}.staging"
+
+def _staged_path() -> Path:
+    return _staging_dir() / (_asset_name() + ".new")
+
+def _hide_path(path: Path) -> None:
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # hidden
+    except Exception:
+        pass
+
+def _sweep_stale_files() -> None:
+    """Startup janitor: delete anything not referenced by a valid
+    pending.json (orphans from killed downloads / interrupted staging)."""
+    keep = set()
+    p = _pending_path()
+    if p.exists():
+        try:
+            info = json.loads(p.read_text(encoding="utf-8"))
+            staged = Path(info.get("staged_path", ""))
+            if staged.is_file() and _sha256(staged) == info.get("checksum"):
+                keep.add(str(staged).lower())
+            else:
+                p.unlink(missing_ok=True)
+        except Exception:
+            p.unlink(missing_ok=True)
+    for d in (_update_dir(), _staging_dir()):
+        try:
+            if not d.is_dir():
+                continue
+            for f in d.iterdir():
+                if f.name in ("pending.json", "cleanup.bat"):
+                    continue  # cleanup.bat may still be mid-run, never touch
+                if f.is_file() and str(f).lower() not in keep:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+            if d.name.endswith(".staging") and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -54,13 +106,14 @@ def _generate_exit_bat():
     if p.exists():
         try:
             info = json.loads(p.read_text(encoding="utf-8"))
-            candidate = Path(info["file_path"])
+            candidate = Path(info.get("staged_path", ""))
             cksum = info["checksum"]
-            if candidate.exists() and _sha256(candidate) == cksum:
+            if candidate.is_file() and _sha256(candidate) == cksum:
                 new_exe = candidate
             else:
                 p.unlink(missing_ok=True)
-                candidate.unlink(missing_ok=True)
+                if str(candidate) not in ("", "."):
+                    candidate.unlink(missing_ok=True)
         except Exception:
             p.unlink(missing_ok=True)
 
@@ -80,8 +133,9 @@ def _generate_exit_bat():
             f'    ping -n 2 127.0.0.1 >nul\n'
             f'    goto retry\n'
             f')\n'
-            f'del "{new_exe}"\n'
+            f'del /a /f "{new_exe}"\n'
             f'del "{p}"\n'
+            f'rmdir "{new_exe.parent}" 2>nul\n'
         )
     else:
         update_block = ''
@@ -115,17 +169,15 @@ def _generate_exit_bat():
 
 
 def _check_and_download():
-    """Background thread: check GitHub, silently download if newer version exists."""
-    time.sleep(5)
-    
-    # Skip update if temp drive has less than 500MB free
+    """Check GitHub; silently download + stage if a newer version exists."""
+    # Skip if the temp drive has less than 500MB free
     try:
         free = shutil.disk_usage(tempfile.gettempdir()).free
         if free < 500 * 1024 * 1024:
             return
     except OSError:
         return
-    
+
     try:
         url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
         req = Request(url, headers={"Accept": "application/vnd.github.v3+json",
@@ -146,16 +198,19 @@ def _check_and_download():
     if not dl_url:
         return
 
-    dest = _update_dir() / _asset_name()
+    staged = _staged_path()
     p = _pending_path()
-    if p.exists() and dest.exists():
+    if p.exists():
         try:
             info = json.loads(p.read_text(encoding="utf-8"))
-            if info.get("version") == release["tag_name"] and _sha256(dest) == info.get("checksum"):
-                return
+            if (info.get("version") == release["tag_name"]
+                    and staged.is_file()
+                    and _sha256(staged) == info.get("checksum")):
+                return          # this release is already staged and ready
         except Exception:
             pass
 
+    dest = _update_dir() / _asset_name()
     h = hashlib.sha256()
     try:
         req2 = Request(dl_url, headers={"User-Agent": f"{_APP_NAME}-updater"})
@@ -167,15 +222,49 @@ def _check_and_download():
         dest.unlink(missing_ok=True)
         return
 
+    # Stage on the exe's DRIVE (not next to the exe): proves the target
+    # drive has room, and turns the final swap into a same-drive copy.
+    # Any failure here leaves the current exe untouched.
+    try:
+        sdir = _staging_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        _hide_path(sdir)
+        if shutil.disk_usage(sdir.anchor).free < dest.stat().st_size + 100 * 1024 * 1024:
+            dest.unlink(missing_ok=True)
+            return
+        shutil.copyfile(dest, staged)
+        ok = _sha256(staged) == h.hexdigest()
+    except OSError:
+        ok = False
+    if not ok:
+        for junk in (staged, dest):
+            try:
+                junk.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
+
+    dest.unlink(missing_ok=True)     # temp copy no longer needed
     _pending_path().write_text(
         json.dumps({"version": release["tag_name"],
-                    "file_path": str(dest),
+                    "staged_path": str(staged),
                     "checksum": h.hexdigest()}, indent=2),
         encoding="utf-8",
     )
 
+def _update_loop():
+    time.sleep(5)
+    _sweep_stale_files()
+    while True:
+        try:
+            _check_and_download()
+        except Exception:
+            pass
+        time.sleep(30 * 60)     # re-check every 30 minutes while running
+
 if getattr(sys, 'frozen', False):
-    threading.Thread(target=_check_and_download, daemon=True).start()
+    threading.Thread(target=_update_loop, daemon=True).start()
+
 # ── End auto-updater ──────────────────────────────────────────────────────────
 
 import datetime
@@ -1074,6 +1163,21 @@ system_drive = os.environ.get("SystemDrive",
                               "C:") + "\\"  # for disk calculation
 
 
+def screenshot_login():
+    global screenshot_users, lock_length
+    with lock:  # lock screenshot length to avoid deleting frames when it is used by main thread
+        screenshot_users += 1
+        lock_length = len(screenshot)  # lock screenshot length to avoid deleting frames when it is used by main thread
+
+
+def screenshot_logout():
+    global screenshot_users, lock_length
+    with lock:  # lock screenshot length to avoid deleting frames when it is used by main thread
+        screenshot_users -= 1
+        if screenshot_users == 0:
+            lock_length = 0
+
+
 def screenshot_thread():
     global this_screenshot_time, high_cpu_seconds
     sct = mss()
@@ -1349,13 +1453,14 @@ class Snip(QWidget):
             self.slider_container.setAttribute(Qt.WA_UnderMouse, True)
 
     def start(self):
-        global lock_length
+        global lock_length, screenshot_users, hide_on_click
         check_processing(2)
-        with lock:  # make sure screenshot does not change while getting lock_length. this is extremely important
-            lock_length = len(screenshot)
+        screenshot_login()
         screenshot[lock_length - 1][0], _, _, = screenshot_qimg_rgb(
             self.sct, self.mon)
         screenshot[lock_length - 1][1] = time.time() * 1000
+
+        hide_on_click = True
 
         self.setUpdatesEnabled(False)
         self.slider.blockSignals(True)
@@ -1449,17 +1554,7 @@ class Snip(QWidget):
                     p.drawImage(exposed, self.background, exposed)
 
                 p.setPen(self.border_pen)
-                p.drawRect(rect)
-
-    def keyPressEvent(self, event):
-        return
-        global lock_length
-        if event.key() == Qt.Key_Escape:
-            if self.dragging:
-                self.cancel_drag()
-            else:
-                self.close_snip(False)
-                lock_length = 0                    
+                p.drawRect(rect)                  
 
     def cancel_drag(self): 
         self.start_pos = None
@@ -1482,7 +1577,7 @@ class Snip(QWidget):
         hotkey_mode = 1
         self._scroll_step = 1
         if not success:
-            lock_length = 0
+            screenshot_logout()
             show_and_exclude_from_capture(window)
 
     def mousePressEvent(self, event):
@@ -1509,8 +1604,8 @@ class Snip(QWidget):
             rect = QRect(self.start_pos, self.end_pos).normalized()
             cropped = self.background.copy(rect)
             click_time = time.time()
-            recorder.capture_last(self.snip_time,
-                                  click_time)  # test need move to thread
+            audio_bytes, audio_start_time, audio_end_time = recorder.capture_last(
+                self.snip_time, click_time)  # test need move to thread
             self.close_snip(True)
             print('lock_length ' + str(lock_length - 1) + ' slider value ' +
                   str(self.slider.value()))  # text
@@ -1523,13 +1618,13 @@ class Snip(QWidget):
                         self.hint_label.deleteLater()
             run_ocr_and_display(
                 ocr, on_error, cropped, self.background, self.slider.value(),
-                rect, self.audio, self.audio_start_time,
-                self.audio_end_time)  # test need better thread arrangement
+                rect, audio_bytes, audio_start_time,
+                audio_end_time)  # test need better thread arrangement
 
 
 def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                         audio_bytes, audio_start_time, audio_end_time):
-    global window, lock_length, processing, hide_on_click
+    global window, lock_length, processing
     processing = 0
     ocr_result = run_ocr(image, ocr, on_error, 2)
 
@@ -1566,7 +1661,6 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             #window.setMaximumSize(16777215, 16777215)
             refresh_window(False)
             show_and_exclude_from_capture(window)
-            hide_on_click = True
             if window.isMinimized():
                 window.showNormal()
                 window.raise_()
@@ -1579,16 +1673,14 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             window_display_word_blank()
             refresh_window(False)
             show_and_exclude_from_capture(window)
-            hide_on_click = True
             if window.isMinimized():
                 window.showNormal()
                 window.raise_()
             print('search dict fail for ' + word)
             processing = 3
     else:
-        lock_length = 0
+        screenshot_logout()
         processing = 3
-        print('no ocr result')  # test need tool tip
         window._toast = Toast(ui('no_ocr_result'), duration=2000)
 
 
@@ -1645,11 +1737,7 @@ def after_display(word_info, word, points, audio_bytes, snip_index,
     anki_new_note_thread = threading.Thread(target=anki_new_note,args=(word_info,qimg_full,anki_new_note_time_stamp,),daemon=True)
     anki_new_note_thread.start()
     if len(audio_bytes) > 0:
-        threading.Thread(
-            target=process_audio,
-            args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp),
-            daemon=True,
-        ).start()
+        threading.Thread(target=process_audio,args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp),daemon=True,).start()
     else:
         anki_new_note_thread.join()
         processing = 3
@@ -1669,14 +1757,6 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     ambiguous_diff_max = 0.15
     detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
     
-    #test need delete
-    import csv
-    with open(os.path.join(folder_path, "sentences.csv"), "w",
-              newline="") as f:
-        csv.writer(f).writerows(
-            [["diff_snip", "diff_last", "frame_time", "ocr_same", "ocr_type"]
-             ] + list(subtitle_sentences))
-
     frame_duration_ms = 20
 
     rms, rms_moving_average = detect_audio(audio_bytes, frame_duration_ms)
@@ -1726,6 +1806,13 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     processing = 3
         
     # test need delete
+    import csv
+    with open(os.path.join(folder_path, "sentences.csv"), "w",
+              newline="") as f:
+        csv.writer(f).writerows(
+            [["diff_snip", "diff_last", "frame_time", "ocr_same", "ocr_type"]
+             ] + list(subtitle_sentences))
+
     with open(os.path.join(folder_path, "audio.mp3"), "wb") as f:
         f.write(wav_to_mp3(pcm_to_wav_bytes(audio_bytes)))  # debug dump, moved off the critical path
     debug_frames = (
@@ -1973,6 +2060,7 @@ def detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subti
         
 
 def detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path):
+    global lock_length, screenshot_users
     # loop left to find end
     last_hog = snip_hog
     ocr_budget_ambiguous = 3
@@ -1992,6 +2080,8 @@ def detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitl
                 folder_path,
                 f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
             ))  #test need delete
+    
+    screenshot_logout()
 
 
 def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sentences,
@@ -2137,7 +2227,6 @@ def window_change_picture(pixmap):
 def window_display_word_blank():
     window.anki_id = None
     window_display_word('', '', '', '', '', True, False)
-
 
 
 anki_last_new_note = (None,None)  # 0 = time stamp 1 = anki_id
@@ -2403,7 +2492,8 @@ def refresh_word():
 
 
 def save_word_qt_to_anki():
-    global processing
+    global processing, hide_on_click
+    hide_on_click = True
     if not window.anki_id:          # nothing to update if no note shown
         return
     # saving ends the edit: drop focus so no box stays in edit mode
@@ -3345,6 +3435,7 @@ def set_qt_layout():
     orig_word_press = window.word.mousePressEvent
 
     def word_press(event):
+        global hide_on_click
         # temporarily allow activation so word input works
         hwnd = int(window.winId())
         ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
@@ -3353,6 +3444,7 @@ def set_qt_layout():
         windll.user32.SetForegroundWindow(hwnd)
         orig_word_press(event)
         window.word.setFocus()
+        hide_on_click = False  # user clicked on word input, disarm auto-hide
 
     window.word.mousePressEvent = word_press
 
@@ -4270,6 +4362,14 @@ def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
             if subtitle_diff_left <= 0:
                 break
     
+    # start_frame is an RMS frame index; play_log stores wall-clock times.
+    # Convert before comparing (frame i starts at audio_start_time + i*20ms)
+    start_time = audio_start_time + start_frame * frame_duration_ms / 1000
+    for i in range(len(play_log)):
+        s = play_log[i][0]
+        if start_time < s and s < subtitle_end_time:
+            subtitle_end_time = s
+            
     subtitle_end_frame = time_to_audio_frame(audio_start_time,
                                             frame_duration_ms, len(rms),
                                             subtitle_end_time)
@@ -4495,7 +4595,6 @@ def analyze_audio(audio_bytes, audio_start_time, rms, rms_moving_average,
                 subtitle_end_time = s
 
     print(f"audio_start_time={audio_start_time:.3f}")
-    print(f"audio_end_time={snip.audio_end_time:.3f}")
     print(f"subtitle_start_time={subtitle_start_time:.3f}")
     print(f"subtitle_end_time={subtitle_end_time:.3f}")
     print(f"len(rms)={len(rms)}")
@@ -4993,7 +5092,9 @@ def anki_create_model():
                    return r.blob();
                })
                .then(function (blob) {
-                   return createImageBitmap(blob);
+                   return createImageBitmap(blob).then(function (bm) {
+                       return { bm: bm, blob: blob };
+                   });
                });
            }
    
@@ -5018,8 +5119,9 @@ def anki_create_model():
                window.top._apCache[fname] = entry;
                ac.close();
                if (bitmapPromise) {
-                   bitmapPromise.then(function (bm) {
-                       entry.bitmap = bm;
+                   bitmapPromise.then(function (res) {
+                       entry.bitmap = res.bm;
+                       entry.blob = res.blob;   // kept: re-decode source after iOS purges the bitmap
                    });
                }
                })
@@ -5053,6 +5155,67 @@ def anki_create_model():
          </svg>
       </div>
       <script>
+         function canvasIsBlank(canvas) {
+             // a purged backing store reads back all-zero (even alpha)
+             try {
+                 var c = canvas.getContext('2d');
+                 var pts = [[0.5, 0.5], [0.25, 0.25], [0.75, 0.75], [0.25, 0.75]];
+                 var sum = 0;
+                 for (var i = 0; i < pts.length; i++) {
+                     var d = c.getImageData(
+                         Math.floor(canvas.width * pts[i][0]),
+                         Math.floor(canvas.height * pts[i][1]), 1, 1).data;
+                     sum += d[0] + d[1] + d[2] + d[3];
+                 }
+                 return sum === 0;
+             } catch (e) {
+                 return false;
+             }
+         }
+         var _rebuildBusy = false;
+         function rebuildWordImage() {
+             // shared rebuild ladder: cached blob -> refetch media file.
+             // The blob itself can die after long backgrounding (proven in
+             // logs), so the network rung is mandatory.
+             if (_rebuildBusy) return;
+             var m2 = `{{audio}}`.match(/src="([^"]+)"/);
+             var fname2 = m2 ? m2[1] : "";
+             var cache = window.top._apCache && window.top._apCache[fname2];
+             if (!cache || typeof createImageBitmap !== 'function') return;
+             _rebuildBusy = true;
+             function done(bm) {
+                 cache.bitmap = bm;
+                 _rebuildBusy = false;
+                 try { renderScreenshot(); } catch (e) {}
+                 if (window.top._imgDbg) {
+                     window.top._imgDbg.healed = (window.top._imgDbg.healed || 0) + 1;
+                 }
+             }
+             function refetch() {
+                 var fb = document.getElementById('word-img-fallback');
+                 var m3 = fb ? /<img[^>]+src="([^"]+)"/.exec(fb.innerHTML) : null;
+                 if (!m3) { _rebuildBusy = false; return; }
+                 fetch(m3[1]).then(function (r) { return r.blob(); })
+                     .then(function (blob) {
+                         cache.blob = blob;
+                         return createImageBitmap(blob);
+                     })
+                     .then(done)
+                     .catch(function () { _rebuildBusy = false; });
+             }
+             if (cache.blob) {
+                 createImageBitmap(cache.blob).then(done, refetch);
+             } else {
+                 refetch();
+             }
+         }
+         function verifyCanvasPainted(canvas, cache) {
+             // iOS may have killed the cached ImageBitmap while backgrounded:
+             // drawing paints nothing. Detect and rebuild.
+             if (!canvas.width || !canvas.height) return;
+             if (!canvasIsBlank(canvas)) return;
+             rebuildWordImage();
+         }
          function renderScreenshot() {
              var canvas = document.getElementById('word-img-canvas');
              var fallback = document.getElementById('word-img-fallback');
@@ -5079,7 +5242,18 @@ def anki_create_model():
              canvas.width = bitmap.width;
              canvas.height = bitmap.height;
              var ctx = canvas.getContext('2d');
-             ctx.drawImage(bitmap, 0, 0);
+             try {
+                 ctx.drawImage(bitmap, 0, 0);
+             } catch (e) {
+                 // detached bitmap throws InvalidStateError: rebuild right away
+                 setTimeout(rebuildWordImage, 0);
+                 return true;
+             }
+             // run the purge check after the frame is presented: getImageData
+             // forces a sync GPU readback and would delay the visible paint
+             requestAnimationFrame(function () {
+                 verifyCanvasPainted(canvas, cache);
+             });
              return true;
              }
              canvas.style.display = 'none';
@@ -5375,12 +5549,18 @@ def anki_create_model():
                   }
               }
               if (peak < 0.001) return;          // silence: leave it alone
-              volCache.vol = Math.min(0.5 / peak, 8);
+              // per-device target peak: phones (weak speakers) get a hotter
+              // level than PCs; UA-based detection, iPad included
+              var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+                  || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+              var targetPeak = isMobile ? 0.45 : 0.3;
+              var maxGain = isMobile ? 8 : 3;
+              volCache.vol = Math.min(targetPeak / peak, maxGain);
           }
           function playRangeInternal() {
               stopCurrent();
               if (!audioBuffer || !audioCtx || !duration) return;
-              if (audioCtx.state === "suspended") audioCtx.resume();
+              if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") audioCtx.resume();
               if (volCache.s !== startT || volCache.e !== endT) computeVol();
               const vol = volCache.vol;
               const source = audioCtx.createBufferSource();
@@ -5662,16 +5842,27 @@ def anki_create_model():
               playRangeInternal();
           };
           function redrawAll() {
-              if (audioBuffer) {
-                  const cached = window.top._apCache && window.top._apCache[filename];
-                  if (cached && cached.bars) {
-                  drawWaveformFromBars(cached.bars);
-                  } else {
-                  drawWaveform(audioBuffer);
+              if (document.visibilityState !== "visible") return;
+              const cache = window.top._apCache && window.top._apCache[filename];
+              // audio: iOS may leave the context stuck after lock/interruption
+              try {
+                  if (audioCtx && (audioCtx.state === "suspended" || audioCtx.state === "interrupted")) {
+                      audioCtx.resume();
                   }
-              }
-              if (typeof renderScreenshot === "function") {
-                  renderScreenshot();
+              } catch (e) {}
+              // waveform: bars are plain JS data, redrawing is free
+              try {
+                  if (cache && cache.bars) {
+                      drawWaveformFromBars(cache.bars);
+                  } else if (audioBuffer) {
+                      drawWaveform(audioBuffer);
+                  }
+              } catch (e) {}
+              // image: delegate to the shared rebuild ladder (blob -> refetch)
+              if (typeof rebuildWordImage === "function") {
+                  rebuildWordImage();
+              } else {
+                  try { renderScreenshot(); } catch (e) {}
               }
           }
           function onVisible() {
@@ -5681,13 +5872,6 @@ def anki_create_model():
               }
           }
           addTracked(document, "visibilitychange", onVisible);
-          addTracked(window, "pageshow", function () {
-          setTimeout(redrawAll, 100);
-          addTracked(window, "focus", function () {
-              setTimeout(redrawAll, 100);
-              setTimeout(redrawAll, 700);
-          });
-          });
       })();
    </script>
    <div id="text-wrap">
@@ -5750,14 +5934,26 @@ def anki_create_model():
        }
        const json = JSON.stringify(data);
        var div = document.createElement('div');
-       div.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;';
+       // viewport units + inset pinning: percentage heights can resolve
+       // against a transformed/short ancestor in Anki's webview and only
+       // cover part of the screen
+       div.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;background:rgba(0,0,0,0.85);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;box-sizing:border-box;padding:calc(env(safe-area-inset-top) + 10vh) 16px env(safe-area-inset-bottom) 16px;';
+       // modal: swallow pointer events so taps cannot bubble up to Anki's
+       // tap-to-answer / tap-to-flip handlers behind the overlay
+       ['click', 'dblclick', 'mousedown', 'mouseup',
+        'pointerdown', 'pointerup',
+        'touchstart', 'touchmove', 'touchend'].forEach(function (ev) {
+           div.addEventListener(ev, function (e) {
+               e.stopPropagation();
+               if (e.target === div && ev !== 'click') e.preventDefault();
+           });
+       });
    var ta = document.createElement('div');
    ta.textContent = json;
-   ta.contentEditable = 'true';
-   ta.style.cssText = 'width:80%;height:3em;font-size:12px;background:white;color:black;padding:8px;overflow:auto;word-break:break-all;';
-   ta.addEventListener('click', function() {
-       ta.select();
-   });
+   // NOT contentEditable: keeps iOS from popping the keyboard and from
+   // auto-zooming (focus on <16px editable zooms the page). Selection
+   // and the copy callout work fine on plain text.
+   ta.style.cssText = 'width:80%;height:3em;font-size:16px;background:white;color:black;padding:8px;overflow:auto;word-break:break-all;-webkit-user-select:text;user-select:text;';
    var label = document.createElement('div');
    label.innerHTML = '1.Copy below text<br>2.Click "Edit" in Anki<br>3.Paste to field "time"<br>4.Sync this device<br>5.Sync another device<br>6.On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"'
    label.style.cssText = 'color:white;margin-bottom:8px;font-size:14px;text-align:left;';
@@ -5765,13 +5961,13 @@ def anki_create_model():
        btn.textContent = 'Close';
        btn.style.cssText = 'margin-top:16px;padding:8px 24px;font-size:16px;';
        btn.onclick = function() {
-           document.body.removeChild(div);
+           div.parentNode.removeChild(div);
            window._exportShowing = false;
        };
        div.appendChild(label);
        div.appendChild(ta);
        div.appendChild(btn);
-       document.body.appendChild(div);
+       document.documentElement.appendChild(div);   // escape any transformed body container
        setTimeout(function() {
            var range = document.createRange();
            range.selectNodeContents(ta);
@@ -5901,7 +6097,34 @@ def anki_create_model():
                return 'bm-err:' + e.name;
            }
        }
+       function probeHeal(tag) {
+           var cache = W._apCache && W._apCache[D.fname];
+           var canvas = document.getElementById('word-img-canvas');
+           if (!cache || !canvas) return;
+           try {
+               if (cache.bitmap) {
+                   canvas.getContext('2d').drawImage(cache.bitmap, 0, 0);
+                   if (sample() === 'painted') { log(tag + ' redraw-ok'); D.lastState = 'painted'; return; }
+               }
+           } catch (e) {}
+           if (cache.blob && typeof createImageBitmap === 'function') {
+               createImageBitmap(cache.blob).then(function (bm) {
+                   cache.bitmap = bm;
+                   try {
+                       canvas.getContext('2d').drawImage(bm, 0, 0);
+                       log(tag + ' ' + (sample() === 'painted' ? 'recreate-ok' : 'recreate-blank'));
+                       D.lastState = sample();
+                   } catch (e) { log(tag + ' recreate-err'); }
+               }, function () { log(tag + ' recreate-fail'); });
+           } else {
+               log(tag + ' no-blob');
+           }
+       }
        function check(src) {
+           if (D.healed && D.healed !== D.healedSeen) {
+               D.healedSeen = D.healed;
+               log('img self-heal #' + D.healed);
+           }
            var st = sample();
            if (st === 'painted') D.everPainted = true;
            if (st !== D.lastState) {
@@ -5910,6 +6133,7 @@ def anki_create_model():
                if (st === 'blank' && D.everPainted) {
                    D.blank += 1;
                    log(src + ' BLANK #' + D.blank + ' | ' + bitmapState());
+                   probeHeal('heal:');
                } else if (flipped) {
                    log(src + ' ' + st);
                }
@@ -5917,9 +6141,30 @@ def anki_create_model():
            if (st === 'blank' && !D.everPainted && !D.freshBlankLogged) {
                D.freshBlankLogged = true;
                log(src + ' render-blank | ' + bitmapState());
+               probeHeal('heal:');
            }
        }
 
+       // ---- audio-side observation (no repair) ----
+       var ctx = W._apAudioCtx;
+       if (ctx) {
+           if (ctx.state !== 'running') log('au:ctx ' + ctx.state);
+           ctx.onstatechange = function () {
+               log('au:state ' + ctx.state);
+           };
+       } else {
+           log('au:ctx none');
+       }
+       if (window.playRange && !window.playRange._dbgWrapped) {
+           var origPlay = window.playRange;
+           var wrapped = function () {
+               var c = W._apAudioCtx;
+               log('au:play ' + (c ? c.state : 'noctx'));
+               return origPlay.apply(this, arguments);
+           };
+           wrapped._dbgWrapped = true;
+           window.playRange = wrapped;
+       }
        if (D.timer) clearInterval(D.timer);
        D.timer = setInterval(function () { check('t'); }, 3000);
        if (!document._imgDbgArmed) {
@@ -6194,10 +6439,22 @@ body.landscape #text-wrap {
                 need_update_config = True
 
     if need_update_config:
-        time.sleep(3)  # not sure if model update reflect immediately
         model_hash = anki_current_model_hash()
         update_config('anki_model_version_and_hash',
                       [ANKI_MODEL_VERSION, model_hash])
+
+    # Mirror the shipped templates next to config.json (debug/backup copy)
+    time.sleep(15)
+    try:
+        from platformdirs import user_config_dir
+        tpl_dir = user_config_dir('ACard', appauthor=False)
+        for name, text in (("FRONT_TEMPLATE.html", FRONT_TEMPLATE),
+                           ("BACK_TEMPLATE.html", BACK_TEMPLATE),
+                           ("CSS.css", CSS)):
+            with open(os.path.join(tpl_dir, name), 'w', encoding='utf-8') as f:
+                f.write(text)
+    except OSError:
+        pass
 
 
 def anki_check_deck_and_model(intial_run):
@@ -6432,12 +6689,13 @@ class LoopbackRecorder:
                 self.size -= len(old)
 
     def capture_last(self, snip_time, click_time):
+        """Extract this capture's audio window and RETURN it. No shared
+        state: every snip owns its private copy, so overlapping pipelines
+        can never clobber each other's audio."""
         with self.lock:
             chunks = list(self.ring)
         if not chunks:
-            if 'snip' in globals():
-                snip.audio = b''
-                return
+            return b'', 0.0, 0.0
 
         print(f"first chunk time: {chunks[0][1]:.3f}")
         print(f"last chunk time:  {chunks[-1][1]:.3f}")
@@ -6452,26 +6710,24 @@ class LoopbackRecorder:
         print(
             f"last_chunk_time - data_start_time={last_chunk_time - data_start_time:.3f}s"
         )
-        snip.audio_start_time = max(snip_time - AUDIO_BEFORE_SNIP_SECOND,
-                                    data_start_time)
+        audio_start_time = max(snip_time - AUDIO_BEFORE_SNIP_SECOND,
+                               data_start_time)
         save_start_byte = len(data) - int(
-            self.BYTES_PER_SEC * (last_chunk_time - snip.audio_start_time))
+            self.BYTES_PER_SEC * (last_chunk_time - audio_start_time))
         save_start_byte = save_start_byte - save_start_byte % self.BYTES_PER_SAMPLE
         save_start_byte = max(save_start_byte, 0)
 
-        snip.audio_end_time = min(snip_time + AUDIO_AFTER_SNIP_SECOND,
-                                  last_chunk_time)
+        audio_end_time = min(snip_time + AUDIO_AFTER_SNIP_SECOND,
+                             last_chunk_time)
         save_end_byte = len(data) - int(
-            self.BYTES_PER_SEC * (last_chunk_time - snip.audio_end_time))
+            self.BYTES_PER_SEC * (last_chunk_time - audio_end_time))
         save_end_byte = save_end_byte - save_end_byte % self.BYTES_PER_SAMPLE
         save_end_byte = min(save_end_byte, len(data))
         save_end_byte = max(save_end_byte, 0)
 
         data = data[save_start_byte:save_end_byte]
-
-        snip.audio = data
         print(f'captured {len(data)} bytes')
-        return
+        return data, audio_start_time, audio_end_time
 
     def stop(self):
         # Signal the native capture thread to stop and join it
@@ -6486,9 +6742,9 @@ screenshot = []
 anki_list = []
 lock = threading.Lock()
 user32 = WinDLL("user32", use_last_error=True)
+screenshot_users = 0
 lock_length = 0
-this_screenshot_time = int(time.time(
-)) * 1000  # initial run at whole second to reduce rounding effect
+this_screenshot_time = int(time.time()) * 1000  # initial run at whole second to reduce rounding effect
 psutil.cpu_percent(interval=0)  # for cpu
 high_cpu_seconds = 0
 screenshot_thread_stop = threading.Event()
