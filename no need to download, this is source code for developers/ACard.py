@@ -443,8 +443,8 @@ dll = CDLL(os.path.join(BASE, 'CVUtils.dll'))
 native_dll = CDLL(os.path.join(BASE, 'NativeUtils.dll'))
 
 from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow, QWidget, QMenu, QSlider, QToolTip, QLabel, QVBoxLayout, QLineEdit, QTextEdit, QSizePolicy, QHBoxLayout, QToolButton, QStyle, QStyleOptionSlider, QStackedWidget, QComboBox, QPushButton, QSystemTrayIcon, QMenu, QAction
-from PyQt5.QtCore import Qt, QRect, QEvent, QObject, pyqtSignal, QTimer, QBuffer, QIODevice, QPoint, QMetaObject
-from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QImage, QCursor, QFont, QIcon
+from PyQt5.QtCore import Qt, QRect, QEvent, QObject, pyqtSignal, QTimer, QBuffer, QIODevice, QPoint, QMetaObject, QEventLoop
+from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QImage, QCursor, QFont, QIcon, QPolygon
 
 UI_TEXT = {
     'messagebox_title': ('ACard', 'ACard'),
@@ -1174,8 +1174,9 @@ def screenshot_logout():
     global screenshot_users, lock_length
     with lock:  # lock screenshot length to avoid deleting frames when it is used by main thread
         screenshot_users -= 1
-        if screenshot_users == 0:
+        if screenshot_users <= 0:
             lock_length = 0
+    print(screenshot_users)
 
 
 def screenshot_thread():
@@ -1285,7 +1286,7 @@ def screenshot_thread():
             highest_fps = min(2, highest_fps)
             print('cpu is ' + str(cpu))  # test test need delete
 
-        if hotkey_mode == 2 or processing < 2:
+        if hotkey_mode == 2 or not round_audio_analysis_start_time_done.is_set():
             highest_fps = min(1, highest_fps)
 
         lowest_frame_interval = 1000 / highest_fps
@@ -1346,6 +1347,43 @@ def prune_play_log():
     play_log[:] = [(s, e) for (s, e) in list(play_log) if e >= cutoff]
 
 
+# --- raw-input structs: virtual cursor for games that lock the mouse ---
+# such games re-center the cursor every frame (SetCursorPos), poisoning
+# cursor POSITIONS, but relative WM_INPUT deltas keep flowing untouched
+WM_INPUT = 0x00FF
+RIDEV_INPUTSINK = 0x00000100
+RIDEV_REMOVE = 0x00000001
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+MOUSE_MOVE_ABSOLUTE = 0x0001
+RI_MOUSE_LEFT_BUTTON_DOWN = 0x0001
+RI_MOUSE_LEFT_BUTTON_UP = 0x0002
+
+
+class RAWINPUTDEVICE(Structure):
+    _fields_ = [('usUsagePage', wintypes.USHORT), ('usUsage', wintypes.USHORT),
+                ('dwFlags', wintypes.DWORD), ('hwndTarget', c_void_p)]
+
+
+class RAWINPUTHEADER(Structure):
+    _fields_ = [('dwType', wintypes.DWORD), ('dwSize', wintypes.DWORD),
+                ('hDevice', c_void_p), ('wParam', c_void_p)]
+
+
+class RAWMOUSE(Structure):
+    _fields_ = [('usFlags', wintypes.USHORT),
+                ('_pad', wintypes.USHORT),          # align union to 4 bytes
+                ('usButtonFlags', wintypes.USHORT),
+                ('usButtonData', wintypes.USHORT),
+                ('ulRawButtons', wintypes.ULONG),
+                ('lLastX', wintypes.LONG), ('lLastY', wintypes.LONG),
+                ('ulExtraInformation', wintypes.ULONG)]
+
+
+class RAWINPUT(Structure):
+    _fields_ = [('header', RAWINPUTHEADER), ('mouse', RAWMOUSE)]
+
+
 class Snip(QWidget):
 
     def __init__(self):
@@ -1356,6 +1394,10 @@ class Snip(QWidget):
         self.end_pos = None
         self.dragging = False
         self.last_slider_time_ms = -1
+
+        self._vmode = False       # virtual-cursor mode (mouse-locking game)
+        self._raw_on = False
+        self._vpos = QPoint(0, 0)
 
         self.audio_start_time = 0
         self.audio_end_time = 0
@@ -1454,7 +1496,7 @@ class Snip(QWidget):
 
     def start(self):
         global lock_length, screenshot_users, hide_on_click
-        check_processing(2)
+        check_processing(round_display)
         screenshot_login()
         screenshot[lock_length - 1][0], _, _, = screenshot_qimg_rgb(
             self.sct, self.mon)
@@ -1487,6 +1529,7 @@ class Snip(QWidget):
         #self.activateWindow()
         self.audio = None
         prune_play_log()
+        self._raw_input_begin()
 
     def eventFilter(self, obj, event):
 
@@ -1554,7 +1597,41 @@ class Snip(QWidget):
                     p.drawImage(exposed, self.background, exposed)
 
                 p.setPen(self.border_pen)
-                p.drawRect(rect)                  
+                p.drawRect(rect)
+
+        if self._vmode:
+            vp = self._vpos
+            kind = getattr(self, '_vcursor_kind', 'cross')
+            if kind == 'arrow':
+                # windows-style pointer, tip at the virtual position
+                pts = QPolygon([QPoint(vp.x() + dx, vp.y() + dy)
+                                for dx, dy in ((0, 0), (0, 17), (4, 13),
+                                               (7, 20), (10, 19), (7, 12),
+                                               (12, 12))])
+                p.setPen(QPen(QColor(0, 0, 0), 1))
+                p.setBrush(QColor(255, 255, 255))
+                p.drawPolygon(pts)
+                p.setBrush(Qt.NoBrush)
+            else:
+                arm = 14 if kind == 'move' else 12
+                p.setPen(QPen(QColor(0, 0, 0), 3))
+                p.drawLine(vp.x() - arm, vp.y(), vp.x() + arm, vp.y())
+                p.drawLine(vp.x(), vp.y() - arm, vp.x(), vp.y() + arm)
+                p.setPen(QPen(QColor(255, 255, 255), 1))
+                p.drawLine(vp.x() - arm, vp.y(), vp.x() + arm, vp.y())
+                p.drawLine(vp.x(), vp.y() - arm, vp.x(), vp.y() + arm)
+                if kind == 'move':
+                    # four arrowheads -> the size-all "move" cursor
+                    p.setPen(QPen(QColor(0, 0, 0), 1))
+                    p.setBrush(QColor(255, 255, 255))
+                    for head in (((-arm, 0), (-arm + 6, -4), (-arm + 6, 4)),
+                                 ((arm, 0), (arm - 6, -4), (arm - 6, 4)),
+                                 ((0, -arm), (-4, -arm + 6), (4, -arm + 6)),
+                                 ((0, arm), (-4, arm - 6), (4, arm - 6))):
+                        p.drawPolygon(QPolygon(
+                            [QPoint(vp.x() + dx, vp.y() + dy)
+                             for dx, dy in head]))
+                    p.setBrush(Qt.NoBrush)
 
     def cancel_drag(self): 
         self.start_pos = None
@@ -1566,6 +1643,7 @@ class Snip(QWidget):
     def close_snip(self, success):
         global hotkey_mode, _snip_open_close_time, lock_length
         _snip_open_close_time = time.time()
+        self._raw_input_end()
         self.hide()
         self.last_slider_time_ms = screenshot[self.slider.value()][1]
         self._slider_gen = getattr(self, '_slider_gen', 0) + 1
@@ -1580,7 +1658,187 @@ class Snip(QWidget):
             screenshot_logout()
             show_and_exclude_from_capture(window)
 
+    # ---- raw-input virtual cursor ----
+    def _raw_input_begin(self):
+        # virtual cursor engages only when a game is detected yanking the
+        # cursor back; normal desktop keeps the accelerated native cursor
+        self._vmode = False
+        p = self.mapFromGlobal(QCursor.pos())
+        self._vpos = QPoint(min(max(p.x(), 0), self.width() - 1),
+                            min(max(p.y(), 0), self.height() - 1))
+        self._raw_sum_x = 0
+        self._raw_sum_y = 0
+        self._raw_start = QCursor.pos()
+        rid = RAWINPUTDEVICE(1, 2, RIDEV_INPUTSINK, int(self.winId()))
+        self._raw_on = bool(windll.user32.RegisterRawInputDevices(
+            byref(rid), 1, sizeof(RAWINPUTDEVICE)))
+
+    def _raw_input_end(self):
+        if self._raw_on:
+            rid = RAWINPUTDEVICE(1, 2, RIDEV_REMOVE, None)
+            windll.user32.RegisterRawInputDevices(byref(rid), 1,
+                                                  sizeof(RAWINPUTDEVICE))
+            self._raw_on = False
+        if self._vmode:
+            self._vmode = False
+            self.setCursor(Qt.CrossCursor)
+            self.panel.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            self.slider.setSliderDown(False)
+            self._vslider_drag = False
+            self._vpanel_drag = False
+            if getattr(self, '_vhover', False):
+                self._vhover = False
+                self.slider_container.setAttribute(Qt.WA_UnderMouse, False)
+                self.slider_container.update()
+
+    def nativeEvent(self, eventType, message):
+        if self._raw_on and eventType == b'windows_generic_MSG':
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_INPUT:
+                self._on_raw_input(msg.lParam)
+        return False, 0
+
+    def _on_raw_input(self, lparam):
+        ri = RAWINPUT()
+        size = wintypes.UINT(sizeof(RAWINPUT))
+        if windll.user32.GetRawInputData(c_void_p(lparam), RID_INPUT,
+                                         byref(ri), byref(size),
+                                         sizeof(RAWINPUTHEADER)) <= 0:
+            return
+        if ri.header.dwType != RIM_TYPEMOUSE:
+            return
+        m = ri.mouse
+        if not (m.usFlags & MOUSE_MOVE_ABSOLUTE) and (m.lLastX or m.lLastY):
+            self._vmouse_move(m.lLastX, m.lLastY)
+        if m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN:
+            self._vmouse_press()
+        if m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP:
+            self._vmouse_release()
+
+    def _vmouse_move(self, dx, dy):
+        if not self._vmode:
+            # lock detection by NET displacement: swipe one direction and
+            # a free cursor travels along with the raw deltas, while a
+            # game-locked cursor is yanked back every frame and its net
+            # movement stays near zero no matter how far the mouse went
+            p = QCursor.pos()
+            g = self.geometry()
+            if (p.x() - g.left() < 5 or g.right() - p.x() < 5 or
+                    p.y() - g.top() < 5 or g.bottom() - p.y() < 5):
+                # pinned by a screen edge: looks like a lock, is not one
+                self._raw_sum_x = self._raw_sum_y = 0
+                self._raw_start = p
+                return
+            self._raw_sum_x += dx
+            self._raw_sum_y += dy
+            raw_net = abs(self._raw_sum_x) + abs(self._raw_sum_y)
+            if raw_net >= 100:
+                # locked = tiny fraction of raw AND under the absolute
+                # bound of one frame's excursion; the cap protects against
+                # low-gain (high-DPI) desktop mice on longer windows
+                if (p - self._raw_start).manhattanLength() < min(
+                        raw_net * 0.2, 25):
+                    print('snip: virtual cursor engaged')  # test
+                    self._vmode = True
+                    self._vslider_drag = False
+                    self._vpanel_drag = False
+                    self._vhover = False
+                    self._vpos = self.mapFromGlobal(p)
+                    self.setCursor(Qt.BlankCursor)
+                    self.panel.setAttribute(
+                        Qt.WA_TransparentForMouseEvents, True)
+                    self.update()
+                else:
+                    self._raw_sum_x = self._raw_sum_y = 0
+                    self._raw_start = p
+            return
+        old = QPoint(self._vpos)
+        nx = min(max(self._vpos.x() + dx, 0), self.width() - 1)
+        ny = min(max(self._vpos.y() + dy, 0), self.height() - 1)
+        self._vpos = QPoint(nx, ny)
+        if getattr(self, '_vslider_drag', False):
+            self._vslider_set_from_x(self._vpos.x())
+        elif getattr(self, '_vpanel_drag', False):
+            self.panel.move(self._vpanel_origin +
+                            (self._vpos - self._vpanel_start))
+        elif self.dragging and self.start_pos is not None:
+            old_rect = QRect(self.start_pos, self.end_pos).normalized()
+            self.end_pos = QPoint(self._vpos)
+            new_rect = QRect(self.start_pos, self.end_pos).normalized()
+            dirty = old_rect.united(new_rect).adjusted(-4, -4, 4, 4)
+            self.update(dirty)
+        # cursor shape mirrors the real-cursor rules: arrow on the
+        # slider, size-all on the empty panel, crosshair elsewhere
+        sl_rect = QRect(self.slider.mapTo(self, QPoint(0, 0)),
+                        self.slider.size())
+        if sl_rect.contains(self._vpos):
+            self._vcursor_kind = 'arrow'
+        elif self.panel.geometry().contains(self._vpos):
+            self._vcursor_kind = 'move'
+        else:
+            self._vcursor_kind = 'cross'
+        # hover feedback: same WA_UnderMouse trick as _fix_slider_hover
+        over = self.slider_container.rect().contains(
+            self.slider_container.mapFrom(self, self._vpos))
+        if over != getattr(self, '_vhover', False):
+            self._vhover = over
+            self.slider_container.setAttribute(Qt.WA_UnderMouse, over)
+            self.slider_container.update()
+        self.update(QRect(old, old).adjusted(-24, -24, 28, 28))
+        self.update(QRect(self._vpos, self._vpos).adjusted(-24, -24, 28, 28))
+
+    def _vslider_set_from_x(self, x):
+        # map a virtual-cursor x (overlay coords) onto the slider value
+        left = self.slider.mapTo(self, QPoint(0, 0)).x()
+        ratio = (x - left) / max(1, self.slider.width())
+        ratio = min(max(ratio, 0.0), 1.0)
+        value = self.slider.minimum() + ratio * (
+            self.slider.maximum() - self.slider.minimum())
+        self.slider.setValue(round(value))
+
+    def _vmouse_press(self):
+        if not self._vmode:
+            return
+        if self.panel.geometry().contains(self._vpos):
+            sl_rect = QRect(self.slider.mapTo(self, QPoint(0, 0)),
+                            self.slider.size())
+            if sl_rect.contains(self._vpos):
+                # on the slider: press shows the pressed handle, holding
+                # and moving drags the value
+                self._vslider_drag = True
+                self.slider.setSliderDown(True)
+                self._vslider_set_from_x(self._vpos.x())
+            else:
+                # on the empty panel area: drag moves the panel, same as
+                # the real-cursor path in eventFilter
+                self._vpanel_drag = True
+                self._vpanel_start = QPoint(self._vpos)
+                self._vpanel_origin = self.panel.pos()
+            return
+        self.start_pos = QPoint(self._vpos)
+        self.end_pos = QPoint(self._vpos)
+        self.dragging = True
+        self.update()
+
+    def _vmouse_release(self):
+        if not self._vmode:
+            return
+        if getattr(self, '_vslider_drag', False):
+            self._vslider_drag = False
+            self.slider.setSliderDown(False)
+            return
+        if getattr(self, '_vpanel_drag', False):
+            self._vpanel_drag = False
+            return
+        if not self.dragging:
+            return
+        self.dragging = False
+        self._do_snip(QPoint(self._vpos))
+
+    # ---- qt mouse events (real cursor; ignored in virtual mode) ----
     def mousePressEvent(self, event):
+        if self._vmode:
+            return
         if event.button() == Qt.LeftButton:
             self.start_pos = event.pos()
             self.end_pos = event.pos()
@@ -1588,7 +1846,9 @@ class Snip(QWidget):
             self.update()
 
     def mouseMoveEvent(self, event):
-        if self.start_pos is None:
+        if self._vmode:
+            return
+        if self.start_pos is None or not self.dragging:
             return
 
         old_rect = QRect(self.start_pos, self.end_pos).normalized()
@@ -1598,34 +1858,43 @@ class Snip(QWidget):
         self.update(dirty)
 
     def mouseReleaseEvent(self, event):
-        global processing
+        if self._vmode:
+            return
         if event.button() == Qt.LeftButton and self.start_pos:
-            self.end_pos = event.pos()
-            rect = QRect(self.start_pos, self.end_pos).normalized()
-            cropped = self.background.copy(rect)
-            click_time = time.time()
-            audio_bytes, audio_start_time, audio_end_time = recorder.capture_last(
-                self.snip_time, click_time)  # test need move to thread
-            self.close_snip(True)
-            print('lock_length ' + str(lock_length - 1) + ' slider value ' +
-                  str(self.slider.value()))  # text
-            if config['playback_hint_left'] > 0:
-                if lock_length - 1 > self.slider.value(
-                ):  # means slider is used by user
-                    n = config['playback_hint_left'] - 1
-                    update_config('playback_hint_left', n)
-                    if n <= 0:
-                        self.hint_label.deleteLater()
-            run_ocr_and_display(
-                ocr, on_error, cropped, self.background, self.slider.value(),
-                rect, audio_bytes, audio_start_time,
-                audio_end_time)  # test need better thread arrangement
+            self._do_snip(event.pos())
+
+    def _do_snip(self, pos):
+        # freeze the rubber band at the release point BEFORE waiting:
+        # check_processing pumps the event loop, and without this the
+        # rect keeps chasing the mouse during the wait
+        self.end_pos = pos
+        self.dragging = False
+        self.update()
+        check_processing(round_anki_audio_sent)
+        rect = QRect(self.start_pos, self.end_pos).normalized()
+        cropped = self.background.copy(rect)
+        click_time = time.time()
+        audio_bytes, audio_start_time, audio_end_time = recorder.capture_last(
+            self.snip_time, click_time)  # test need move to thread
+        self.close_snip(True)
+        print('lock_length ' + str(lock_length - 1) + ' slider value ' +
+              str(self.slider.value()))  # text
+        if config['playback_hint_left'] > 0:
+            if lock_length - 1 > self.slider.value(
+            ):  # means slider is used by user
+                n = config['playback_hint_left'] - 1
+                update_config('playback_hint_left', n)
+                if n <= 0:
+                    self.hint_label.deleteLater()
+        run_ocr_and_display(
+            ocr, on_error, cropped, self.background, self.slider.value(),
+            rect, audio_bytes, audio_start_time,
+            audio_end_time)  # test need better thread arrangement
 
 
 def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                         audio_bytes, audio_start_time, audio_end_time):
-    global window, lock_length, processing
-    processing = 0
+    round_reset()
     ocr_result = run_ocr(image, ocr, on_error, 2)
 
     if ocr_result:
@@ -1664,6 +1933,7 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             if window.isMinimized():
                 window.showNormal()
                 window.raise_()
+            round_display.set()
             threading.Thread(target=after_display,
                              args=(word_info, word, points, audio_bytes,
                                    snip_index, audio_start_time,
@@ -1677,10 +1947,11 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                 window.showNormal()
                 window.raise_()
             print('search dict fail for ' + word)
-            processing = 3
+            screenshot_logout()
+            round_finish_all()
     else:
         screenshot_logout()
-        processing = 3
+        round_finish_all()
         window._toast = Toast(ui('no_ocr_result'), duration=2000)
 
 
@@ -1725,7 +1996,6 @@ def resize_window_height():
 
 def after_display(word_info, word, points, audio_bytes, snip_index,
                   audio_start_time, audio_end_time, rect, qimg_full):
-    global processing
     # create new note in anki
     word_info['word'] = word
     word_info['position'] = '[' + str(points[0].x()) + ',' + str(
@@ -1737,14 +2007,14 @@ def after_display(word_info, word, points, audio_bytes, snip_index,
     anki_new_note_thread = threading.Thread(target=anki_new_note,args=(word_info,qimg_full,anki_new_note_time_stamp,),daemon=True)
     anki_new_note_thread.start()
     if len(audio_bytes) > 0:
-        threading.Thread(target=process_audio,args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp),daemon=True,).start()
+        threading.Thread(target=process_audio,args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp,anki_new_note_thread),daemon=True,).start()
     else:
         anki_new_note_thread.join()
-        processing = 3
+        screenshot_logout()
+        round_finish_all()
 
 
-def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,rect,word,anki_new_note_time_stamp):
-    global processing
+def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,rect,word,anki_new_note_time_stamp,anki_new_note_thread):
 
     folder_path = os.path.join(
         os.path.expanduser("~"), "Downloads", "acard",
@@ -1768,9 +2038,10 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     start_byte, start_frame = analyze_audio_start(audio_bytes, audio_start_time, rms, rms_moving_average,
                   frame_duration_ms, snip_index_in_sentences,
                   subtitle_sentences, ambiguous_diff_max)
-    processing = 2
+    round_audio_analysis_start_time_done.set()
 
     detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
+    screenshot_logout()
     end_byte, end_frame = analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
                 frame_duration_ms, snip_index_in_sentences,
                 subtitle_sentences, ambiguous_diff_max,start_frame)
@@ -1803,7 +2074,8 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                     "fields": fields
                 })
     
-    processing = 3
+    anki_new_note_thread.join()
+    round_finish_all()
         
     # test need delete
     import csv
@@ -2080,8 +2352,6 @@ def detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitl
                 folder_path,
                 f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
             ))  #test need delete
-    
-    screenshot_logout()
 
 
 def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sentences,
@@ -2261,14 +2531,14 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp):
 
 
 def anki_new_note_after(anki_new_note_time_stamp,anki_id, word):
-    global processing, anki_last_new_note
+    global anki_last_new_note
     anki_last_new_note = (anki_new_note_time_stamp,anki_id)
     anki_list.insert(0, [anki_id, word])
     if len(anki_list) > 20:
         anki_list.pop()
     window.anki_id = anki_id
     set_save_baseline()
-    processing = 1
+    round_anki_id_generated.set()
     threading.Thread(target=anki_sync, daemon=True).start()
 
 
@@ -2301,6 +2571,10 @@ def anki_get_and_display(anki_id, anki_check):
                         fields['excerpt']['value'], fields['fuzzy']['value'],
                         pixmap, True, True)
     window.word.setText(fields['word']['value'])
+
+    # paint the refreshed word now; audio download below may take a while
+    QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
     audio_field = fields['audio']['value']  # e.g. '<img src="xxx.mp3">'
     m = re.search(r'src="([^"]+)"', audio_field)
     if m:
@@ -2329,7 +2603,7 @@ def anki_delete_note():  # test need more detailed delete
     if _play_session is not None:
         _play_session.set_end(STOP_NOW)   # fade out audio of the note being deleted
     window.delete_btn.setChecked(True)
-    check_processing(1)
+    check_processing(round_anki_id_generated)
     window.delete_btn.setChecked(False)
     anki_check_needed = True
     if window.anki_id:  # test need to consider blank
@@ -2479,20 +2753,19 @@ def anki_connect_is_running():
 
 
 def refresh_word():
-    global processing
-    check_processing(2)
-    processing = 0
+    check_processing(round_anki_audio_sent)
+    round_reset()
     word = window.word.text()
     if word:
         word_info = search_dict(word)
         window_display_word(word_info['spell'], word_info['pron'],
                             word_info['excerpt'], word_info['fuzzy'], None,
                             False, True)
-    processing = 3
+    round_finish_all()
 
 
 def save_word_qt_to_anki():
-    global processing, hide_on_click
+    global hide_on_click
     hide_on_click = True
     if not window.anki_id:          # nothing to update if no note shown
         return
@@ -2519,7 +2792,7 @@ def save_word_qt_to_anki():
             anki_list[i][1] = word
             break
     set_save_baseline()             # content == saved now -> grey out save
-    processing = 3
+    round_finish_all()
     threading.Thread(target=anki_sync, daemon=True).start()
 
 
@@ -2528,7 +2801,7 @@ def refresh_history_menu():
     hide_on_click = False   # user opened history: they need the UI
     toggle_to_main()
     window.history_menu.clear()
-    check_processing(1)
+    check_processing(round_anki_id_generated)
     hwnd = int(window.history_menu.winId())
     user32.SetWindowDisplayAffinity(hwnd, 0)
     user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
@@ -3939,7 +4212,7 @@ def play_audio(event):
     fw = window.focusWidget()
     if fw is not None:
         fw.clearFocus()
-    check_processing(2)
+    check_processing(round_audio_analysis_start_time_done)
 
     global _play_session
     if not hasattr(window, 'audio_wav') or not window.audio_wav:
@@ -4203,9 +4476,9 @@ def toggle_to_setting():
     QTimer.singleShot(0, re_elide)   # after the page is laid out
 
 
-def check_processing(target_processing_stage):
-    for i in range(40):
-        if processing >= target_processing_stage:
+def check_processing(event):
+    for i in range(100):
+        if event.is_set():
             break
         else:
             QApplication.processEvents()
@@ -4391,7 +4664,7 @@ def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
         subtitle_end_frame_to_middle = subtitle_end_frame
 
     # shift end to side to find blank
-    blank_audio_ms_end = 200
+    blank_audio_ms_end = 150
     blank_frame_target_end = blank_audio_ms_end // frame_duration_ms
     blank_frame_now = 0
     for i in range(subtitle_end_frame_to_middle, len(rms)):
@@ -6596,7 +6869,13 @@ anki_thread = threading.Thread(target=open_anki,
 anki_thread.start()  # test
 threading.Thread(target=check_google_reachable,daemon=True).start()
 check_dup()
-processing = 3  # global variable to check if some thread is in processing, 0 = in processing, 1 = after new note before audio analysis, 2 = after audio analysis before audio range add to anki, 3 = all done
+
+round_display = threading.Event()
+round_anki_id_generated = threading.Event()
+round_audio_analysis_start_time_done = threading.Event()
+round_anki_audio_sent = threading.Event()
+_round_events = (round_display, round_anki_id_generated, round_audio_analysis_start_time_done, round_anki_audio_sent)
+
 session = None  # moji session
 dummy_uuid = str(uuid.uuid4())
 hotkey_mode = 1  # -1 = ignore all, 0 = config, 1 = main, 2 = in snip
@@ -6604,6 +6883,16 @@ keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 last_moji_search_time = 0
 anki_sync_running = False
 _dict_loading = False
+
+
+def round_reset():
+    for ev in _round_events:
+        ev.clear()
+
+
+def round_finish_all():
+    for ev in _round_events:
+        ev.set()
 
 
 def _init_dict():
@@ -6744,6 +7033,7 @@ lock = threading.Lock()
 user32 = WinDLL("user32", use_last_error=True)
 screenshot_users = 0
 lock_length = 0
+round_finish_all()
 this_screenshot_time = int(time.time()) * 1000  # initial run at whole second to reduce rounding effect
 psutil.cpu_percent(interval=0)  # for cpu
 high_cpu_seconds = 0
