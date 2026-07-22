@@ -821,7 +821,7 @@ def _mouse_hook_proc(nCode, wParam, lParam):
         if wParam == WM_LBUTTONDOWN:
             if window.isVisible():
                 info = cast(lParam, POINTER(MSLLHOOKSTRUCT))[0]
-                if QApplication.activePopupWidget() is None and not window.geometry().contains(QPoint(info.pt.x,info.pt.y)) and hide_on_click:
+                if hide_on_click and QApplication.activePopupWidget() is None and not window.geometry().contains(QPoint(info.pt.x,info.pt.y)) and window.stack.currentIndex() != 1:
                     window.hide_signal.emit()
                     hide_on_click = False
         return passthrough()
@@ -2024,6 +2024,10 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     os.makedirs(folder_path, exist_ok=True)  #test need delete
 
     snip_hog, subtitle_sentences, snip_index_in_sentences, rect_small, rect_expanded, direction = detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect)
+    
+    snip_strip = screenshot[snip_index][0].copy(rect_small)  # test need delete: grab before logout, saved in debug tail
+    snip_strip_time = screenshot[snip_index][1] / 1000  # test need delete
+    
     ambiguous_diff_max = 0.15
     detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
     
@@ -2079,18 +2083,22 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
         
     # test need delete
     import csv
+    snip_strip.save(
+        os.path.join(folder_path, f"{snip_strip_time:.3f}-snip.png"))
     with open(os.path.join(folder_path, "sentences.csv"), "w",
               newline="") as f:
         csv.writer(f).writerows(
             [["diff_snip", "diff_last", "frame_time", "ocr_same", "ocr_type"]
              ] + list(subtitle_sentences))
 
-    with open(os.path.join(folder_path, "audio.mp3"), "wb") as f:
-        f.write(wav_to_mp3(pcm_to_wav_bytes(audio_bytes)))  # debug dump, moved off the critical path
-    debug_frames = (
-        start_byte, start_frame, end_byte, end_frame, play_start_time, play_end_time
-    )
-    import csv
+    try:
+        # WAV, not mp3: sample-exact seeking, zero encoder delay, so the
+        # '@..s' positions line up exactly with the byte offsets
+        with open(os.path.join(folder_path, "audio.wav"), "wb") as f:
+            f.write(pcm_to_wav_bytes(audio_bytes))
+    except OSError as e:
+        # excel's mci player may still hold the previous file open
+        print('debug audio.wav write skipped:', e)
     SENTENCE_COLS = 5  # number of columns in sentences.csv
     with open(os.path.join(folder_path, 'sentences.csv'),
                 'r',
@@ -2104,21 +2112,58 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
             f'{rms_moving_average[i]:.6f}'
             if i < len(rms_moving_average) else ''
         ]
-    while len(rows[0]) < SENTENCE_COLS + 3:
+    # column H row0: the snipped word (matches <time>-snip.png).
+    # column I: folder, audio start, frame duration, then the twelve
+    # stage results of play START/END detection; '@..s' = position
+    # inside this folder's audio.mp3
+    while len(rows[0]) < SENTENCE_COLS + 4:
         rows[0].append('')
-    while len(rows[1]) < SENTENCE_COLS + 3:
+    while len(rows[1]) < SENTENCE_COLS + 4:
         rows[1].append('')
-    rows[0][SENTENCE_COLS + 2] = folder_path
-    rows[1][SENTENCE_COLS + 2] = f'{audio_start_time:.3f}'
-    for i, val in enumerate(debug_frames):
+    rows[0][SENTENCE_COLS + 2] = word
+    # H row2: the word's box (x,y,w,h) RELATIVE to <time>-snip.png
+    # (= rect_small), directly usable as a template crop box
+    _wx = [p.x() for p in points]
+    _wy = [p.y() for p in points]
+    rows[1][SENTENCE_COLS + 2] = (
+        f'{min(_wx) - rect_small.x()},{min(_wy) - rect_small.y()},'
+        f'{max(_wx) - min(_wx)},{max(_wy) - min(_wy)}')
+    rows[0][SENTENCE_COLS + 3] = folder_path
+    rows[1][SENTENCE_COLS + 3] = f'{audio_start_time:.3f}'
+    bps = recorder.BYTES_PER_SEC
+    fdur = frame_duration_ms / 1000
+    step_vals = [f'frame_duration_ms={frame_duration_ms}']
+    start_labels = [
+        'subtitle_start_time', 'subtitle_start_frame',
+        'subtitle_start_frame_to_middle',
+        'subtitle_start_frame_to_middle_to_side',
+        'subtitle_start_frame_to_middle_to_side_after_blank_frame',
+        'start_byte']
+    end_labels = [
+        'subtitle_end_time', 'subtitle_end_frame',
+        'subtitle_end_frame_to_middle',
+        'subtitle_end_frame_to_middle_to_side',
+        'subtitle_end_frame_to_middle_to_side_after_blank_frame',
+        'end_byte']
+    for lbls, fn in ((start_labels, analyze_audio_start),
+                     (end_labels, analyze_audio_end)):
+        for lbl, v in zip(lbls, getattr(fn, '_dbg', [])):
+            if lbl.endswith('_time'):
+                t = v - audio_start_time
+            elif lbl.endswith('_byte'):
+                t = v / bps
+            else:
+                t = v * fdur
+            step_vals.append(f'{lbl}={v} @{t:.3f}s')
+    for i, val in enumerate(step_vals):
         while len(rows) <= i + 2:
-            rows.append([''] * (SENTENCE_COLS + 3))
-        while len(rows[i + 2]) < SENTENCE_COLS + 3:
+            rows.append([''] * (SENTENCE_COLS + 4))
+        while len(rows[i + 2]) < SENTENCE_COLS + 4:
             rows[i + 2].append('')
-        rows[i + 2][SENTENCE_COLS + 2] = str(val)
+        rows[i + 2][SENTENCE_COLS + 3] = str(val)
     with open(os.path.join(folder_path, 'sentences.csv'),
                 'w',
-                encoding='utf-8',
+                encoding='utf-8-sig',
                 newline='') as f:
         csv.writer(f).writerows(rows)
 
@@ -2208,67 +2253,6 @@ def quad_to_smaller_rect(points):
     margin = min(x2 - x1, y2 - y1) * 0.2
     return QRect(round(x1 + margin), round(y1 + margin),
                  round(x2 - x1 - margin * 2), round(y2 - y1 - margin * 2))
-
-
-def detect_subtitle(points, snip_index, audio_start_time, audio_end_time,
-                    audio_bytes, rect, word, ocr, on_error, folder_path):
-    return
-    global lock_length
-
-    # same direction with original ocr
-    # this is because rect will be expanded vertically for further ocr
-    # if no adjustment here, the ocr is more likely to become vertical
-    rect_small = quad_to_smaller_rect(points)
-    w = rect_small.width()
-    h = rect_small.height()
-    if w >= h * 1.8:
-        direction = 0  # horizontal
-    elif h >= w * 1.8:
-        direction = 1  # vertical
-    else:
-        direction = 2  # auto
-
-    os.makedirs(folder_path, exist_ok=True)  #test need delete
-
-    sentences = []
-    snip_hog = compute_hog(screenshot[snip_index][0], rect_small)
-
-    for i in range(lock_length):
-        this_frame_time = screenshot[i][1] / 1000
-        if audio_start_time <= this_frame_time and this_frame_time <= audio_end_time:
-            if i == snip_index:
-                snip_index_in_sentences = len(sentences)
-            sentences.append([
-                -1, -1, this_frame_time, -1, ''
-            ])  # (diff_snip,diff_last,time,ocr_same) test need delete last
-
-    # expand rect
-    expand = rect.height() * 5
-    rect_expanded = rect.adjusted(0, -expand, 0, expand)
-    screen_h = screenshot[snip_index][0].height()
-    if rect_expanded.top() < 0:
-        rect_expanded.setTop(0)
-    if rect_expanded.bottom() > screen_h - 1:
-        rect_expanded.setBottom(screen_h - 1)
-
-    detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,sentences,rect_small,rect_expanded,word,direction,folder_path)
-
-    detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,sentences,rect_small,rect_expanded,word,direction,folder_path)
-
-    #test need delete
-    import csv
-    with open(os.path.join(folder_path, "sentences.csv"), "w",
-              newline="") as f:
-        csv.writer(f).writerows(
-            [["diff_snip", "diff_last", "frame_time", "ocr_same", "ocr_type"]
-             ] + list(sentences))
-    audio_wav = pcm_to_wav_bytes(audio_bytes)  #test
-    audio_mp3 = wav_to_mp3(audio_wav)
-    with open(os.path.join(folder_path, "audio.mp3"), "wb") as f:
-        f.write(audio_mp3)
-
-    lock_length = 0
-    return sentences, snip_index_in_sentences
 
 
 def detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect):
@@ -2596,11 +2580,14 @@ def anki_get_and_display(anki_id, anki_check):
         window.audio_wav = None
     window.anki_id = anki_id
     set_save_baseline()
-    
+
 
 def anki_delete_note():  # test need more detailed delete
     global anki_check_needed
-    if _play_session is not None:
+    # stop audio only if what is playing IS the note being deleted;
+    # a session still playing an EARLIER capture keeps going
+    if _play_session is not None and getattr(
+            _play_session, 'src_wav', None) is window.audio_wav:
         _play_session.set_end(STOP_NOW)   # fade out audio of the note being deleted
     window.delete_btn.setChecked(True)
     check_processing(round_anki_id_generated)
@@ -2793,6 +2780,7 @@ def save_word_qt_to_anki():
             break
     set_save_baseline()             # content == saved now -> grey out save
     round_finish_all()
+    resize_window_height()
     threading.Thread(target=anki_sync, daemon=True).start()
 
 
@@ -2924,6 +2912,118 @@ def _lookup_one(c, dic, lang, w):
     if rows:
         return rows[0]
     return first
+# OCR confusion table: SEEN char -> plausible TRUE chars, grouped by the
+# language the TRUE char belongs to; only the src language's group is
+# active. One-way entries are deliberate ('<' never lives inside a word).
+# Applied to the RAW ocr string BEFORE _norm_key (NFKC would fold
+# fullwidth forms and hide some SEEN keys).
+OCR_CONFUSION = {
+    'ja': {
+        '力': ['カ'], 'カ': ['力'],
+        '口': ['ロ'], 'ロ': ['口'],
+        '工': ['エ'], 'エ': ['工', 'ェ'],
+        '夕': ['タ'], 'タ': ['夕'],
+        '二': ['ニ'], 'ニ': ['二'],
+        '八': ['ハ'], 'ハ': ['八'],
+        '卜': ['ト'], 'ト': ['卜'],
+        '才': ['オ'], 'オ': ['才', 'ォ'],
+        'つ': ['っ'], 'っ': ['つ'],
+        'や': ['ゃ'], 'ゃ': ['や'],
+        'ゆ': ['ゅ'], 'ゅ': ['ゆ'],
+        'よ': ['ょ'], 'ょ': ['よ'],
+        'ッ': ['ツ'],
+        'ヨ': ['ョ'], 'ョ': ['ヨ'],
+        'ヤ': ['ャ'], 'ャ': ['ヤ'],
+        'ユ': ['ュ'], 'ュ': ['ユ'],
+        'ア': ['ァ'], 'ァ': ['ア'],
+        'イ': ['ィ'], 'ィ': ['イ'],
+        'ウ': ['ゥ'], 'ゥ': ['ウ'],
+        'ェ': ['エ'],
+        'ォ': ['オ'],
+        '千': ['チ'], 'チ': ['千'],
+        '一': ['ー'], 'ー': ['一'],
+        'ソ': ['ン'], 'ン': ['ソ'],
+        'シ': ['ツ'], 'ツ': ['シ', 'ッ'],
+        'へ': ['ヘ'], 'ヘ': ['へ'],
+        'り': ['リ'], 'リ': ['り'],
+        # dakuten vs handakuten (two dots vs small circle, blurry at
+        # subtitle size); the he/be/pe family also keeps its hira/kata
+        # twin-shape candidates, merged into one list
+        'べ': ['ベ', 'ぺ'], 'ベ': ['べ', 'ペ'],
+        'ぺ': ['ペ', 'べ'], 'ペ': ['ぺ', 'ベ'],
+        'ば': ['ぱ'], 'ぱ': ['ば'],
+        'び': ['ぴ'], 'ぴ': ['び'],
+        'ぶ': ['ぷ'], 'ぷ': ['ぶ'],
+        'ぼ': ['ぽ'], 'ぽ': ['ぼ'],
+        'バ': ['パ'], 'パ': ['バ'],
+        'ビ': ['ピ'], 'ピ': ['ビ'],
+        'ブ': ['プ'], 'プ': ['ブ'],
+        'ボ': ['ポ'], 'ポ': ['ボ'],
+        'つ': ['っ'], 'っ': ['つ'],
+        'ヨ': ['ョ'], 'ョ': ['ヨ'],
+        'や': ['ゃ'], 'ゃ': ['や'],
+        'ゆ': ['ゅ'], 'ゅ': ['ゆ'],
+        'よ': ['ょ'], 'ょ': ['よ'],
+        'ッ': ['ツ'],
+        '元': ['え'],
+        '＜': ['く'], '<': ['く'],
+        '5': ['ら'],
+        '-': ['ー'], '－': ['ー'], '～': ['ー'],
+    },
+    'zh': {
+        'カ': ['力'], 'ロ': ['口'], 'エ': ['工'], 'タ': ['夕'],
+        'ニ': ['二'], 'ハ': ['八'], 'ト': ['卜'], 'オ': ['才'],
+        'チ': ['千'], 'ー': ['一'],
+        '己': ['已'], '已': ['己', '巳'],
+        '未': ['末'], '末': ['未'],
+        '土': ['士'], '士': ['土'],
+        '曰': ['日'],
+        '人': ['入'], '入': ['人'],
+        '夭': ['天'],
+        '0': ['〇'], 'O': ['〇'],
+    },
+    'en': {
+        '0': ['o', 'O'], '1': ['l', 'i'], '5': ['s', 'S'],
+        '8': ['B'], '6': ['b'], '|': ['l', 'I'],
+        'l': ['I'], 'I': ['l'],
+    },
+}
+
+
+def gen_ocr_variants(word, lang, cap=100):
+    """Confusion variants of a raw OCR word, BFS by substitution count:
+    all 1-swap variants first, then 2-swap... capped. Returns a list of
+    (variant, n_substitutions); the original word is not included."""
+    table = OCR_CONFUSION.get(lang)
+    if not table:
+        return []
+    slots = [(i, table[ch]) for i, ch in enumerate(word) if ch in table]
+    if not slots:
+        return []
+    out = []
+    seen = {word}
+    frontier = [word]
+    for depth in range(1, len(slots) + 1):
+        nxt = []
+        for base in frontier:
+            for i, alts in slots:
+                if base[i] != word[i]:
+                    continue          # slot already swapped in this base
+                for alt in alts:
+                    v = base[:i] + alt + base[i + 1:]
+                    if v in seen:
+                        continue
+                    seen.add(v)
+                    nxt.append(v)
+                    out.append((v, depth))
+                    if len(out) >= cap:
+                        return out
+        frontier = nxt
+        if not frontier:
+            break
+    return out
+
+
 def search_dict(word):
     result = {
         "spell": word,
@@ -2976,6 +3076,34 @@ def search_dict(word):
             if n and n not in cands and n not in truncs:
                 truncs.append(n)
 
+        # OCR-confusion variants: lookalike chars swapped in the raw word.
+        # Lower trust than cands: content-bearing exact hits only, tried
+        # only after every cand missed. Each variant reuses the normal
+        # transform pipeline (conjugation / kana / simp).
+        raw_variants = gen_ocr_variants(word, lang)
+        ocr_cands = []
+        fuzzy_variant_keys = []   # single-swap, >=3 chars: may join fuzzy
+        for v, n_subs in raw_variants:
+            if lang == 'ja':
+                vforms = get_base_forms(v, with_trunc=False)
+                vh = kata_to_hira(v)
+                if vh != v:
+                    vforms += get_base_forms(vh, with_trunc=False)
+            elif lang == 'zh':
+                vforms = [v, _to_simp(v)]
+            else:
+                vforms = get_english_base_forms(v)
+            for w in vforms:
+                n = _norm_key(w)
+                if n and n not in cands and n not in ocr_cands:
+                    ocr_cands.append(n)
+            if n_subs == 1 and len(v) >= 3:
+                n = _norm_key(v)
+                if n and n not in fuzzy_variant_keys:
+                    fuzzy_variant_keys.append(n)
+
+        print(cands)
+
         # main hit: primary dict first, then the allowed fallbacks. Only
         # high matches (exact after conjugation/kana/alias transforms) can
         # pull in another language; empty hits never block the chain.
@@ -2993,6 +3121,18 @@ def search_dict(word):
                     empty_hit = r
             if row:
                 break
+        if row is None and ocr_cands:
+            # tier 2: OCR-variant exact hits. Full dict chain (may cross
+            # language), but only hits WITH content count - a guessed
+            # word never blocks the chain with an empty entry
+            for dic in order:
+                for w in ocr_cands:
+                    r = _lookup_one(c, dic, lang, w)
+                    if r is not None and r['excerpt']:
+                        row = r
+                        break
+                if row:
+                    break
         if row is None:
             # partial-match rescue: truncated prefixes, PRIMARY dict only,
             # content-bearing hits only
@@ -3007,12 +3147,16 @@ def search_dict(word):
             result["spell"] = row["spell"]
             result["pron"] = row["pron"] or ""
             result["excerpt"] = row["excerpt"] or ""
+        else:
+            # final miss: dump everything we tried, to grow the table
+            print('search_dict MISS:', word,
+                  '| variants tried:', [v for v, _ in raw_variants])
 
         # fuzzy: prefix matches from the PRIMARY dict only, so the fuzzy
         # area stays in the configured language
         fuzzy_entries = []
         seen = {result["spell"]} if row else set()
-        for w in cands + truncs:
+        for w in cands + fuzzy_variant_keys + truncs:
             frows = c.execute(
                 "SELECT e.spell, e.pron, e.excerpt FROM keys k "
                 "JOIN entries e ON e.id = k.entry_id "
@@ -3141,6 +3285,7 @@ def get_base_forms(word, with_trunc=True):
         (rf'^(.*[{_IC}])れば$', r'\1る'),
         (rf'^(.*[{_IC}])ろ$', r'\1る'),  # imperative: 食べろ → 食べる
         (rf'^(.*[{_IC}])よ$', r'\1る'),  # formal imperative: 食べよ → 食べる
+        (rf'^(.*[{_IC}])$', r'\1る'),    # bare stem: 食べ → 食べる
     ]
     for pat, repl in ichidan_rules:
         if re.match(pat, word):
@@ -3179,6 +3324,16 @@ def get_base_forms(word, with_trunc=True):
         (r'^(.+)みます$', ['む']),
         (r'^(.+)います$', ['う']),
         (r'^(.+)にます$', ['ぬ']),
+        # Bare masu-stem / 連用形 (noun-ized): 録り → 録る, 書き → 書く
+        (r'^(.+)り$', ['る']),
+        (r'^(.+)き$', ['く']),
+        (r'^(.+)ぎ$', ['ぐ']),
+        (r'^(.+)し$', ['す']),
+        (r'^(.+)ち$', ['つ']),
+        (r'^(.+)び$', ['ぶ']),
+        (r'^(.+)み$', ['む']),
+        (r'^(.+)い$', ['う']),
+        (r'^(.+)に$', ['ぬ']),
         # Volitional (ou form)
         (r'^(.+)こう$', ['く']),
         (r'^(.+)ごう$', ['ぐ']),
@@ -3807,12 +3962,27 @@ def set_qt_layout():
     #window.label_pron.setVisible(False)
     #window.label_excerpt.setVisible(False)
 
+    class _SelectAllOnFocus(QObject):
+        # clicking/tabbing into a result box selects its whole content.
+        # selectAll is deferred one tick: the click that grants focus
+        # also places the cursor AFTER FocusIn, which would undo an
+        # immediate selection
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.FocusIn and event.reason() in (
+                    Qt.MouseFocusReason, Qt.TabFocusReason,
+                    Qt.BacktabFocusReason):
+                QTimer.singleShot(0, obj.selectAll)
+            return False
+
+    window._select_all_filter = _SelectAllOnFocus(window)  # keep a live ref
+
     result_boxes = [window.label_spell, window.label_pron, window.label_excerpt, window.label_fuzzy]
     for box in result_boxes:
         box.setContextMenuPolicy(Qt.CustomContextMenu)
         box.customContextMenuRequested.connect(
             lambda pos, w=box: show_custom_context_menu(w, pos, font_size_small))
         setup_editable_result_box(box, result_boxes)
+        box.installEventFilter(window._select_all_filter)
 
 
     # save lights up whenever any field changes (search result or manual edit)
@@ -4603,6 +4773,12 @@ def analyze_audio_start(audio_bytes, audio_start_time, rms, rms_moving_average,
                                         recorder.BYTES_PER_SAMPLE,
                                         recorder.BYTES_PER_SEC, search_ms)
     
+    analyze_audio_start._dbg = [
+        subtitle_start_time, subtitle_start_frame,
+        subtitle_start_frame_to_middle, subtitle_start_frame_to_middle_to_side,
+        subtitle_start_frame_to_middle_to_side_after_blank_frame,
+        start_byte]  # test need delete
+    
     window.start_byte = start_byte
 
     return start_byte, subtitle_start_frame_to_middle_to_side_after_blank_frame
@@ -4680,7 +4856,7 @@ def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
         subtitle_end_frame_to_middle_to_side = len(rms) - 1
 
 
-    subtitle_end_frame_to_middle_to_side_after_blank_frame, search_ms = check_blank_frame(subtitle_end_frame_to_middle_to_side,400,rms,rms_moving_average,frame_duration_ms,0)
+    subtitle_end_frame_to_middle_to_side_after_blank_frame, search_ms = check_blank_frame(subtitle_end_frame_to_middle_to_side,200,rms,rms_moving_average,frame_duration_ms,0)
     subtitle_end_frame_to_middle_to_side_after_blank_frame = max(subtitle_end_frame_to_middle_to_side_after_blank_frame,start_frame)
 
     end_bytes_frame = int(subtitle_end_frame_to_middle_to_side_after_blank_frame *
@@ -4689,8 +4865,15 @@ def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
                                         recorder.BYTES_PER_SAMPLE,
                                         recorder.BYTES_PER_SEC, search_ms)
     
+    # test need delete
+    analyze_audio_end._dbg = [
+        subtitle_end_time, subtitle_end_frame,
+        subtitle_end_frame_to_middle, subtitle_end_frame_to_middle_to_side,
+        subtitle_end_frame_to_middle_to_side_after_blank_frame,
+        end_byte]  # test need delete
     window.end_byte = end_byte
     # deliver END to the live session if it is playing THIS capture
+
     if _play_session is not None and getattr(_play_session, 'src_wav', None) is window.audio_wav:
         _play_session.set_end_bytes(end_byte)
 
@@ -5100,7 +5283,7 @@ def snap_to_min_energy(audio_bytes,
                        bytes_per_sample,
                        bytes_per_sec,
                        search_ms,
-                       window_ms=10):
+                       window_ms=30):
     aligned_target = target_byte - target_byte % bytes_per_sample
     if search_ms == 0:
         return aligned_target
@@ -5131,17 +5314,25 @@ def snap_to_min_energy(audio_bytes,
 
     samples = np.frombuffer(audio_bytes[region_lo:region_hi],
                             dtype=np.int16).astype(np.int64)
+    # collapse interleaved channel values into per-FRAME energy, so every
+    # index below lives in sample-frame units (bytes_per_sample bytes).
+    # indexing the raw int16 array with frame indices halved every
+    # measured position and doubled the returned displacement
+    spf = bytes_per_sample // 2          # int16 values per frame
+    n_frames = len(samples) // spf
+    frame_sq = (samples[:n_frames * spf] *
+                samples[:n_frames * spf]).reshape(n_frames, spf).sum(axis=1)
 
     # Cumulative sum of squares -> any window's energy in O(1).
     # int64 is required: int16^2 accumulated over the region can overflow int32.
-    cumsum_sq = np.concatenate(([0], np.cumsum(samples * samples)))
+    cumsum_sq = np.concatenate(([0], np.cumsum(frame_sq)))
 
     half_n = half_window_bytes // bytes_per_sample
 
-    # Candidate sample range, clamped so the window never goes out of bounds.
+    # Candidate frame range, clamped so the window never goes out of bounds.
     cand_lo = max(half_n, (search_lo_byte - region_lo) // bytes_per_sample)
     cand_hi = min(
-        len(samples) - half_n,
+        n_frames - half_n,
         (search_hi_byte - region_lo) // bytes_per_sample + 1)
     if cand_hi <= cand_lo:
         return aligned_target
@@ -5695,6 +5886,7 @@ def anki_create_model():
           let audioBuffer = null;
           let audioCtx = null;
           let currentSource = null;
+          let rebuilds = 0;   // zombie-clock rebuild quota per visit/tap
           let webStart = 0;
           let webOffset = 0;
           let rafId = null;
@@ -5830,6 +6022,43 @@ def anki_create_model():
               var maxGain = isMobile ? 8 : 3;
               volCache.vol = Math.min(targetPeak / peak, maxGain);
           }
+          function rebuildAndReplay(tag) {
+              if (rebuilds >= 4) {
+                  if (window._apDbgLog) window._apDbgLog("au:giveup " + tag);
+                  return;
+              }
+              rebuilds++;
+              if (window._apDbgLog) window._apDbgLog("au:rebuild" + rebuilds + " " + tag);
+              try { audioCtx.close(); } catch (e) {}
+              const AC = window.AudioContext || window.webkitAudioContext;
+              audioCtx = new AC();
+              window.top._apAudioCtx = audioCtx;
+              playRangeInternal();
+          }
+          function warmupClock(attempt) {
+              // on return from background: verify the clock actually
+              // advances; silently rebuild frozen contexts so the next
+              // tap lands on a live one. Never touches a moving clock.
+              attempt = attempt || 0;
+              if (!audioCtx) return;
+              if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") {
+                  try { audioCtx.resume(); } catch (e) {}
+              }
+              const c0 = audioCtx;
+              const t0 = c0.currentTime;
+              setTimeout(function () {
+                  if (audioCtx !== c0) return;
+                  const adv = c0.currentTime - t0;
+                  if (window._apDbgLog) window._apDbgLog(
+                      "au:warm" + attempt + " +" + adv.toFixed(3) + " " + c0.state);
+                  if (adv > 0 || attempt >= 5) return;
+                  try { c0.close(); } catch (e) {}
+                  const AC = window.AudioContext || window.webkitAudioContext;
+                  audioCtx = new AC();
+                  window.top._apAudioCtx = audioCtx;
+                  warmupClock(attempt + 1);
+              }, 400);
+          }
           function playRangeInternal() {
               stopCurrent();
               if (!audioBuffer || !audioCtx || !duration) return;
@@ -5847,6 +6076,22 @@ def anki_create_model():
               currentSource = source;
               webStart = audioCtx.currentTime;
               webOffset = offset;
+              // zombie-clock watchdog WITH repair: frozen currentTime on
+              // a 'running' context = dead output unit. Rebuild the
+              // context and replay; fresh contexts can inherit the stuck
+              // session, so retries (with quota) matter.
+              const zt = audioCtx.currentTime;
+              const zsrc = source;
+              const zctx = audioCtx;
+              [300, 1200].forEach(function (ms) {
+                  setTimeout(function () {
+                      if (currentSource !== zsrc || audioCtx !== zctx) return;
+                      const adv = zctx.currentTime - zt;
+                      if (window._apDbgLog) window._apDbgLog(
+                          "au:tick" + ms + " +" + adv.toFixed(3) + " " + zctx.state);
+                      if (adv === 0) rebuildAndReplay("t" + ms);
+                  }, ms);
+              });
               const MAX_FADE_S = 0.3;
               const MAX_VOL = 0.01;
               const sr = audioBuffer.sampleRate;
@@ -6108,6 +6353,7 @@ def anki_create_model():
               addTracked(document, "touchend", onUp);
           }
           window.playRange = function () {
+              rebuilds = 0;   // each real tap earns a fresh repair quota
               if (typeof fadeStop === "function" && window.top._audio) {
                   fadeStop(window.top._audio, 200);
                   window.top._audio = null;
@@ -6140,6 +6386,8 @@ def anki_create_model():
           }
           function onVisible() {
               if (document.visibilityState === "visible") {
+                  rebuilds = 0;
+                  warmupClock();
                   setTimeout(redrawAll, 100);
                   setTimeout(redrawAll, 700);
               }
@@ -6228,7 +6476,7 @@ def anki_create_model():
    // and the copy callout work fine on plain text.
    ta.style.cssText = 'width:80%;height:3em;font-size:16px;background:white;color:black;padding:8px;overflow:auto;word-break:break-all;-webkit-user-select:text;user-select:text;';
    var label = document.createElement('div');
-   label.innerHTML = '1.Copy below text<br>2.Click "Edit" in Anki<br>3.Paste to field "time"<br>4.Sync this device<br>5.Sync another device<br>6.On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"'
+   label.innerHTML = '<div style="text-align:center;margin-bottom:6px">Manually sync audio time to another device</div>1. Copy below text<br>2. Click "Edit" in Anki<br>3. Paste to field "time"<br>4. Sync this device<br>5. Sync another device<br>6. On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"'
    label.style.cssText = 'color:white;margin-bottom:8px;font-size:14px;text-align:left;';
        var btn = document.createElement('button');
        btn.textContent = 'Close';
@@ -6326,7 +6574,7 @@ def anki_create_model():
        }
        function render() {
            var el = document.getElementById('dbg-panel');
-           if (el) el.textContent = D.log.slice(-12).join(NL);
+           if (el) el.textContent = D.log.slice(-30).join(NL);
        }
        function log(msg) {
            D.log.push(ts() + ' ' + msg);
@@ -6438,6 +6686,7 @@ def anki_create_model():
            wrapped._dbgWrapped = true;
            window.playRange = wrapped;
        }
+       window._apDbgLog = log;   // probe output for the play-clock ticks
        if (D.timer) clearInterval(D.timer);
        D.timer = setInterval(function () { check('t'); }, 3000);
        if (!document._imgDbgArmed) {
@@ -6638,8 +6887,8 @@ body.landscape #text-wrap {
             ('Import complete, ', '导入完成，更新了'),
             ('records updated', '条记录'),
             ('Error: ', '解析失败：'),
-            ('1.Copy below text<br>2.Click "Edit" in Anki<br>3.Paste to field "time"<br>4.Sync this device<br>5.Sync another device<br>6.On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"',
-             '1.复制以下文本<br>2.点击Anki的"编辑"<br>3.找到"time"字段并黏贴<br>4.同步本设备<br>5.同步另一设备<br>6.在另一设备打开 <span style="text-decoration:underline">同一词条</span> 并点击"导入音频时间"'
+            ('<div style="text-align:center;margin-bottom:6px">Manually sync audio time to another device</div>1. Copy below text<br>2. Click "Edit" in Anki<br>3. Paste to field "time"<br>4. Sync this device<br>5. Sync another device<br>6. On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"',
+             '<div style="text-align:center;margin-bottom:6px">手动复制音频时间到另一设备</div>1.复制以下文本<br>2.点击Anki的"编辑"<br>3.找到"time"字段并黏贴<br>4.同步本设备<br>5.同步另一设备<br>6.在另一设备打开 <span style="text-decoration:underline">同一词条</span> 并点击"导入音频时间"'
              ),
             ('Copy Audio Time', '复制音频时间'),
             ('Import Audio Time', '导入音频时间'),
