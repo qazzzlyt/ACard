@@ -464,6 +464,8 @@ UI_TEXT = {
      ),
     'dict': ('Dictionary', '字典'),
     'monitor': ('Monitor', '显示器'),
+    'search_dup': ('Combine to note?', '合并到已有词条?'),
+    'delete_dup': ('Delete note with multiple entries?', '删除全部词条?'),
     'cut': ('Cut', '剪切'),
     'copy': ('Copy', '复制'),
     'paste': ('Paste', '粘贴'),
@@ -2068,7 +2070,13 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
         fields = {}
         if audio_wav_after_trim:
             audio_mp3 = wav_to_mp3(audio_wav_after_trim)
-            audio_name = anki_upload_media(audio_mp3, word + str(anki_new_note_time_stamp) + '.mp3')
+            # L0 naming: same stem as the jpg (pairing key) + play range
+            # in microseconds; range field kept for the desktop reader
+            audio_name = anki_upload_media(
+                audio_mp3,
+                anki_l0_stem(word, anki_new_note_time_stamp)
+                + f'_r{round(float(play_start_time) * 1e6)}'
+                + f'-{round(float(play_end_time) * 1e6)}.mp3')
             if audio_name:
                 fields['audio'] = f'<img src="{audio_name["result"]}">'  # pretend to be a img so anki will not auto delete it. if label it as a sound, anki will force to auto play it, which i do not want
                 fields['range'] = f"{float(play_start_time)},{float(play_end_time)}"
@@ -2484,17 +2492,38 @@ def window_display_word_blank():
 
 
 anki_last_new_note = (None,None)  # 0 = time stamp 1 = anki_id
+def anki_l0_stem(word, ts):
+    # L0 media stem: sanitized word (max 18 chars) + 13-digit ms timestamp.
+    # MUST be byte-identical between the jpg and mp3 of one capture: the
+    # card template pairs files by everything before the LAST underscore.
+    w = re.sub(r'[\\/:*?"<>|_\s]', '', word)[:18] or 'word'
+    return f'{w}_{int(ts * 1000)}'
+
+
+def anki_l0_quad(position):
+    # position field '[x1,y1],[x2,y2],[x3,y3],[x4,y4]' -> 'x1-y1-...-y4'
+    # (8 dash-separated non-negative ints; all zeros = no quad)
+    pts = re.findall(r'\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]', position or '')
+    if len(pts) != 4:
+        return '-'.join(['0'] * 8)
+    return '-'.join(str(max(0, int(v))) for xy in pts for v in xy)
+
+
 def anki_new_note(fields, qimg_full, anki_new_note_time_stamp):
     global anki_check_needed
     anki_check_needed = True
     anki_check_deck_and_model(False)
-    t = time.strftime("%Y%m%d_%H%M%S")
     if qimg_full:
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         qimg_full.save(buf, "JPEG", int(config['jpeg_quality']))
         img_bytes = buf.data().data()
-        screenshot_name = anki_upload_media(img_bytes,fields['word'] + t + '.jpg')
+        # L0 naming: quad rides in the filename; the template reads it
+        # from there (position field kept only for the desktop reader)
+        screenshot_name = anki_upload_media(
+            img_bytes,
+            anki_l0_stem(fields['word'], anki_new_note_time_stamp)
+            + '_p' + anki_l0_quad(fields.get('position', '')) + '.jpg')
         if screenshot_name:
             fields['screenshot'] = f'<img src="{screenshot_name["result"]}">'
     if fields.get('excerpt'):
@@ -2564,7 +2593,18 @@ def anki_get_and_display(anki_id, anki_check):
     if m:
         mp3_bytes = anki_download_media(m.group(1))
         window.audio_wav = mp3_to_wav(mp3_bytes) if mp3_bytes else None
-        start_sec, end_sec = map(float, fields['range']['value'].split(','))
+        # play range: L0 filename first (_r{us}-{us}); legacy field as
+        # fallback; last resort = play everything
+        rng = re.search(r'_r(\d+)-(\d+)\.[^.]+$', m.group(1))
+        if rng and int(rng.group(2)) > int(rng.group(1)):
+            start_sec = int(rng.group(1)) / 1e6
+            end_sec = int(rng.group(2)) / 1e6
+        else:
+            try:
+                start_sec, end_sec = map(
+                    float, fields['range']['value'].split(','))
+            except (ValueError, KeyError):
+                start_sec, end_sec = 0.0, 3600.0
         # Anki persists seconds; runtime works in PCM bytes. Convert with
         # the DECODED wav's own format (mp3 output may differ from capture)
         if window.audio_wav:
@@ -3963,15 +4003,33 @@ def set_qt_layout():
     #window.label_excerpt.setVisible(False)
 
     class _SelectAllOnFocus(QObject):
-        # clicking/tabbing into a result box selects its whole content.
-        # selectAll is deferred one tick: the click that grants focus
-        # also places the cursor AFTER FocusIn, which would undo an
-        # immediate selection
+        # right-clicking (or tabbing into) a result box selects its whole
+        # content; a plain left-click just places the cursor. selectAll is
+        # deferred one tick: the cursor placement that follows the event
+        # would undo an immediate selection
         def eventFilter(self, obj, event):
-            if event.type() == QEvent.FocusIn and event.reason() in (
-                    Qt.MouseFocusReason, Qt.TabFocusReason,
-                    Qt.BacktabFocusReason):
-                QTimer.singleShot(0, obj.selectAll)
+            # Qt grants click-focus BEFORE delivering the press, so
+            # hasFocus() cannot tell "entering" from "already inside".
+            # FocusIn(mouse) arms a one-shot flag instead; the press that
+            # caused it consumes it: right button selects all, left does
+            # nothing
+            if event.type() == QEvent.FocusIn:
+                if event.reason() == Qt.MouseFocusReason:
+                    # armed for exactly one tick: only the press belonging
+                    # to this same click can consume it. hasFocus() is NOT
+                    # usable here - in this no-activate window it flips
+                    # with window activation, not with box entry
+                    obj._ap_entered = True
+                    QTimer.singleShot(0, lambda o=obj: setattr(
+                        o, '_ap_entered', False))
+                elif event.reason() in (Qt.TabFocusReason,
+                                        Qt.BacktabFocusReason):
+                    QTimer.singleShot(0, obj.selectAll)
+            elif event.type() == QEvent.MouseButtonPress:
+                if event.button() == Qt.RightButton and \
+                        getattr(obj, '_ap_entered', False):
+                    QTimer.singleShot(0, obj.selectAll)
+                obj._ap_entered = False
             return False
 
     window._select_all_filter = _SelectAllOnFocus(window)  # keep a live ref
@@ -5497,7 +5555,15 @@ def anki_create_model():
        // 3. Clear stale global function from previous back side
        try {
            window.playRange = null;
+           window._apSeqArm = null;
+           window._apSeqNext = null;
+           window._apReloadAudio = null;
+           window._apRenderImage = null;
        } catch (e) {}
+       // Invalidate every pending callback (timers/rAF/promise chains)
+       // left behind by previous cards: they compare their captured
+       // generation against this counter and bail out when stale.
+       window.top._apGen = (window.top._apGen || 0) + 1;
    
        // 4. Clear ALL cache entries (audio buffers, waveform bars, bitmaps)
        if (window.top._apCache) {
@@ -5596,7 +5662,88 @@ def anki_create_model():
                });
    }, 0);
 </script>"""
-    BACK_TEMPLATE = """<div style="font-size: min(48px, 8vh)">{{spell}}</div>
+    BACK_TEMPLATE = """<script>
+(function () {
+    // fresh card: the window SURVIVES across cards (that is what makes
+    // _apCache work), so per-card state frozen by the previous card must
+    // be cleared here or it leaks into this one
+    // bump the card generation FIRST: every delayed callback of the
+    // previous card compares its captured generation and bails out
+    window.top._apGen = (window.top._apGen || 0) + 1;
+    window._apFrame = null;
+    window._apSeqArm = null;
+    window._apSeqNext = null;
+    window._apSeqStop = null;
+    // multi-capture parser: pair files by everything before the LAST
+    // underscore; metadata rides in the names (_p quad / _r range-us)
+    function stem(fn) {
+        var b = fn.replace(/\.[^.]+$/, '');
+        var i = b.lastIndexOf('_');
+        return i < 0 ? fn : b.slice(0, i);
+    }
+    function srcs(html) {
+        var out = [], re = /src="([^"]+)"/g, m;
+        while ((m = re.exec(html))) out.push(m[1]);
+        return out;
+    }
+    var caps = [], byStem = {};
+    srcs(`{{screenshot}}`).forEach(function (fn) {
+        var s = stem(fn), c = byStem[s];
+        if (!c) { c = byStem[s] = { stem: s }; caps.push(c); }
+        c.img = fn;
+        var m = fn.match(/_p(\d+(?:-\d+){7})\.[^.]+$/);
+        if (m) {
+            var v = m[1].split('-').map(Number);
+            if (v.some(function (x) { return x; })) {
+                c.quad = [[v[0], v[1]], [v[2], v[3]],
+                          [v[4], v[5]], [v[6], v[7]]];
+            }
+        }
+    });
+    srcs(`{{audio}}`).forEach(function (fn) {
+        var s = stem(fn), c = byStem[s];
+        if (!c) { c = byStem[s] = { stem: s }; caps.push(c); }
+        c.mp3 = fn;
+        var m = fn.match(/_r(\d+)-(\d+)\.[^.]+$/);
+        if (m) {
+            var a = +m[1] / 1e6, b = +m[2] / 1e6;
+            if (b > a) c.range = [a, b];
+        }
+    });
+    // LEGACY MERGE: old cards have one jpg and one mp3 whose names never
+    // pair (and carry no _p/_r metadata) - collapse them into ONE capture
+    if (caps.length === 2) {
+        var io_ = caps.filter(function (c) { return c.img && !c.mp3 && !c.quad; });
+        var ao_ = caps.filter(function (c) { return c.mp3 && !c.img && !c.range; });
+        if (io_.length === 1 && ao_.length === 1) {
+            caps = [{ stem: io_[0].stem, img: io_[0].img, mp3: ao_[0].mp3 }];
+        }
+    }
+    // old-format cards (no metadata in names): fall back to the fields
+    if (caps.length && !caps[0].quad) {
+        var p = [{{position}}];
+        var imgs = caps.filter(function (c) { return c.img; });
+        if (p.length === 4 && imgs.length === 1 && !imgs[0].quad) imgs[0].quad = p;
+    }
+    var withMp3 = caps.filter(function (c) { return c.mp3; });
+    if (withMp3.length === 1 && !withMp3[0].range) {
+        var r = "{{range}}".trim().split(",");
+        if (r.length === 2 && +r[1] > +r[0]) {
+            withMp3[0].range = [+r[0], +r[1]];
+        }
+    }
+    var start = 0, key = 'ap-page:' + (caps.length ? caps[0].stem : '');
+    try {
+        var saved = parseInt(localStorage.getItem(key), 10);
+        if (saved >= 0 && saved < caps.length) start = saved;
+    } catch (e) {}
+    window._apPageKey = key;
+    window._apCaptures = caps;
+    window._apCur = start;
+    window._apCap = function () { return caps[window._apCur] || {}; };
+})();
+</script>
+<div style="font-size: min(48px, 8vh)">{{spell}}</div>
 <div style="font-size: 20px">
 <span id="pron">{{pron}}</span>
 <div id="main-wrap">
@@ -5642,8 +5789,7 @@ def anki_create_model():
              // The blob itself can die after long backgrounding (proven in
              // logs), so the network rung is mandatory.
              if (_rebuildBusy) return;
-             var m2 = `{{audio}}`.match(/src="([^"]+)"/);
-             var fname2 = m2 ? m2[1] : "";
+             var fname2 = window._apCap().mp3 || "";
              var cache = window.top._apCache && window.top._apCache[fname2];
              if (!cache || typeof createImageBitmap !== 'function') return;
              _rebuildBusy = true;
@@ -5656,10 +5802,9 @@ def anki_create_model():
                  }
              }
              function refetch() {
-                 var fb = document.getElementById('word-img-fallback');
-                 var m3 = fb ? /<img[^>]+src="([^"]+)"/.exec(fb.innerHTML) : null;
-                 if (!m3) { _rebuildBusy = false; return; }
-                 fetch(m3[1]).then(function (r) { return r.blob(); })
+                 var _src3 = window._apCap().img;
+                 if (!_src3) { _rebuildBusy = false; return; }
+                 fetch(_src3).then(function (r) { return r.blob(); })
                      .then(function (blob) {
                          cache.blob = blob;
                          return createImageBitmap(blob);
@@ -5684,25 +5829,13 @@ def anki_create_model():
              var canvas = document.getElementById('word-img-canvas');
              var fallback = document.getElementById('word-img-fallback');
              if (!canvas) return;
-             var m = `{{audio}}`.match(/src="([^"]+)"/);
-             var fname = m ? m[1] : "";
+             var fname = window._apCap().mp3 || "";
              var cache = window.top._apCache && window.top._apCache[fname];
              var bitmap = cache && cache.bitmap;
              if (bitmap) {
-             var dpr = window.devicePixelRatio || 1;
-         var displayWidth = window.innerWidth *0.95;
-         var displayHeight = displayWidth * bitmap.height / bitmap.width;
-         var maxH = window.innerHeight < window.innerWidth ? screen.width * 0.35 : screen.height * 0.5;
-         if (displayHeight > maxH) {
-             displayHeight = maxH;
-             displayWidth = maxH * bitmap.width / bitmap.height;
-         }
-             canvas.style.width = displayWidth + 'px';
-             canvas.style.height = displayHeight + 'px';
-             var textWrap = document.getElementById('text-wrap');
-             if (textWrap) textWrap.style.width = displayWidth + 'px';
-             var apWrap = document.querySelector('.ap-wrap');
-             if (apWrap) apWrap.style.width = displayWidth + 'px';
+             canvas.style.display = 'block';
+             fallback.style.display = 'none';
+             ensureFrame(bitmap.width, bitmap.height);
              canvas.width = bitmap.width;
              canvas.height = bitmap.height;
              var ctx = canvas.getContext('2d');
@@ -5722,15 +5855,28 @@ def anki_create_model():
              }
              canvas.style.display = 'none';
              fallback.style.display = 'block';
-             var fbImg = fallback.querySelector('img');
+             var _curImg = window._apCap().img;
+             var _fbAll = fallback.querySelectorAll('img');
+             var fbImg = null;
+             for (var _fi = 0; _fi < _fbAll.length; _fi++) {
+                 var _im = _fbAll[_fi];
+                 _im.style.width = '100%';
+                 _im.style.height = '100%';
+                 // beat the model CSS max-height:60vh cap - the frame box
+                 // is the single size authority now
+                 _im.style.maxWidth = 'none';
+                 _im.style.maxHeight = 'none';
+                 _im.style.objectFit = 'scale-down';
+                 var _vis = !!_curImg && _im.getAttribute('src') === _curImg;
+                 _im.style.display = _vis ? 'block' : 'none';
+                 if (_vis) fbImg = _im;
+             }
              function syncFallbackWidth() {
-                 var apWrap = document.querySelector('.ap-wrap');
-                 if (!apWrap || !fbImg.naturalWidth) return;
-                 var dispW = fbImg.offsetWidth;
-                 apWrap.style.width = dispW + 'px';
+                 if (!fbImg || !fbImg.naturalWidth) return;
+                 ensureFrame(fbImg.naturalWidth, fbImg.naturalHeight);
              }
              if (fbImg) {
-             fbImg.complete ? syncFallbackWidth() :fbImg.addEventListener('load', syncFallbackWidth);
+             fbImg.complete ? syncFallbackWidth() : fbImg.addEventListener('load', syncFallbackWidth);
              }
              return false;
          }
@@ -5757,7 +5903,11 @@ def anki_create_model():
              var wrap = document.getElementById('word-img-wrap');
              if (!wrap) return;
              var canvas = document.getElementById('word-img-canvas');
-             var fallbackImg = wrap.querySelector('#word-img-fallback img');
+             var fallbackImg = null;
+             var _fbs = wrap.querySelectorAll('#word-img-fallback img');
+             for (var _bi = 0; _bi < _fbs.length; _bi++) {
+                 if (_fbs[_bi].style.display !== 'none') { fallbackImg = _fbs[_bi]; break; }
+             }
              var displayEl = (canvas && canvas.style.display !== 'none') ? canvas : fallbackImg;
              if (!displayEl) return;
              var natW, natH;
@@ -5771,21 +5921,83 @@ def anki_create_model():
              }
              var dispW = displayEl.offsetWidth;
              var dispH = displayEl.offsetHeight;
-             var rx = dispW / natW;
-             var ry = dispH / natH;
+             // object-fit insets the drawn image inside the element box:
+             // quad points need the content-rect scale plus offset
+             var _s = Math.min(dispW / natW, dispH / natH, 1);
+             var _ox = (dispW - natW * _s) / 2;
+             var _oy = (dispH - natH * _s) / 2;
              var sv = document.getElementById('sv');
              sv.style.width = dispW + 'px';
              sv.style.height = dispH + 'px';
              sv.style.left = displayEl.offsetLeft + 'px';
              sv.style.top = displayEl.offsetTop + 'px';
              document.getElementById('pl').setAttribute('points',
-             [{{position}}].map(function(p) { return p[0]*rx + ',' + p[1]*ry; }).join(' '));
+             (window._apCap().quad || []).map(function(p) { return (_ox + p[0]*_s) + ',' + (_oy + p[1]*_s); }).join(' '));
+         }
+         (function initFrameBox() {
+             var cv = document.getElementById('word-img-canvas');
+             if (!cv || !cv.parentNode) return;
+             var box = cv.parentNode;
+             box.style.position = 'relative';
+             box.style.overflow = 'hidden';
+             box.style.marginLeft = 'auto';
+             box.style.marginRight = 'auto';
+             cv.style.position = 'absolute';
+             cv.style.left = '0';
+             cv.style.top = '0';
+             cv.style.width = '100%';
+             cv.style.height = '100%';
+             cv.style.objectFit = 'scale-down';
+             var fb = document.getElementById('word-img-fallback');
+             if (fb) {
+                 fb.style.position = 'absolute';
+                 fb.style.left = '0';
+                 fb.style.top = '0';
+                 fb.style.width = '100%';
+                 fb.style.height = '100%';
+             }
+             window._apFrameBox = box;
+         })();
+         function ensureFrame(natW, natH) {
+             if (!window._apFrame) {
+                 // only the HEIGHT is frozen (from the anchor page dims);
+                 // widths stay 100% so late scrollbars / reflows can never
+                 // knock the box, waveform and text out of alignment
+                 var _pn = window._apFrameBox && window._apFrameBox.parentNode;
+                 var w = (_pn && _pn.clientWidth > 0)
+                     ? _pn.clientWidth : window.innerWidth * 0.95;
+                 var h = w * natH / natW;
+                 var mH = window.innerHeight < window.innerWidth ? screen.width * 0.35 : screen.height * 0.5;
+                 // uncapped: width follows the column (100%) so late
+                 // scrollbars can't cause overflow; height-capped: hug the
+                 // image with a numeric width (always < column, so both
+                 // centering mechanisms agree)
+                 var fw = null;
+                 if (h > mH) { h = mH; fw = h * natW / natH; }
+                 window._apFrame = { h: h, w: fw, natW: natW, natH: natH };
+             }
+             var fr = window._apFrame;
+             var _w = fr.w ? fr.w + 'px' : '100%';
+             if (window._apFrameBox) {
+                 window._apFrameBox.style.width = _w;
+                 window._apFrameBox.style.height = fr.h + 'px';
+             }
+             var textWrap = document.getElementById('text-wrap');
+             if (textWrap) textWrap.style.width = _w;
+             var apWrap = document.querySelector('.ap-wrap');
+             if (apWrap) apWrap.style.width = _w;
+             if ((!textWrap || !apWrap) && (fr._rt = (fr._rt || 0) + 1) < 10) {
+                 // parse-order guard: siblings below this script may not
+                 // exist yet on some hosts - size them once they do
+                 setTimeout(function () { ensureFrame(natW, natH); }, 0);
+             }
          }
          renderScreenshot();
          drawBox();
-         var fbImg = document.querySelector('#word-img-fallback img');
-         if (fbImg && !fbImg.complete) {
-             fbImg.addEventListener('load', drawBox);
+         window._apRenderImage = function () { renderScreenshot(); drawBox(); };
+         var _fbImgs = document.querySelectorAll('#word-img-fallback img');
+         for (var _li = 0; _li < _fbImgs.length; _li++) {
+             if (!_fbImgs[_li].complete) _fbImgs[_li].addEventListener('load', drawBox);
          }
          function updateLayout() {
              var isMobile = /iPhone|iPad|Android|HarmonyOS/i.test(navigator.userAgent);
@@ -5793,21 +6005,24 @@ def anki_create_model():
              document.body.classList.toggle('landscape', isMobile && isLandscape);
          }
          updateLayout();
+         function reflowFrame() {
+             updateLayout();
+             if (window._apFrame) {
+                 // recompute from the ANCHOR page dims, not the current page
+                 var n = window._apFrame;
+                 window._apFrame = null;
+                 ensureFrame(n.natW, n.natH);
+             }
+             renderScreenshot();
+             drawBox();
+         }
          var _resizeTimer = null;
          window.addEventListener('resize', function() {
              if (_resizeTimer) clearTimeout(_resizeTimer);
-             _resizeTimer = setTimeout(function() {
-                 updateLayout();
-                 renderScreenshot();
-                 drawBox();
-             }, 150);
+             _resizeTimer = setTimeout(reflowFrame, 150);
          });
          window.addEventListener('orientationchange', function() {
-             setTimeout(function() {
-                 updateLayout();
-                 renderScreenshot();
-                 drawBox();
-             }, 300);
+             setTimeout(reflowFrame, 300);
          });
       </script>
       <div class="ap-wrap">
@@ -5829,12 +6044,13 @@ def anki_create_model():
    </div>
    <script>
       (function () {
-          var m = `{{audio}}`.match(/src="([^"]+)"/);
-          const filename = m ? m[1] : "";
-          if (!filename) {
+          var _anyAudio = (window._apCaptures || []).some(function (c) { return c.mp3; });
+          if (!_anyAudio) {
               document.querySelector(".ap-wrap").innerHTML = '';
               return;
           }
+          let filename = window._apCap().mp3 || "";
+          var _apSkipPlay = false;
           const track = document.getElementById("ap-track");
           const canvas = document.getElementById("ap-wave");
           const rangeEl = document.getElementById("ap-range");
@@ -5844,7 +6060,7 @@ def anki_create_model():
           const HIT_OUTER = parseFloat(getComputedStyle(track).getPropertyValue("--hit-outer")) || 0;
           const zoomEl = document.getElementById("ap-zoom");
           const zoomCanvas = document.getElementById("ap-zoom-canvas");
-          const STORAGE_KEY = "ap-range:" + filename;
+          function STORAGE_KEY() { return "ap-range:" + filename; }
           if (!window.top._apListeners) window.top._apListeners = [];
           function addTracked(target, type, fn, opts) {
               target.addEventListener(type, fn, opts);
@@ -5857,7 +6073,7 @@ def anki_create_model():
           }
           function loadRange() {
               try {
-                  const raw = localStorage.getItem(STORAGE_KEY);
+                  const raw = localStorage.getItem(STORAGE_KEY());
                   if (!raw) return null;
                   const obj = JSON.parse(raw);
                   if (typeof obj.start === "number" && typeof obj.end === "number") {
@@ -5871,7 +6087,7 @@ def anki_create_model():
           function saveRange() {
               try {
                   localStorage.setItem(
-                  STORAGE_KEY,
+                  STORAGE_KEY(),
                   JSON.stringify({
                       start: startT,
                       end: endT,
@@ -5885,8 +6101,11 @@ def anki_create_model():
           let endT = 0;
           let audioBuffer = null;
           let audioCtx = null;
+          const _apMyGen = window.top._apGen;
           let currentSource = null;
+          let currentGain = null;
           let rebuilds = 0;   // zombie-clock rebuild quota per visit/tap
+          let zombieAlerted = false;  // test need delete: alert once per card
           let webStart = 0;
           let webOffset = 0;
           let rafId = null;
@@ -5978,17 +6197,31 @@ def anki_create_model():
           }
           function stopCurrent() {
               if (currentSource) {
-                  if (window.top._audio && window.top._audio.node === currentSource) {
+                  var _src = currentSource, _g = currentGain;
+                  if (window.top._audio && window.top._audio.node === _src) {
                   window.top._audio = null;
                   }
-                  try {
-                  currentSource.onended = null;
-                  currentSource.stop();
-                  } catch (e) {}
-                  try {
-                  currentSource.disconnect();
-                  } catch (e) {}
                   currentSource = null;
+                  currentGain = null;
+                  try { _src.onended = null; } catch (e) {}
+                  // fade the outgoing source instead of chopping it: page
+                  // switches crossfade; the delayed stop only stops a node,
+                  // safe even if the card changes meanwhile
+                  if (_g && audioCtx) {
+                      try {
+                          var _fn = audioCtx.currentTime;
+                          _g.gain.cancelScheduledValues(_fn);
+                          _g.gain.setValueAtTime(_g.gain.value, _fn);
+                          _g.gain.linearRampToValueAtTime(0, _fn + 0.15);
+                      } catch (e) {}
+                      setTimeout(function () {
+                          try { _src.stop(); } catch (e) {}
+                          try { _src.disconnect(); } catch (e) {}
+                      }, 200);
+                  } else {
+                      try { _src.stop(); } catch (e) {}
+                      try { _src.disconnect(); } catch (e) {}
+                  }
               }
               if (rafId != null) {
                   cancelAnimationFrame(rafId);
@@ -6023,12 +6256,14 @@ def anki_create_model():
               volCache.vol = Math.min(targetPeak / peak, maxGain);
           }
           function rebuildAndReplay(tag) {
+              if (_apMyGen !== window.top._apGen) return;
               if (rebuilds >= 4) {
                   if (window._apDbgLog) window._apDbgLog("au:giveup " + tag);
                   return;
               }
               rebuilds++;
               if (window._apDbgLog) window._apDbgLog("au:rebuild" + rebuilds + " " + tag);
+              if (!zombieAlerted) { zombieAlerted = true; alert('zombie audio recovered: ' + tag); }  // test need delete
               try { audioCtx.close(); } catch (e) {}
               const AC = window.AudioContext || window.webkitAudioContext;
               audioCtx = new AC();
@@ -6047,11 +6282,13 @@ def anki_create_model():
               const c0 = audioCtx;
               const t0 = c0.currentTime;
               setTimeout(function () {
+                  if (_apMyGen !== window.top._apGen) return;
                   if (audioCtx !== c0) return;
                   const adv = c0.currentTime - t0;
                   if (window._apDbgLog) window._apDbgLog(
                       "au:warm" + attempt + " +" + adv.toFixed(3) + " " + c0.state);
                   if (adv > 0 || attempt >= 5) return;
+                  if (!zombieAlerted) { zombieAlerted = true; alert('zombie audio recovered: warm' + attempt); }  // test need delete
                   try { c0.close(); } catch (e) {}
                   const AC = window.AudioContext || window.webkitAudioContext;
                   audioCtx = new AC();
@@ -6074,6 +6311,7 @@ def anki_create_model():
               const playDur = Math.max(0, endT - startT);
               source.start(0, offset, playDur);
               currentSource = source;
+              currentGain = gain;
               webStart = audioCtx.currentTime;
               webOffset = offset;
               // zombie-clock watchdog WITH repair: frozen currentTime on
@@ -6085,6 +6323,7 @@ def anki_create_model():
               const zctx = audioCtx;
               [300, 1200].forEach(function (ms) {
                   setTimeout(function () {
+                      if (_apMyGen !== window.top._apGen) return;
                       if (currentSource !== zsrc || audioCtx !== zctx) return;
                       const adv = zctx.currentTime - zt;
                       if (window._apDbgLog) window._apDbgLog(
@@ -6134,6 +6373,7 @@ def anki_create_model():
               rafId = requestAnimationFrame(watchProgress);
           }
           function watchProgress() {
+              if (_apMyGen !== window.top._apGen) { rafId = null; return; }
               if (!currentSource) {
                   rafId = null;
                   return;
@@ -6143,21 +6383,42 @@ def anki_create_model():
               if (t >= endT) {
                   stopCurrent();
                   updateProgressFromTime(endT);
+                  if (window._apSeqNext) window._apSeqNext();
                   return;
               }
               updateProgressFromTime(t);
               rafId = requestAnimationFrame(watchProgress);
           }
-          (function loadAudio() {
+          function loadAudio() {
+              if (!filename) {
+                  // audio-less page: keep the strip, clear the wave, hide
+                  // the drag handles until a page with audio comes back
+                  stopCurrent();
+                  audioBuffer = null;
+                  try {
+                      const _cx = canvas.getContext("2d");
+                      _cx.clearRect(0, 0, canvas.width, canvas.height);
+                  } catch (e) {}
+                  hStart.style.display = 'none';
+                  hEnd.style.display = 'none';
+                  rangeEl.style.display = 'none';
+                  progEl.style.display = 'none';
+                  return;
+              }
               const AudioCtx = window.AudioContext || window.webkitAudioContext;
               if (!AudioCtx) {
                   document.querySelector(".ap-wrap").innerHTML =
                   '<div style="color:#c00">Web Audio not supported.</div>';
                   return;
               }
-              audioCtx = new AudioCtx();
+              if (!audioCtx) audioCtx = new AudioCtx();
               window.top._apAudioCtx = audioCtx;
               function onDecoded(decoded, prerenderedBars, prerenderedPlayTime) {
+                  if (_apMyGen !== window.top._apGen) return;
+                  hStart.style.display = '';
+                  hEnd.style.display = '';
+                  rangeEl.style.display = '';
+                  progEl.style.display = '';
                   audioBuffer = decoded;
                   duration = decoded.duration;
                   bars = prerenderedBars || null;
@@ -6170,15 +6431,8 @@ def anki_create_model():
                   if (initStart === null) {
                   let pt = prerenderedPlayTime;
                   if (!pt) {
-                      const raw = "{{range}}".trim();
-                      if (raw) {
-                          const parts = raw.split(",");
-                          if (parts.length === 2) {
-                              const s = parseFloat(parts[0]);
-                              const e = parseFloat(parts[1]);
-                              if (isFinite(s) && isFinite(e) && s < e) pt = [s, e];
-                          }
-                      }
+                      var _cr = window._apCap().range;
+                      if (_cr) pt = [_cr[0], _cr[1]];
                   }
                   if (pt && pt[1] <= duration + 0.01) {
                       initStart = Math.max(0, pt[0]);
@@ -6198,7 +6452,7 @@ def anki_create_model():
                   } else {
                   drawWaveform(decoded);
                   }
-                  playRangeInternal();
+                  if (_apSkipPlay) { _apSkipPlay = false; } else { playRangeInternal(); }
               }
               const cached = window.top._apCache && window.top._apCache[filename];
               if (cached) {
@@ -6219,7 +6473,14 @@ def anki_create_model():
                       '<br>Check if sync is finished</div>';
                   console.log("Audio load failed:", err);
                   });
-          })();
+          }
+          loadAudio();
+          window._apReloadAudio = function (noplay) {
+              if (_apMyGen !== window.top._apGen) return;
+              filename = window._apCap().mp3 || "";
+              _apSkipPlay = !!noplay;
+              loadAudio();
+          };
           const ZOOM_W = 140, ZOOM_H = 44, ZOOM_SEC = 0.5;
           const SHOW_ZOOM = false; // zoom magnifier tog4
           function updateZoom() {
@@ -6291,6 +6552,7 @@ def anki_create_model():
               return { x: e.clientX, y: e.clientY };
           }
           function onDown(e) {
+              if (window._apSeqStop) window._apSeqStop();
               dragging = e.currentTarget.dataset.role;
               dragRect = track.getBoundingClientRect();
               const p = getXY(e);
@@ -6354,6 +6616,7 @@ def anki_create_model():
           }
           window.playRange = function () {
               rebuilds = 0;   // each real tap earns a fresh repair quota
+              if (window._apSeqArm) window._apSeqArm();
               if (typeof fadeStop === "function" && window.top._audio) {
                   fadeStop(window.top._audio, 200);
                   window.top._audio = null;
@@ -6361,6 +6624,7 @@ def anki_create_model():
               playRangeInternal();
           };
           function redrawAll() {
+              if (_apMyGen !== window.top._apGen) return;
               if (document.visibilityState !== "visible") return;
               const cache = window.top._apCache && window.top._apCache[filename];
               // audio: iOS may leave the context stuck after lock/interruption
@@ -6560,8 +6824,7 @@ def anki_create_model():
        var W = window.top;
        if (!W._imgDbg) W._imgDbg = { log: [], blank: 0, timer: null };
        var D = W._imgDbg;
-       var am = `{{audio}}`.match(/src="([^"]+)"/);
-       D.fname = am ? am[1] : '';
+       D.fname = (window._apCap && window._apCap().mp3) || '';
        D.everPainted = false;
        D.lastState = null;
        D.freshBlankLogged = false;
@@ -6708,7 +6971,167 @@ def anki_create_model():
        render();
    })();
 </script>
-"""
+<script>
+(function () {
+    var _apMyGen = window.top._apGen;
+    var caps = window._apCaptures || [];
+    if (caps.length < 2) return;
+    var wrap = document.querySelector('.ap-wrap');
+    if (!wrap || !wrap.parentNode) return;
+
+    var bar = document.createElement('div');
+    bar.id = 'ap-nav';
+    bar.style.cssText = 'display:flex;align-items:center;' +
+        'justify-content:center;gap:18px;margin:6px auto 0;' +
+        'user-select:none;-webkit-user-select:none;';
+    var prev = document.createElement('div');
+    var label = document.createElement('div');
+    var next = document.createElement('div');
+    prev.textContent = '◀';
+    next.textContent = '▶';
+    prev.style.cssText = next.style.cssText =
+        'padding:6px 16px;cursor:pointer;font-size:20px;opacity:.75;';
+    label.style.cssText =
+        'font-size:14px;opacity:.8;min-width:3em;text-align:center;';
+    label.textContent = (window._apCur + 1) + '/' + caps.length;
+    bar.appendChild(prev);
+    bar.appendChild(label);
+    bar.appendChild(next);
+    wrap.parentNode.insertBefore(bar, wrap.nextSibling);
+
+    var seqOn = false, seqLeft = 0, seqHome = 0, holdTimer = null;
+
+    function _visibleImg() {
+        var fb = document.getElementById('word-img-fallback');
+        if (!fb) return null;
+        var imgs = fb.querySelectorAll('img');
+        for (var i = 0; i < imgs.length; i++) {
+            if (imgs[i].style.display !== 'none') return imgs[i];
+        }
+        return null;
+    }
+    // freeze the outgoing image as an overlay, then wipe it away with a
+    // clip-path sweep: forward = front moves right-to-left, backward
+    // mirrored (new page is revealed underneath)
+    function wipe(dir, fade) {
+        var box = window._apFrameBox;
+        if (!box) return;
+        var cv = document.getElementById('word-img-canvas');
+        var snap = null;
+        if (cv && cv.style.display !== 'none' && cv.width) {
+            snap = document.createElement('canvas');
+            snap.width = cv.width;
+            snap.height = cv.height;
+            try { snap.getContext('2d').drawImage(cv, 0, 0); }
+            catch (e) { snap = null; }
+        }
+        if (!snap) {
+            var im = _visibleImg();
+            if (im && im.naturalWidth) snap = im.cloneNode(false);
+        }
+        if (!snap) return;
+        snap.style.cssText = 'position:absolute;left:0;top:0;' +
+            'width:100%;height:100%;object-fit:scale-down;' +
+            'display:block;z-index:5;pointer-events:none;';
+        snap.style.clipPath = 'inset(0 0 0 0)';
+        snap.style.webkitClipPath = 'inset(0 0 0 0)';
+        snap.style.transition = fade
+            ? 'opacity 300ms ease'
+            : 'clip-path 300ms ease, -webkit-clip-path 300ms ease';
+        box.appendChild(snap);
+        requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+                if (fade) {
+                    snap.style.opacity = '0';
+                } else {
+                    var tgt = dir >= 0 ? 'inset(0 100% 0 0)'
+                                       : 'inset(0 0 0 100%)';
+                    snap.style.clipPath = tgt;
+                    snap.style.webkitClipPath = tgt;
+                }
+            });
+        });
+        setTimeout(function () {
+            if (snap.parentNode) snap.parentNode.removeChild(snap);
+        }, 420);
+    }
+    function fadeWave(fn) {
+        if (!wrap) { if (fn) fn(); return; }
+        wrap.style.transition = 'opacity 160ms';
+        wrap.style.opacity = '0';
+        setTimeout(function () {
+            if (_apMyGen !== window.top._apGen) return;
+            if (fn) fn();
+            wrap.style.opacity = '1';
+        }, 220);
+    }
+    function maybeTimerAdvance() {
+        if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+        if (!seqOn) return;
+        if (!window._apCap().mp3) {
+            holdTimer = setTimeout(function () {
+                if (_apMyGen !== window.top._apGen) return;
+                if (window._apSeqNext) window._apSeqNext();
+            }, 1000);
+        }
+    }
+    function show(idx, opts) {
+        opts = opts || {};
+        var n = caps.length;
+        idx = ((idx % n) + n) % n;
+        wipe(opts.dir >= 0 ? 1 : -1, !!opts.fade);
+        window._apCur = idx;
+        label.textContent = (idx + 1) + '/' + n;
+        if (window._apRenderImage) window._apRenderImage();
+        fadeWave(function () {
+            if (window._apReloadAudio) window._apReloadAudio(!!opts.noplay);
+        });
+        if (!opts.auto) {
+            try {
+                localStorage.setItem(window._apPageKey, String(idx));
+            } catch (e) {}
+        }
+        maybeTimerAdvance();
+    }
+    function go(d) {
+        seqOn = false;
+        if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+        show(window._apCur + d, { dir: d });
+    }
+    prev.onclick = function () { go(-1); };
+    next.onclick = function () { go(1); };
+
+    // sequence: play every page once starting from the current (anchor)
+    // page, wrapping around, then come home silently
+    window._apSeqArm = function () {
+        if (_apMyGen !== window.top._apGen) return;
+        seqOn = true;
+        seqLeft = caps.length - 1;
+        seqHome = window._apCur;
+    };
+    window._apSeqNext = function () {
+        if (_apMyGen !== window.top._apGen) return;
+        if (!seqOn) return;
+        if (seqLeft > 0) {
+            seqLeft--;
+            show(window._apCur + 1, { auto: true, dir: 1 });
+        } else {
+            seqOn = false;
+            show(seqHome, { auto: true, dir: 1, noplay: true, fade: true });
+        }
+    };
+    // dragging a range handle = manual intervention: let the current page
+    // finish but do not auto-advance afterwards
+    window._apSeqStop = function () {
+        if (_apMyGen !== window.top._apGen) return;
+        seqOn = false;
+        if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    };
+    // card shown = the sequence starts from the anchor page
+    window._apSeqArm();
+    maybeTimerAdvance();
+})();
+</script>"""
     CSS = """img {
   max-width: 100%;
   height: auto;
@@ -7059,6 +7482,7 @@ DEFAULT_CONFIG = {
     "anki_model_version_and_hash": [0, ""],
     "anki_new_note_left": 30,
     "anki_sync_note": 20,
+    "anki_combine_dup": True,
     "monitor_index": 1,
     "max_fps": [[5, 8], [10, 4], [120, 2]],
     "min_memory_gb": 0.5,
