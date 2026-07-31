@@ -465,7 +465,8 @@ UI_TEXT = {
     'dict': ('Dictionary', '字典'),
     'monitor': ('Monitor', '显示器'),
     'search_dup': ('Combine to note?', '合并到已有词条?'),
-    'delete_dup': ('Delete note with multiple entries?', '删除全部词条?'),
+    'search_dup_add_fail': ('Failed to combine to note', '合并词条失败'),
+    'delete_dup': ('Delete note with multiple entries?', '词条包含多条音画,全部删除?'),
     'cut': ('Cut', '剪切'),
     'copy': ('Copy', '复制'),
     'paste': ('Paste', '粘贴'),
@@ -1497,8 +1498,15 @@ class Snip(QWidget):
             self.slider_container.setAttribute(Qt.WA_UnderMouse, True)
 
     def start(self):
-        global lock_length, screenshot_users, hide_on_click
+        global lock_length, screenshot_users, hide_on_click, _spell_index_thread
         check_processing(round_display)
+        if config['anki_combine_dup']:
+            # refresh the note index for THIS round; anki add/merge joins
+            # this thread first (a stale index degrades to a plain add)
+            _spell_index_thread = threading.Thread(
+                target=rebuild_spell_index, kwargs={'wait_prev': True},
+                daemon=True)
+            _spell_index_thread.start()
         screenshot_login()
         screenshot[lock_length - 1][0], _, _, = screenshot_qimg_rgb(
             self.sct, self.mon)
@@ -1925,6 +1933,35 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
         window_change_picture(pixmap)
         window.word.setText(word)
         search_dict_thread.join()
+        # merge round: the EXISTING note is what the user sees - its
+        # (possibly hand-edited) text wins over the fresh dict lookup;
+        # this round only contributes a new capture
+        merge_target = None
+        if config['anki_combine_dup']:
+            if _spell_index_thread is not None:
+                # index snapshot must be in before the decision; timing
+                # out degrades this round to a plain add
+                _spell_index_thread.join(timeout=5)
+            merge_target = _spell_index.get(
+                norm_spell(word_info.get('spell') or ''))
+            merge_target = test_pick_merge_target(merge_target)  # TEST ONLY
+            if merge_target:
+                r = invoke('notesInfo', notes=[int(merge_target)])
+                if r and not r.get('error') and r.get('result') \
+                        and r['result'][0].get('fields'):
+                    f = r['result'][0]['fields']
+                    word_info['spell'] = f['spell']['value']
+                    word_info['pron'] = f['pron']['value']
+                    word_info['excerpt'] = f['excerpt']['value']
+                    word_info['fuzzy'] = f['fuzzy']['value']
+                    # the page count is known NOW: show the nav at once;
+                    # flipping blocks until the round finalizes the note
+                    window.show_page_signal.emit(
+                        None, 0, len(parse_captures(f)) + 1)
+                else:
+                    merge_target = None    # unreadable -> plain add
+            print('path: merge into ' + str(merge_target)
+                  if merge_target else 'path: new note')
         if word_info['spell'] != '':
             window_display_word(word_info['spell'], word_info['pron'],
                                 word_info['excerpt'], word_info['fuzzy'], None,
@@ -1939,7 +1976,8 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             threading.Thread(target=after_display,
                              args=(word_info, word, points, audio_bytes,
                                    snip_index, audio_start_time,
-                                   audio_end_time, rect, qimg_full),
+                                   audio_end_time, rect, qimg_full,
+                                   merge_target),
                              daemon=True).start()
         else:  # test maybe delete, won't happen
             window_display_word_blank()
@@ -1991,32 +2029,38 @@ def resize_window_height():
     # screenshot
     if window.label_screenshot.pixmap():
         h += window.label_screenshot.sizeHint().height()
+    if getattr(window, 'page_nav', None) and window.page_nav.isVisible():
+        h += window.page_nav.sizeHint().height()
 
     window.setMinimumHeight(0)
     window.resize(window.width(), h)
 
 
 def after_display(word_info, word, points, audio_bytes, snip_index,
-                  audio_start_time, audio_end_time, rect, qimg_full):
+                  audio_start_time, audio_end_time, rect, qimg_full,
+                  merge_target=None):
     # create new note in anki
     word_info['word'] = word
+    window._qt_caps = None
+    _qt_caps_event.clear()
     word_info['position'] = '[' + str(points[0].x()) + ',' + str(
         points[0].y()) + '],[' + str(points[1].x()) + ',' + str(
             points[1].y()) + '],[' + str(points[2].x()) + ',' + str(
                 points[2].y()) + '],[' + str(points[3].x()) + ',' + str(
                     points[3].y()) + ']'
     anki_new_note_time_stamp = time.time()
-    anki_new_note_thread = threading.Thread(target=anki_new_note,args=(word_info,qimg_full,anki_new_note_time_stamp,),daemon=True)
+    anki_new_note_thread = threading.Thread(target=anki_new_note,args=(word_info,qimg_full,anki_new_note_time_stamp,merge_target),daemon=True)
     anki_new_note_thread.start()
     if len(audio_bytes) > 0:
-        threading.Thread(target=process_audio,args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp,anki_new_note_thread),daemon=True,).start()
+        threading.Thread(target=process_audio,args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp,anki_new_note_thread,word_info.get('spell') or word),daemon=True,).start()
     else:
         anki_new_note_thread.join()
+        qt_note_pages_ready(anki_new_note_time_stamp)
         screenshot_logout()
         round_finish_all()
 
 
-def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,rect,word,anki_new_note_time_stamp,anki_new_note_thread):
+def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,rect,word,anki_new_note_time_stamp,anki_new_note_thread,spell=''):
 
     folder_path = os.path.join(
         os.path.expanduser("~"), "Downloads", "acard",
@@ -2056,10 +2100,18 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
 
     audio_wav_after_trim = pcm_to_wav_bytes(audio_bytes_after_trim)
 
+    # the note id is published by the qt main thread (anki_new_note_after)
+    # AFTER the add/merge rpc chain finishes; merge rounds make extra rpc
+    # calls, and a short audio analysis can finish before them, so
+    # matching without waiting silently drops the audio
+    round_anki_id_generated.wait(timeout=5)
     anki_id_processed = None
     anki_last_new_note_snapshot = anki_last_new_note  # avoid anki_last_new_note changed during matching
     if anki_new_note_time_stamp == anki_last_new_note_snapshot[0]:
         anki_id_processed = int(anki_last_new_note_snapshot[1])
+    if anki_id_processed is None:
+        print('process_audio: note id not published for this round, '
+              'audio skipped')
 
     if anki_id_processed:
         with lock:
@@ -2077,14 +2129,50 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                 anki_l0_stem(word, anki_new_note_time_stamp)
                 + f'_r{round(float(play_start_time) * 1e6)}'
                 + f'-{round(float(play_end_time) * 1e6)}.mp3')
-            if audio_name:
-                fields['audio'] = f'<img src="{audio_name["result"]}">'  # pretend to be a img so anki will not auto delete it. if label it as a sound, anki will force to auto play it, which i do not want
-                fields['range'] = f"{float(play_start_time)},{float(play_end_time)}"
-        invoke("updateNoteFields",
+            if not audio_name or audio_name.get('error') \
+                    or not audio_name.get('result'):
+                print('process_audio: mp3 upload FAILED:',
+                      audio_name and audio_name.get('error'))
+            else:
+                # img tag: a sound tag would autoplay and get auto-deleted
+                new_tag = f'<img src="{audio_name["result"]}">'
+                # prepend to whatever the note already holds: empty for a
+                # fresh note, previous captures for a merge target
+                old_audio = ''
+                old_shot = ''
+                r = invoke('notesInfo', notes=[int(anki_id_processed)])
+                if r and not r.get('error') and r.get('result') \
+                        and r['result'][0].get('fields'):
+                    old_audio = r['result'][0]['fields']['audio']['value']
+                    old_shot = r['result'][0]['fields'][
+                        'screenshot']['value']
+                else:
+                    print('process_audio: old audio read FAILED:',
+                          r and r.get('error'))
+                fields['audio'] = new_tag + old_audio
+        r = invoke("updateNoteFields",
                 note={
                     "id": anki_id_processed,
                     "fields": fields
                 })
+        if not r or r.get('error'):
+            print('process_audio: updateNoteFields FAILED:',
+                  r and r.get('error'))
+        else:
+            print('process_audio: audio field written ('
+                  + str(fields.get('audio', '').count('<img')) + ' tags)')
+            if fields.get('audio'):
+                # the round's note (fresh or merge target) is final now:
+                # let the window know its pages; badge shows for >=2 and
+                # clicking the image sequences through all of them
+                window._qt_caps = parse_captures({
+                    'screenshot': {'value': old_shot},
+                    'audio': {'value': fields['audio']},
+                })
+                window.show_page_signal.emit(
+                    None, 0, len(window._qt_caps))
+                _qt_caps_event.set()
+                qt_preload_pages()
     
     anki_new_note_thread.join()
     round_finish_all()
@@ -2280,6 +2368,7 @@ def detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time
     sentences = []
     snip_hog = compute_hog(screenshot[snip_index][0], rect_small)
 
+    snip_index_in_sentences = 0  # test not sure why sometimes 'snip_index_in_sentences' where it is not associated with a value without this initialize
     for i in range(lock_length):
         this_frame_time = screenshot[i][1] / 1000
         if audio_start_time <= this_frame_time and this_frame_time <= audio_end_time:
@@ -2411,7 +2500,7 @@ def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences, 
             this_hog = compute_hog(screenshot[k][0], rect_small)
         else:
             subtitle_sentences[i][3] = 0
-        print(f'{i}_rect_small.jpg: {ocr_result}')
+        #print(f'{i}_rect_small.jpg: {ocr_result}')
     return rect_last_ocr, rect_small, this_hog
 
 
@@ -2475,6 +2564,8 @@ def window_display_word(spell, pron, excerpt, fuzzy, pixmap, change_picture, btn
 
 
 def window_change_picture(pixmap):
+    if hasattr(window, 'page_nav'):
+        window.page_nav.hide()
     if pixmap:
         margin = window.layout().contentsMargins()
         label_width = window.width() - margin.left() - margin.right()
@@ -2496,7 +2587,10 @@ def anki_l0_stem(word, ts):
     # L0 media stem: sanitized word (max 18 chars) + 13-digit ms timestamp.
     # MUST be byte-identical between the jpg and mp3 of one capture: the
     # card template pairs files by everything before the LAST underscore.
-    w = re.sub(r'[\\/:*?"<>|_\s]', '', word)[:18] or 'word'
+    if TEST_RANDOM_MERGE:                       # TEST ONLY: ZZTEST names
+        return f'ZZTEST_{int(ts * 1000)}'       # TEST ONLY
+    w = re.sub(r'<[^>]+>', '', word)      # hand-edited spells carry html
+    w = re.sub(r'[\\/:*?"<>|_\s]', '', w)[:18] or 'word'
     return f'{w}_{int(ts * 1000)}'
 
 
@@ -2509,7 +2603,36 @@ def anki_l0_quad(position):
     return '-'.join(str(max(0, int(v))) for xy in pts for v in xy)
 
 
-def anki_new_note(fields, qimg_full, anki_new_note_time_stamp):
+def anki_merge_into(target_id, fields):
+    # merge-by-spell: prepend this capture's screenshot to an existing
+    # note; text fields stay untouched. The audio thread appends its mp3
+    # to the same note later (it follows anki_last_new_note). Returns
+    # False when the target cannot be read/updated -> caller adds a new
+    # note instead
+    r = invoke('notesInfo', notes=[int(target_id)])
+    if not r or r.get('error') or not r.get('result') \
+            or not r['result'][0].get('fields'):
+        return False
+    old = r['result'][0]['fields']
+    cards = r['result'][0].get('cards') or []
+    upd = {
+        'screenshot': fields.get('screenshot', '')
+                      + old['screenshot']['value'],
+    }
+    r = invoke('updateNoteFields',
+               note={'id': int(target_id), 'fields': upd})
+    if not r or r.get('error'):
+        print('merge: updateNoteFields failed:', r and r.get('error'))
+        return False
+    if cards:
+        # fresh material on an old note: back to the new-card queue
+        invoke('forgetCards', cards=cards)
+    print(f"merged '{fields.get('spell', '')}' into note {target_id}")
+    return True
+
+
+def anki_new_note(fields, qimg_full, anki_new_note_time_stamp,
+                  merge_target=None):
     global anki_check_needed
     anki_check_needed = True
     anki_check_deck_and_model(False)
@@ -2526,8 +2649,20 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp):
             + '_p' + anki_l0_quad(fields.get('position', '')) + '.jpg')
         if screenshot_name:
             fields['screenshot'] = f'<img src="{screenshot_name["result"]}">'
+    fields.pop('position', None)   # the quad lives in the filename now
+    if merge_target and fields.get('screenshot'):
+        if anki_merge_into(merge_target, fields):
+            # the existing note becomes this round's "new note": the
+            # audio thread, history and current-card logic all follow it
+            bridge.anki_new_note_done.emit(anki_new_note_time_stamp,
+                                           str(merge_target),
+                                           fields['word'])
+            return
+        # unreadable target falls through to a plain add (per spec)
     if fields.get('excerpt'):
         fields['excerpt'] += '<div><br></div>'
+    # word is not a field any more: it rides in the media filenames
+    _word = fields.pop('word', '')
     result = invoke("addNote",
                     note={
                         "deckName": DECK_NAME,
@@ -2540,12 +2675,17 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp):
             print(result['error'])
         else:
             bridge.anki_new_note_done.emit(anki_new_note_time_stamp,str(result['result']),
-                                           fields['word'])
+                                           _word)
 
 
 def anki_new_note_after(anki_new_note_time_stamp,anki_id, word):
     global anki_last_new_note
     anki_last_new_note = (anki_new_note_time_stamp,anki_id)
+    # a merged target may already sit in history: move it to the front
+    for _it in anki_list:
+        if str(_it[0]) == str(anki_id):
+            anki_list.remove(_it)
+            break
     anki_list.insert(0, [anki_id, word])
     if len(anki_list) > 20:
         anki_list.pop()
@@ -2583,7 +2723,7 @@ def anki_get_and_display(anki_id, anki_check):
     window_display_word(fields['spell']['value'], fields['pron']['value'],
                         fields['excerpt']['value'], fields['fuzzy']['value'],
                         pixmap, True, True)
-    window.word.setText(fields['word']['value'])
+    window.word.setText('')   # word is not stored any more
 
     # paint the refreshed word now; audio download below may take a while
     QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
@@ -2618,12 +2758,17 @@ def anki_get_and_display(anki_id, anki_check):
         print(f"[WRITE get_and_display] id={anki_id} range={fields['range']['value']} bytes={window.start_byte}-{window.end_byte} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
     else:
         window.audio_wav = None
+    window._qt_caps = parse_captures(fields)
+    window.show_page_signal.emit(None, 0, len(window._qt_caps))
+    _qt_caps_event.set()
+    qt_preload_pages()
     window.anki_id = anki_id
     set_save_baseline()
 
 
 def anki_delete_note():  # test need more detailed delete
-    global anki_check_needed
+    global anki_check_needed, _qt_seq_gen
+    _qt_seq_gen += 1     # cancel any running page sequence
     # stop audio only if what is playing IS the note being deleted;
     # a session still playing an EARLIER capture keeps going
     if _play_session is not None and getattr(
@@ -2634,6 +2779,16 @@ def anki_delete_note():  # test need more detailed delete
     window.delete_btn.setChecked(False)
     anki_check_needed = True
     if window.anki_id:  # test need to consider blank
+        if config['anki_combine_dup']:
+            # a note holding several captures needs an explicit yes
+            r = invoke('notesInfo', notes=[int(window.anki_id)])
+            if r and not r.get('error') and r.get('result') \
+                    and r['result'][0].get('fields'):
+                if r['result'][0]['fields']['screenshot'][
+                        'value'].count('<img') >= 2:
+                    if not ask_front(ui('delete_dup')):
+                        return
+            spell_index_forget(window.anki_id)
         threading.Thread(target=invoke,
                          args=("deleteNotes", ),
                          kwargs={
@@ -2779,6 +2934,86 @@ def anki_connect_is_running():
         return is_running
 
 
+def anki_merge_note_into(target_id, src_id):
+    # search-merge: move ALL captures (img+mp3 tags) of note src_id to
+    # the FRONT of an existing note; text fields stay untouched. Returns
+    # False when either note cannot be read or the update fails
+    r = invoke('notesInfo', notes=[int(src_id), int(target_id)])
+    if not r or r.get('error') or not r.get('result') \
+            or len(r['result']) < 2 \
+            or not r['result'][0].get('fields') \
+            or not r['result'][1].get('fields'):
+        return False
+    src = r['result'][0]['fields']
+    tgt = r['result'][1]['fields']
+    cards = r['result'][1].get('cards') or []
+    upd = {
+        'screenshot': src['screenshot']['value'] + tgt['screenshot']['value'],
+        'audio': src['audio']['value'] + tgt['audio']['value'],
+    }
+    r = invoke('updateNoteFields',
+               note={'id': int(target_id), 'fields': upd})
+    if not r or r.get('error'):
+        return False
+    if cards:
+        # the target gained captures: reschedule it as a new card
+        invoke('forgetCards', cards=cards)
+    return True
+
+
+def ask_front(text, yes_no=True):
+    # message box forced above other windows: the main window is
+    # no-activate, so a plain exec_ can open behind the game
+    box = QMessageBox()
+    box.setWindowTitle(ui('messagebox_title'))
+    box.setText(text)
+    box.setStandardButtons(
+        (QMessageBox.Yes | QMessageBox.No) if yes_no else QMessageBox.Ok)
+    box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
+    box.show()
+    box.raise_()
+    box.activateWindow()
+    try:
+        windll.user32.SetForegroundWindow(int(box.winId()))
+    except Exception:
+        pass
+    return box.exec_() == QMessageBox.Yes
+
+
+def maybe_merge_on_save():
+    # saving while the spell belongs to ANOTHER existing note: offer to
+    # move this note's captures there and drop this note. Returns True
+    # when merged (the normal text save is skipped: this note is gone
+    # and the target's text stays untouched)
+    if not config['anki_combine_dup'] or not window.anki_id:
+        return False
+    target = _spell_index.get(norm_spell(window.label_spell.text()))
+    target = test_pick_merge_target(target)           # TEST ONLY
+    if not target or str(target) == str(window.anki_id):
+        return False
+    if not ask_front(ui('search_dup')):
+        return False
+    src_id = int(window.anki_id)
+    if not anki_merge_note_into(target, src_id):
+        ask_front(ui('search_dup_add_fail'), yes_no=False)
+        return False
+    r = invoke('deleteNotes', notes=[src_id])
+    if not r or r.get('error'):
+        print('save merge: deleteNotes failed:', r and r.get('error'))
+    spell_index_forget(src_id)
+    # the target becomes the current note, on top of the history
+    for _it in list(anki_list):
+        if str(_it[0]) in (str(src_id), str(target)):
+            anki_list.remove(_it)
+    anki_list.insert(0, [str(target), window.word.text()])
+    window.anki_id = str(target)
+    set_save_baseline()
+    anki_get_and_display(window.anki_id, False)
+    print(f'save merge: note {src_id} moved into {target}')
+    threading.Thread(target=anki_sync, daemon=True).start()
+    return True
+
+
 def refresh_word():
     check_processing(round_anki_audio_sent)
     round_reset()
@@ -2800,9 +3035,10 @@ def save_word_qt_to_anki():
     fw = window.focusWidget()
     if fw is not None:
         fw.clearFocus()
+    if maybe_merge_on_save():
+        return
     word = window.word.text()
     word_info = {
-        'word': word,
         'spell': window.label_spell.text(),
         'pron': window.label_pron.text(),
         'excerpt': window.label_excerpt.toHtml(),
@@ -2816,7 +3052,8 @@ def save_word_qt_to_anki():
             })
     for i in range(len(anki_list)):
         if str(anki_list[i][0]) == str(window.anki_id):
-            anki_list[i][1] = word
+            if word:          # empty box = recalled note, keep old label
+                anki_list[i][1] = word
             break
     set_save_baseline()             # content == saved now -> grey out save
     round_finish_all()
@@ -4054,6 +4291,29 @@ def set_qt_layout():
     window.label_screenshot = QLabel("", central)
     main_layout.addWidget(window.label_screenshot)
     window.label_screenshot.mousePressEvent = play_audio
+    # page nav under the image: only visible for multi-capture notes
+    window.page_nav = QWidget(central)
+    _nav_lay = QHBoxLayout(window.page_nav)
+    _nav_lay.setContentsMargins(0, 2, 0, 2)
+    _nav_lay.setSpacing(18)
+    _nav_lay.addStretch(1)
+    window.page_prev_btn = QToolButton(window.page_nav)
+    window.page_prev_btn.setText('◀')
+    window.page_prev_btn.setFont(QFont('Segoe UI Symbol', int(font_size_btn/2)))
+    window.page_prev_btn.setAutoRaise(True)
+    window.page_prev_btn.clicked.connect(lambda: qt_play_pages(-1, False))
+    _nav_lay.addWidget(window.page_prev_btn)
+    window.page_nav_label = QLabel('1/1', window.page_nav)
+    _nav_lay.addWidget(window.page_nav_label)
+    window.page_next_btn = QToolButton(window.page_nav)
+    window.page_next_btn.setText('▶')
+    window.page_next_btn.setFont(QFont('Segoe UI Symbol', int(font_size_btn/2)))
+    window.page_next_btn.setAutoRaise(True)
+    window.page_next_btn.clicked.connect(lambda: qt_play_pages(1, False))
+    _nav_lay.addWidget(window.page_next_btn)
+    _nav_lay.addStretch(1)
+    main_layout.addWidget(window.page_nav)
+    window.page_nav.hide()
 
     settings_page = QWidget()
     window.stack.addWidget(settings_page)
@@ -4434,6 +4694,162 @@ class AudioPlayback:
         self._thread.start()
 
 
+_qt_seq_gen = 0      # bumped to cancel a running page sequence
+_qt_caps_event = threading.Event()   # set when _qt_caps is final
+
+
+def parse_captures(fields):
+    # pair jpg/mp3 by the stem before the LAST underscore (same rule as
+    # the card template); play range comes from the _r{us}-{us} suffix
+    caps, by_stem = [], {}
+
+    def stem(fn):
+        b = re.sub(r'\.[^.]+$', '', fn)
+        i = b.rfind('_')
+        return fn if i < 0 else b[:i]
+
+    for fn in re.findall(r'src="([^"]+)"', fields['screenshot']['value']):
+        s = stem(fn)
+        if s not in by_stem:
+            by_stem[s] = {'img': None, 'mp3': None, 'range': None}
+            caps.append(by_stem[s])
+        by_stem[s]['img'] = fn
+    for fn in re.findall(r'src="([^"]+)"', fields['audio']['value']):
+        s = stem(fn)
+        if s not in by_stem:
+            by_stem[s] = {'img': None, 'mp3': None, 'range': None}
+            caps.append(by_stem[s])
+        by_stem[s]['mp3'] = fn
+        m = re.search(r'_r(\d+)-(\d+)\.[^.]+$', fn)
+        if m and int(m.group(2)) > int(m.group(1)):
+            by_stem[s]['range'] = (int(m.group(1)) / 1e6,
+                                   int(m.group(2)) / 1e6)
+    # legacy single pair whose names never match: collapse into one
+    if len(caps) == 2 and caps[0]['mp3'] is None and caps[1]['img'] is None:
+        caps = [{'img': caps[0]['img'], 'mp3': caps[1]['mp3'],
+                 'range': caps[1]['range']}]
+    return caps
+
+
+def _range_to_bytes(wav, rng):
+    with wave.open(io.BytesIO(wav), 'rb') as wf:
+        bps = wf.getframerate() * wf.getnchannels() * wf.getsampwidth()
+        fb = wf.getnchannels() * wf.getsampwidth()
+    if not rng:
+        return 0, None
+    return int(rng[0] * bps) // fb * fb, int(rng[1] * bps) // fb * fb
+
+
+def qt_preload_pages():
+    # decode every page's media in the background as soon as the caps
+    # are known, so flips and the sequence start instantly
+    caps = getattr(window, '_qt_caps', None)
+    if not caps or len(caps) < 2:
+        return
+
+    def worker(cs=caps):
+        for c in cs:
+            if getattr(window, '_qt_caps', None) is not cs:
+                return               # a newer round took over
+            if c.get('_jpg') is None and c['img']:
+                c['_jpg'] = anki_download_media(c['img'])
+            if not c.get('_wav_tried') and c['mp3']:
+                c['_wav_tried'] = True
+                mp3 = anki_download_media(c['mp3'])
+                c['_wav'] = mp3_to_wav(mp3) if mp3 else None
+                if c['_wav'] is None:
+                    print('preload: audio unavailable for ' + str(c['mp3']))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def qt_note_pages_ready(ts):
+    # no-audio round tail: once the note id is published, parse the
+    # note's captures so the nav reflects the merged state
+    round_anki_id_generated.wait(timeout=15)
+    snap = anki_last_new_note
+    if ts != snap[0]:
+        return
+    r = invoke('notesInfo', notes=[int(snap[1])])
+    if r and not r.get('error') and r.get('result') \
+            and r['result'][0].get('fields'):
+        window._qt_caps = parse_captures(r['result'][0]['fields'])
+        window.show_page_signal.emit(None, 0, len(window._qt_caps))
+        _qt_caps_event.set()
+        qt_preload_pages()
+
+
+def qt_play_pages(delta, auto_advance):
+    # unified page navigation. Jump to (current page + delta) and play
+    # it; with auto_advance, continue around ALL pages (hard cuts) and
+    # come home silently. Manual arrows use auto_advance=False: play the
+    # landed page only (mirrors the card template's rules)
+    global _qt_seq_gen
+    _qt_seq_gen += 1
+    gen = _qt_seq_gen
+    if not _qt_caps_event.is_set() and delta:
+        # this round has not finished analyzing its audio yet: the arrow
+        # stays visibly pressed until the flip can actually happen
+        (window.page_prev_btn if delta < 0
+         else window.page_next_btn).setDown(True)
+
+    def worker():
+        global _play_session
+        # a merge round shows the nav before the note is finalized:
+        # block here until the caps are ready, then flip
+        if not _qt_caps_event.wait(timeout=20):
+            window.nav_reset_signal.emit()
+            return
+        caps = getattr(window, '_qt_caps', None)
+        if not caps or len(caps) < 2:
+            window.nav_reset_signal.emit()
+            return
+        if gen != _qt_seq_gen:
+            window.nav_reset_signal.emit()
+            return
+        n = len(caps)
+        start = (getattr(window, '_qt_page', 0) + delta) % n
+        steps = list(range(n)) + [None] if auto_advance else [0]
+        cur = None
+        for k in steps:
+            if cur is not None and cur._thread is not None:
+                cur._thread.join(timeout=120)
+                cur = None
+            if gen != _qt_seq_gen:
+                return
+            idx = start if k is None else (start + k) % n
+            c = caps[idx]
+            jpg = c.get('_jpg')
+            if jpg is None and c['img']:
+                jpg = anki_download_media(c['img'])
+            if gen != _qt_seq_gen:
+                return
+            window.show_page_signal.emit(jpg, idx, n)
+            if k is None:
+                return              # home: image only, stay silent
+            wav = c.get('_wav')
+            if wav is None and c['mp3']:
+                mp3 = anki_download_media(c['mp3'])
+                wav = mp3_to_wav(mp3) if mp3 else None
+            if not wav:
+                time.sleep(1.0)     # audio-less page holds one second
+                continue
+            sb, eb = _range_to_bytes(wav, c['range'])
+            if gen != _qt_seq_gen:
+                return
+            if _play_session is not None:
+                _play_session.abort()
+            s = AudioPlayback(wav)
+            s.src_wav = wav
+            _play_session = s
+            s.play_bytes(sb)
+            if eb is not None:
+                s.set_end_bytes(eb)
+            cur = s
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def play_audio(event):
     # clicking the screenshot must not leave a result box in edit mode;
     # window.focusWidget() also works while the window is inactive
@@ -4441,6 +4857,12 @@ def play_audio(event):
     if fw is not None:
         fw.clearFocus()
     check_processing(round_audio_analysis_start_time_done)
+
+    caps = getattr(window, '_qt_caps', None)
+    if caps and len(caps) >= 2:
+        # multi-page note: play only the page on display (no auto-advance)
+        qt_play_pages(0, False)
+        return
 
     global _play_session
     if not hasattr(window, 'audio_wav') or not window.audio_wav:
@@ -5332,7 +5754,7 @@ def check_blank_frame(raw_frame,raw_search_ms,rms,rms_moving_average,frame_durat
             if inner_bound == -1:
                 inner_bound = raw_frame
         search_ms = max((outer_bound-inner_bound-1)*frame_duration_ms,raw_search_ms)
-    print(f"{raw_frame=}, {inner_bound=}, {search_ms=}, {outer_bound=}")
+    # print(f"{raw_frame=}, {inner_bound=}, {search_ms=}, {outer_bound=}")
     return inner_bound, search_ms
 
 
@@ -5444,12 +5866,37 @@ _bass.BASS_StreamFree.restype = c_bool
 _bass.BASS_StreamFree.argtypes = [c_ulong]
 _bass.BASS_ChannelGetInfo.restype = c_bool
 _bass.BASS_ChannelGetInfo.argtypes = [c_ulong, POINTER(BASS_CHANNELINFO)]
+_bass.BASS_ErrorGetCode.restype = c_int
+_bass.BASS_Init.restype = c_bool
+_bass.BASS_Init.argtypes = [c_int, c_ulong, c_ulong, c_void_p, c_void_p]
+_bass.BASS_SetDevice.restype = c_bool
+_bass.BASS_SetDevice.argtypes = [c_ulong]
 BASS_STREAM_DECODE = 0x200000
+
+
+def _bass_bind_thread():
+    # BASS holds its device setting PER THREAD, so a fresh worker thread
+    # cannot even create a decode-only stream until it binds one. Device
+    # 0 is the "no sound" device: decoding only, no audio hardware, so it
+    # never interferes with the pyaudio playback path
+    if not _bass.BASS_SetDevice(0):
+        _bass.BASS_Init(0, 44100, 0, None, None)   # ALREADY = harmless
+        _bass.BASS_SetDevice(0)
 
 def mp3_to_wav(mp3_bytes):
     stream = _bass.BASS_StreamCreateFile(True, mp3_bytes, 0, len(mp3_bytes), BASS_STREAM_DECODE)
+    if not stream and _bass.BASS_ErrorGetCode() == 8:   # BASS_ERROR_INIT
+        _bass_bind_thread()
+        stream = _bass.BASS_StreamCreateFile(
+            True, mp3_bytes, 0, len(mp3_bytes), BASS_STREAM_DECODE)
     if not stream:
-        print('BASS_StreamCreateFile failed')
+        # BASS error codes are per-thread: read it right here. 8=INIT,
+        # 41=FILEFORM, 44=CODEC, 2=FILEOPEN, 6=FORMAT, 46=BUSY
+        print('BASS_StreamCreateFile failed: err=%s len=%s head=%r thread=%s'
+              % (_bass.BASS_ErrorGetCode(),
+                 len(mp3_bytes) if mp3_bytes else 0,
+                 (mp3_bytes or b'')[:4],
+                 threading.current_thread().name))
         return None
     info = BASS_CHANNELINFO()
     _bass.BASS_ChannelGetInfo(stream, byref(info))
@@ -5477,7 +5924,7 @@ def anki_create_deck():
 
 def anki_create_model():
     ANKI_MODEL_VERSION = 1
-    FRONT_TEMPLATE = """<div style="font-size: min(48px, 8vh)">{{spell}}</div>
+    FRONT_TEMPLATE = r"""<div style="font-size: min(48px, 8vh)">{{spell}}</div>
 <script>
    // Purpose of this script: (1) stop ongoing audio from previous card (2) clean up memory from previous card (3) preload back side because it is heavy
    
@@ -5662,7 +6109,46 @@ def anki_create_model():
                });
    }, 0);
 </script>"""
-    BACK_TEMPLATE = """<script>
+    BACK_TEMPLATE = r"""<script>
+/* ============================================================
+   TUNABLES - every adjustable number of the card lives here.
+   Edit a value, rebuild, push. Sizes/colours/fonts are in the
+   styling tab (CSS), grouped under :root at its top.
+   This block must stay FIRST: the scripts below read it while
+   they run, and a browser executes script blocks in order.
+   ============================================================ */
+window._apCfg = {
+    /* ---- image frame ---- */
+    landscapeHeightRatio: 0.35, /* landscape: max img height = screen.width  * this */
+    portraitHeightRatio: 0.5,   /* portrait:  max img height = screen.height * this */
+    resizeDebounceMs: 150,      /* quiet time after a resize before reflowing */
+    resizeSettleMs: 300,        /* second reflow, for late layout settling */
+
+    /* ---- page transitions ---- */
+    wipeMs: 300,                /* wipe sweep / home-return crossfade */
+    wipeCleanupMs: 420,         /* when the frozen snapshot is dropped */
+    waveFadeOutMs: 160,         /* waveform fade-out on a page change */
+    waveSwapMs: 220,            /* when the next page's audio is loaded */
+    silentHoldMs: 3000,         /* how long a page without audio holds */
+
+    /* ---- audio ---- */
+    audioFadeMaxS: 0.3,         /* longest fade at a clip edge */
+    audioFadeRefVol: 0.01,      /* loudness that already needs a full fade */
+    switchFadeS: 0.15,          /* fade when a page switch cuts playback */
+    switchStopMs: 200,          /* when the faded-out source is stopped */
+    targetPeakMobile: 0.45,     /* normalized peak, phones */
+    targetPeakDesktop: 0.3,     /* normalized peak, desktop */
+    maxGainMobile: 8,           /* gain ceiling, phones */
+    maxGainDesktop: 3,          /* gain ceiling, desktop */
+
+    /* ---- ios audio self-healing (rarely worth touching) ---- */
+    watchdogMs: [300, 1200],    /* clock checks after playback starts */
+    rebuildQuota: 4,            /* context rebuilds allowed per tap */
+    warmupMs: 400,              /* clock probe after returning to the app */
+    warmupTries: 5              /* probe attempts before giving up */
+};
+</script>
+<script>
 (function () {
     // fresh card: the window SURVIVES across cards (that is what makes
     // _apCache work), so per-card state frozen by the previous card must
@@ -5967,7 +6453,9 @@ def anki_create_model():
                  var w = (_pn && _pn.clientWidth > 0)
                      ? _pn.clientWidth : window.innerWidth * 0.95;
                  var h = w * natH / natW;
-                 var mH = window.innerHeight < window.innerWidth ? screen.width * 0.35 : screen.height * 0.5;
+                 var mH = window.innerHeight < window.innerWidth
+            ? screen.width * window._apCfg.landscapeHeightRatio
+            : screen.height * window._apCfg.portraitHeightRatio;
                  // uncapped: width follows the column (100%) so late
                  // scrollbars can't cause overflow; height-capped: hug the
                  // image with a numeric width (always < column, so both
@@ -6019,10 +6507,11 @@ def anki_create_model():
          var _resizeTimer = null;
          window.addEventListener('resize', function() {
              if (_resizeTimer) clearTimeout(_resizeTimer);
-             _resizeTimer = setTimeout(reflowFrame, 150);
+             _resizeTimer = setTimeout(reflowFrame,
+                 window._apCfg.resizeDebounceMs);
          });
          window.addEventListener('orientationchange', function() {
-             setTimeout(reflowFrame, 300);
+             setTimeout(reflowFrame, window._apCfg.resizeSettleMs);
          });
       </script>
       <div class="ap-wrap">
@@ -6104,8 +6593,8 @@ def anki_create_model():
           const _apMyGen = window.top._apGen;
           let currentSource = null;
           let currentGain = null;
+          let curVol = 1, curFadeOutS = 0, fadeArmed = false;
           let rebuilds = 0;   // zombie-clock rebuild quota per visit/tap
-          let zombieAlerted = false;  // test need delete: alert once per card
           let webStart = 0;
           let webOffset = 0;
           let rafId = null;
@@ -6212,12 +6701,13 @@ def anki_create_model():
                           var _fn = audioCtx.currentTime;
                           _g.gain.cancelScheduledValues(_fn);
                           _g.gain.setValueAtTime(_g.gain.value, _fn);
-                          _g.gain.linearRampToValueAtTime(0, _fn + 0.15);
+                          _g.gain.linearRampToValueAtTime(
+                              0, _fn + window._apCfg.switchFadeS);
                       } catch (e) {}
                       setTimeout(function () {
                           try { _src.stop(); } catch (e) {}
                           try { _src.disconnect(); } catch (e) {}
-                      }, 200);
+                      }, window._apCfg.switchStopMs);
                   } else {
                       try { _src.stop(); } catch (e) {}
                       try { _src.disconnect(); } catch (e) {}
@@ -6251,19 +6741,22 @@ def anki_create_model():
               // level than PCs; UA-based detection, iPad included
               var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
                   || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
-              var targetPeak = isMobile ? 0.45 : 0.3;
-              var maxGain = isMobile ? 8 : 3;
+              var targetPeak = isMobile
+                  ? window._apCfg.targetPeakMobile
+                  : window._apCfg.targetPeakDesktop;
+              var maxGain = isMobile
+                  ? window._apCfg.maxGainMobile
+                  : window._apCfg.maxGainDesktop;
               volCache.vol = Math.min(targetPeak / peak, maxGain);
           }
           function rebuildAndReplay(tag) {
               if (_apMyGen !== window.top._apGen) return;
-              if (rebuilds >= 4) {
+              if (rebuilds >= window._apCfg.rebuildQuota) {
                   if (window._apDbgLog) window._apDbgLog("au:giveup " + tag);
                   return;
               }
               rebuilds++;
               if (window._apDbgLog) window._apDbgLog("au:rebuild" + rebuilds + " " + tag);
-              if (!zombieAlerted) { zombieAlerted = true; alert('zombie audio recovered: ' + tag); }  // test need delete
               try { audioCtx.close(); } catch (e) {}
               const AC = window.AudioContext || window.webkitAudioContext;
               audioCtx = new AC();
@@ -6287,14 +6780,14 @@ def anki_create_model():
                   const adv = c0.currentTime - t0;
                   if (window._apDbgLog) window._apDbgLog(
                       "au:warm" + attempt + " +" + adv.toFixed(3) + " " + c0.state);
-                  if (adv > 0 || attempt >= 5) return;
-                  if (!zombieAlerted) { zombieAlerted = true; alert('zombie audio recovered: warm' + attempt); }  // test need delete
+                  if (adv > 0 || attempt >= window._apCfg.warmupTries)
+                      return;
                   try { c0.close(); } catch (e) {}
                   const AC = window.AudioContext || window.webkitAudioContext;
                   audioCtx = new AC();
                   window.top._apAudioCtx = audioCtx;
                   warmupClock(attempt + 1);
-              }, 400);
+              }, window._apCfg.warmupMs);
           }
           function playRangeInternal() {
               stopCurrent();
@@ -6309,7 +6802,7 @@ def anki_create_model():
               gain.connect(audioCtx.destination);
               const offset = startT;
               const playDur = Math.max(0, endT - startT);
-              source.start(0, offset, playDur);
+              source.start(0, offset);
               currentSource = source;
               currentGain = gain;
               webStart = audioCtx.currentTime;
@@ -6321,7 +6814,7 @@ def anki_create_model():
               const zt = audioCtx.currentTime;
               const zsrc = source;
               const zctx = audioCtx;
-              [300, 1200].forEach(function (ms) {
+              window._apCfg.watchdogMs.forEach(function (ms) {
                   setTimeout(function () {
                       if (_apMyGen !== window.top._apGen) return;
                       if (currentSource !== zsrc || audioCtx !== zctx) return;
@@ -6331,8 +6824,8 @@ def anki_create_model():
                       if (adv === 0) rebuildAndReplay("t" + ms);
                   }, ms);
               });
-              const MAX_FADE_S = 0.3;
-              const MAX_VOL = 0.01;
+              const MAX_FADE_S = window._apCfg.audioFadeMaxS;
+              const MAX_VOL = window._apCfg.audioFadeRefVol;
               const sr = audioBuffer.sampleRate;
               const data = audioBuffer.getChannelData(0);
               const fadeSamples = Math.floor(sr * MAX_FADE_S);
@@ -6359,11 +6852,11 @@ def anki_create_model():
               } else {
                   gain.gain.setValueAtTime(vol, now);
               }
-              if (fadeOutS > 0) {
-                  const fadeOutStart = now + playDur - fadeOutS;
-                  gain.gain.setValueAtTime(vol, fadeOutStart);
-                  gain.gain.linearRampToValueAtTime(0, fadeOutStart + fadeOutS);
-              }
+              // fade-out is NOT scheduled up front any more: endT can
+              // move while playing, so watchProgress decides per frame
+              curVol = vol;
+              curFadeOutS = fadeOutS;
+              fadeArmed = false;
 
               window.top._audio = {
                   node: source,
@@ -6385,6 +6878,22 @@ def anki_create_model():
                   updateProgressFromTime(endT);
                   if (window._apSeqNext) window._apSeqNext();
                   return;
+              }
+              if (currentGain && curFadeOutS > 0) {
+                  const left = endT - t;
+                  const g = currentGain.gain;
+                  const n2 = audioCtx.currentTime;
+                  if (!fadeArmed && left <= curFadeOutS) {
+                      fadeArmed = true;
+                      g.cancelScheduledValues(n2);
+                      g.setValueAtTime(g.value, n2);
+                      g.linearRampToValueAtTime(0, n2 + Math.max(0.01, left));
+                  } else if (fadeArmed && left > curFadeOutS) {
+                      fadeArmed = false;   // dragged further right: undo
+                      g.cancelScheduledValues(n2);
+                      g.setValueAtTime(g.value, n2);
+                      g.linearRampToValueAtTime(curVol, n2 + 0.05);
+                  }
               }
               updateProgressFromTime(t);
               rafId = requestAnimationFrame(watchProgress);
@@ -7035,9 +7544,11 @@ def anki_create_model():
             'display:block;z-index:5;pointer-events:none;';
         snap.style.clipPath = 'inset(0 0 0 0)';
         snap.style.webkitClipPath = 'inset(0 0 0 0)';
+        var _wm = window._apCfg.wipeMs;
         snap.style.transition = fade
-            ? 'opacity 300ms ease'
-            : 'clip-path 300ms ease, -webkit-clip-path 300ms ease';
+            ? 'opacity ' + _wm + 'ms ease'
+            : 'clip-path ' + _wm + 'ms ease, -webkit-clip-path '
+              + _wm + 'ms ease';
         box.appendChild(snap);
         requestAnimationFrame(function () {
             requestAnimationFrame(function () {
@@ -7053,17 +7564,18 @@ def anki_create_model():
         });
         setTimeout(function () {
             if (snap.parentNode) snap.parentNode.removeChild(snap);
-        }, 420);
+        }, window._apCfg.wipeCleanupMs);
     }
     function fadeWave(fn) {
         if (!wrap) { if (fn) fn(); return; }
-        wrap.style.transition = 'opacity 160ms';
+        wrap.style.transition =
+            'opacity ' + window._apCfg.waveFadeOutMs + 'ms';
         wrap.style.opacity = '0';
         setTimeout(function () {
             if (_apMyGen !== window.top._apGen) return;
             if (fn) fn();
             wrap.style.opacity = '1';
-        }, 220);
+        }, window._apCfg.waveSwapMs);
     }
     function maybeTimerAdvance() {
         if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
@@ -7072,7 +7584,7 @@ def anki_create_model():
             holdTimer = setTimeout(function () {
                 if (_apMyGen !== window.top._apGen) return;
                 if (window._apSeqNext) window._apSeqNext();
-            }, 1000);
+            }, window._apCfg.silentHoldMs);
         }
     }
     function show(idx, opts) {
@@ -7132,7 +7644,7 @@ def anki_create_model():
     maybeTimerAdvance();
 })();
 </script>"""
-    CSS = """img {
+    CSS = r"""img {
   max-width: 100%;
   height: auto;
 }
@@ -7549,6 +8061,92 @@ round_audio_analysis_start_time_done = threading.Event()
 round_anki_audio_sent = threading.Event()
 _round_events = (round_display, round_anki_id_generated, round_audio_analysis_start_time_done, round_anki_audio_sent)
 
+# --- merge-by-spell: index of existing notes ---------------------------
+_spell_index = {}          # normalized spell -> oldest unsuspended note id
+_spell_index_thread = None
+
+
+def norm_spell(s):
+    # merge key: strip html tags and nbsp (hand-edited notes carry both),
+    # then compare exactly
+    s = re.sub(r'<[^>]+>', '', s or '')
+    return s.replace('\xa0', '').strip()
+
+
+def rebuild_spell_index(wait_prev=False):
+    # snapshot {spell: note id} of every active note in the deck. With
+    # wait_prev the previous round's note must land in Anki first, so
+    # re-snipping the same word sees it as a merge target
+    global _spell_index
+    if wait_prev:
+        round_anki_id_generated.wait(timeout=5)
+    t0 = time.time()
+    r = invoke('findNotes',
+               query=f'deck:{DECK_NAME} note:{MODEL_NAME} -is:suspended')
+    if not r or r.get('error') or r.get('result') is None:
+        print('spell index: findNotes failed, keeping old index')
+        return
+    r = invoke('notesInfo', notes=r['result'])
+    if not r or r.get('error') or r.get('result') is None:
+        print('spell index: notesInfo failed, keeping old index')
+        return
+    idx = {}
+    for n in r['result']:
+        s = norm_spell(n['fields']['spell']['value'])
+        nid = n['noteId']
+        if s and (s not in idx or nid < idx[s]):
+            idx[s] = nid    # duplicate spells: oldest note wins
+    _spell_index = idx
+    print(f'spell index: {len(idx)} entries in {time.time() - t0:.2f}s')
+
+
+# ==================== TEST ONLY: random merge ====================
+# Real duplicates are rare, so force them: 80% of rounds merge into a
+# RANDOM existing note, 20% are treated as new notes. Every capture made
+# while this is on is named ZZTEST_* so cleanup_test_captures.py can
+# strip it (and delete the pure-test notes) afterwards.
+# Set TEST_RANDOM_MERGE = False to stop; delete this block and the two
+# call sites marked TEST ONLY when the feature is signed off.
+TEST_RANDOM_MERGE = True
+TEST_MERGE_RATE = 0.8
+
+
+def test_pick_merge_target(real_target):
+    if not TEST_RANDOM_MERGE:
+        return real_target
+    if random.random() >= TEST_MERGE_RATE:
+        print('TEST: forced NEW note')
+        return None
+    ids = [i for i in _spell_index.values()
+           if str(i) != str(window.anki_id)]
+    if not ids:
+        return real_target
+    t = random.choice(ids)
+    print('TEST: forced merge into ' + str(t))
+    return t
+# ================== END TEST ONLY ==================
+
+
+def spell_index_forget(note_id):
+    # a note deleted in acard: drop it from the index
+    for k, v in list(_spell_index.items()):
+        if str(v) == str(note_id):
+            del _spell_index[k]
+            break
+
+
+def _spell_index_boot():
+    # quiet warm-up: wait for AnkiConnect, then build the first index
+    for _ in range(120):
+        if anki_connect_is_running():
+            rebuild_spell_index()
+            return
+        time.sleep(2)
+
+
+if config['anki_combine_dup']:
+    threading.Thread(target=_spell_index_boot, daemon=True).start()
+
 session = None  # moji session
 dummy_uuid = str(uuid.uuid4())
 hotkey_mode = 1  # -1 = ignore all, 0 = config, 1 = main, 2 = in snip
@@ -7659,19 +8257,17 @@ class LoopbackRecorder:
         if not chunks:
             return b'', 0.0, 0.0
 
-        print(f"first chunk time: {chunks[0][1]:.3f}")
-        print(f"last chunk time:  {chunks[-1][1]:.3f}")
-        print(f"click_time:       {click_time:.3f}")
-        print(f"data_start_time:  {chunks[0][1]:.3f}")
-        print(f"snip_time-60:     {snip_time - AUDIO_BEFORE_SNIP_SECOND:.3f}")
+        # print(f"first chunk time: {chunks[0][1]:.3f}")
+        # print(f"last chunk time:  {chunks[-1][1]:.3f}")
+        # print(f"click_time:       {click_time:.3f}")
+        # print(f"data_start_time:  {chunks[0][1]:.3f}")
+        # print(f"snip_time-60:     {snip_time - AUDIO_BEFORE_SNIP_SECOND:.3f}")
 
         data = b''.join(c for c, _ in chunks)
         data_start_time = chunks[0][1]
         last_chunk_time = chunks[-1][1]
-        print(f"len(data)/BYTES_PER_SEC={len(data)/self.BYTES_PER_SEC:.3f}s")
-        print(
-            f"last_chunk_time - data_start_time={last_chunk_time - data_start_time:.3f}s"
-        )
+        # print(f"len(data)/BYTES_PER_SEC={len(data)/self.BYTES_PER_SEC:.3f}s")
+        # print(f"last_chunk_time - data_start_time={last_chunk_time - data_start_time:.3f}s")
         audio_start_time = max(snip_time - AUDIO_BEFORE_SNIP_SECOND,
                                data_start_time)
         save_start_byte = len(data) - int(
@@ -7753,6 +8349,8 @@ ocr, on_error = init_ocr(
 
 class MainWindow(QMainWindow):
     show_msg_signal = pyqtSignal(str)
+    show_page_signal = pyqtSignal(object, int, int)
+    nav_reset_signal = pyqtSignal()
     reinit_snip_signal = pyqtSignal()
     close_snip_signal = pyqtSignal(bool)  # 0 = quit, 1 = successful snip
     cancel_drag_signal = pyqtSignal()
@@ -7771,6 +8369,8 @@ class MainWindow(QMainWindow):
         self._pos_save_timer.timeout.connect(self._save_position)
         self._restore_done = False
         self.show_msg_signal.connect(self._show_msg)
+        self.show_page_signal.connect(self._show_page)
+        self.nav_reset_signal.connect(self._nav_reset)
         self.reinit_snip_signal.connect(_reinit_snip_main_thread)
         self.close_snip_signal.connect(snip.close_snip)
         self.cancel_drag_signal.connect(snip.cancel_drag)
@@ -7805,6 +8405,33 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         on_quit()
+
+    def _nav_reset(self):
+        # let the arrows pop back up (round finished or timed out)
+        window.page_prev_btn.setDown(False)
+        window.page_next_btn.setDown(False)
+
+    def _show_page(self, jpg_bytes, idx, total):
+        self._nav_reset()
+        # worker asks the gui thread to hard-cut to a page and refresh
+        # the nav bar; jpg_bytes None = nav refresh only
+        # read visibility BEFORE window_change_picture: that call hides
+        # the nav, so reading after it always looks like a hidden->shown
+        # flip and resizes on every page change - and with the nav just
+        # shown its sizeHint is still stale, so the window shrinks a bit
+        was = window.page_nav.isVisible()
+        if jpg_bytes:
+            pm = QPixmap()
+            pm.loadFromData(jpg_bytes)
+            window_change_picture(pm)
+        window._qt_page = idx
+        if total >= 2:
+            window.page_nav_label.setText(f'{idx + 1}/{total}')
+            window.page_nav.show()
+        else:
+            window.page_nav.hide()
+        if window.page_nav.isVisible() != was:
+            resize_window_height()
 
     def _show_msg(self, str):
         global anki_check_needed
