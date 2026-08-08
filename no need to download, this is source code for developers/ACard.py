@@ -1,4 +1,4 @@
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -10,6 +10,14 @@ GITHUB_OWNER = "qazzzlyt"
 GITHUB_REPO  = "ACard"
 _APP_NAME    = "ACard"
 
+
+def _ulog(msg):
+    # the updater thread sleeps 5s before doing anything, by which time
+    # setup_logging() has already teed stdout into ACard.log
+    try:
+        print('[update] ' + str(msg), flush=True)
+    except Exception:
+        pass
 
 def _update_dir() -> Path:
     d = Path(tempfile.gettempdir()) / f"{_APP_NAME}-update"
@@ -174,20 +182,27 @@ def _check_and_download():
     try:
         free = shutil.disk_usage(tempfile.gettempdir()).free
         if free < 500 * 1024 * 1024:
+            _ulog(f"abort: temp drive has only {free / 1e6:.0f} MB free")
             return
-    except OSError:
+    except OSError as e:
+        _ulog(f"abort: cannot read temp disk usage: {e!r}")
         return
 
+    t0 = time.time()
     try:
         url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
         req = Request(url, headers={"Accept": "application/vnd.github.v3+json",
                                     "User-Agent": f"{_APP_NAME}-updater"})
         with urlopen(req, timeout=30) as r:
             release = json.loads(r.read())
-    except Exception:
+        _ulog(f"api ok in {time.time() - t0:.1f}s, "
+              f"latest={release.get('tag_name')!r}, running={__version__!r}")
+    except Exception as e:
+        _ulog(f"api FAILED after {time.time() - t0:.1f}s: {e!r}")
         return
 
     if _parse_ver(release.get("tag_name", "")) <= _parse_ver(__version__):
+        _ulog("already up to date")
         return
 
     dl_url = next(
@@ -196,6 +211,8 @@ def _check_and_download():
         None,
     )
     if not dl_url:
+        _ulog(f"abort: no asset named {_asset_name()!r} in the release "
+              f"(assets: {[a.get('name') for a in release.get('assets', [])]})")
         return
 
     staged = _staged_path()
@@ -206,19 +223,30 @@ def _check_and_download():
             if (info.get("version") == release["tag_name"]
                     and staged.is_file()
                     and _sha256(staged) == info.get("checksum")):
+                _ulog(f"{release['tag_name']} already staged, "
+                      f"applies on next exit")
                 return          # this release is already staged and ready
-        except Exception:
-            pass
+        except Exception as e:
+            _ulog(f"pending.json unreadable, ignoring it: {e!r}")
 
     dest = _update_dir() / _asset_name()
     h = hashlib.sha256()
+    _ulog(f"downloading {release['tag_name']} from {dl_url}")
+    t1 = time.time()
+    got = 0
     try:
         req2 = Request(dl_url, headers={"User-Agent": f"{_APP_NAME}-updater"})
         with urlopen(req2, timeout=900) as r, open(dest, "wb") as f:
             while chunk := r.read(65536):
                 f.write(chunk)
                 h.update(chunk)
-    except Exception:
+                got += len(chunk)
+        dt = time.time() - t1
+        _ulog(f"downloaded {got / 1e6:.1f} MB in {dt:.0f}s "
+              f"({got / 1e6 / max(dt, 0.1):.2f} MB/s)")
+    except Exception as e:
+        _ulog(f"download FAILED after {time.time() - t1:.0f}s, "
+              f"{got / 1e6:.1f} MB received: {e!r}")
         dest.unlink(missing_ok=True)
         return
 
@@ -234,9 +262,11 @@ def _check_and_download():
             return
         shutil.copyfile(dest, staged)
         ok = _sha256(staged) == h.hexdigest()
-    except OSError:
+    except OSError as e:
+        _ulog(f"staging FAILED: {e!r}")
         ok = False
     if not ok:
+        _ulog("staging discarded (copy failed or checksum mismatch)")
         for junk in (staged, dest):
             try:
                 junk.unlink(missing_ok=True)
@@ -251,15 +281,20 @@ def _check_and_download():
                     "checksum": h.hexdigest()}, indent=2),
         encoding="utf-8",
     )
+    _ulog(f"staged {release['tag_name']} at {staged}, applies on next exit")
 
 def _update_loop():
     time.sleep(5)
-    _sweep_stale_files()
+    _ulog(f"updater started, running {__version__}")
+    try:
+        _sweep_stale_files()
+    except Exception as e:
+        _ulog(f"sweep failed: {e!r}")
     while True:
         try:
             _check_and_download()
-        except Exception:
-            pass
+        except Exception as e:
+            _ulog(f"unexpected error: {e!r}")
         time.sleep(30 * 60)     # re-check every 30 minutes while running
 
 if getattr(sys, 'frozen', False):
@@ -271,7 +306,7 @@ import datetime
 import uuid
 import sys, psutil
 # Beta expiry date
-BETA_EXPIRY = datetime.date(2026, 7, 31)
+BETA_EXPIRY = datetime.date(2026, 8, 31)
 # Allowed MAC addresses (last 8 hex digits, lowercase, no separators)
 ALLOWED_MAC_SUFFIXES = [
     '2489',  # add allowed suffixes here
@@ -794,6 +829,8 @@ def _wm_to_btn_str(wParam, lParam):
 
 def _mouse_hook_proc(nCode, wParam, lParam):
     global lock_length, _rb_down_suppressed, last_slider_time_ms, hide_on_click
+    if nCode >= 0 and pressed_mouse_hotkey(wParam, lParam):  # HKDEBUG
+        hk_log(f'MOUSE {_wm_to_btn_str(wParam, lParam)}')    # HKDEBUG
 
     def passthrough():
         return windll.user32.CallNextHookEx(None, nCode, wParam,
@@ -903,6 +940,8 @@ def on_press(key):
     global current_modifiers, lock_length
     if key in MODIFIER_KEYS:
         current_modifiers.add(key)
+    if pressed_keyboard_hotkey(key):   # HKDEBUG
+        hk_log(f'KEY {key}')           # HKDEBUG
     if hotkey_mode == 0:
         if key not in MODIFIER_KEYS:  # only record when a non-modifier key is pressed
             mods = []
@@ -1022,6 +1061,68 @@ def on_release(key):
     global current_modifiers
     if key in MODIFIER_KEYS:
         current_modifiers.discard(key)
+
+
+# ==== HKDEBUG BEGIN — delete this whole block when done =====================
+HK_DEBUG = True
+
+
+def hk_log(what):
+    """One line per press of the configured hotkey, dumping everything that
+    can affect whether the hotkey fires and whether snip can be exited.
+    Runs on the mouse-hook thread, so every read is defensive: one broken
+    field must never cost the whole line."""
+    if not HK_DEBUG:
+        return
+
+    def g(fn):
+        try:
+            return fn()
+        except Exception as e:
+            return f'<{type(e).__name__}>'
+
+    try:
+        s = globals().get('snip')
+        w = globals().get('window')
+        now = time.time()
+        stamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        print(' | '.join([
+            f'[HK {stamp}] {what}',
+            # what decides whether the hotkey fires at all
+            f'mode={hotkey_mode}'
+            f' hk={g(lambda: config["hotkey"])}'
+            f' since_openclose={round(now - _snip_open_close_time, 2)}'
+            f' rb_supp={_rb_down_suppressed}'
+            f' mods={g(lambda: sorted(str(m)[4:] for m in current_modifiers))}'
+            f' kb_alive={g(lambda: keyboard_listener.is_alive())}',
+            # snip state: a stuck drag / virtual cursor blocks the exit
+            f'snip#{g(lambda: id(s) % 100000 if s is not None else None)}'
+            f' vis={g(lambda: s.isVisible())}'
+            f' drag={getattr(s, "dragging", "?")}'
+            f' pos={getattr(s, "start_pos", "?")}->{getattr(s, "end_pos", "?")}'
+            f' raw_on={getattr(s, "_raw_on", "?")}'
+            f' vmode={getattr(s, "_vmode", "?")}'
+            f' vdrag={getattr(s, "_vslider_drag", "?")}'
+            f'/{getattr(s, "_vpanel_drag", "?")}'
+            f' vhover={getattr(s, "_vhover", "?")}'
+            f' slider={g(lambda: s.slider.value())}'
+            f'/{g(lambda: s.slider.maximum())}'
+            f' scroll={getattr(s, "_scroll_step", "?")}'
+            f' last_ms={getattr(s, "last_slider_time_ms", "?")}',
+            # close_snip does screenshot[slider.value()] -> IndexError risk
+            f'shots={g(lambda: len(screenshot))}'
+            f' shot_thread={g(lambda: screenshot_thread_handle.is_alive())}'
+            f' shot_stop={g(lambda: screenshot_thread_stop.is_set())}',
+            # window + signal wiring; close_recv > 1 means duplicate connects
+            f'win_vis={g(lambda: w.isVisible())}'
+            f' page={g(lambda: w.stack.currentIndex())}'
+            f' hide_on_click={globals().get("hide_on_click", "?")}'
+            f' lock={globals().get("lock_length", "?")}'
+            f' close_recv={g(lambda: w.receivers(w.close_snip_signal))}',
+        ]))
+    except Exception as e:
+        print(f'[HK] log failed: {e!r}')
+# ==== HKDEBUG END ==========================================================
 
 
 _snip_open_close_time = 0
@@ -1944,7 +2045,6 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                 _spell_index_thread.join(timeout=5)
             merge_target = _spell_index.get(
                 norm_spell(word_info.get('spell') or ''))
-            merge_target = test_pick_merge_target(merge_target)  # TEST ONLY
             if merge_target:
                 r = invoke('notesInfo', notes=[int(merge_target)])
                 if r and not r.get('error') and r.get('result') \
@@ -2367,6 +2467,7 @@ def detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time
 
     sentences = []
     snip_hog = compute_hog(screenshot[snip_index][0], rect_small)
+    zncc_prepare_template(screenshot[snip_index][0], rect_small)
 
     snip_index_in_sentences = 0  # test not sure why sometimes 'snip_index_in_sentences' where it is not associated with a value without this initialize
     for i in range(lock_length):
@@ -2472,7 +2573,114 @@ def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sente
     return ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, this_hog, diff_frame_draft_total
 
 
-def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences, word,
+# ==== ZNCC subtitle probe =================================================
+# Replaces the OCR probe: the word's own pixels, cropped from the snip
+# frame, are matched against later frames. One rect only - a match is
+# always the template's size, so rect_small is the single source of truth.
+ZNCC_THRESHOLD = 0.6      # score at or above this means "the word is here"
+_zncc_tmpl = None         # template for the current detection round
+
+
+def _zncc_next_pow2(n):
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def qimage_to_gray(qimg_full, rect):
+    """Crop -> float64 grayscale. QImage pads rows, so the buffer must be
+    reshaped by bytesPerLine and only then sliced down to the real width."""
+    cropped = qimg_full.copy(rect).convertToFormat(QImage.Format_Grayscale8)
+    h, w = cropped.height(), cropped.width()
+    if h <= 0 or w <= 0:
+        return None
+    ptr = cropped.bits()
+    ptr.setsize(cropped.byteCount())
+    arr = np.frombuffer(memoryview(ptr).tobytes(), dtype=np.uint8)
+    arr = arr.reshape((h, cropped.bytesPerLine()))
+    return arr[:, :w].astype(np.float64)
+
+
+def zncc_prepare_template(qimg_full, rect_small):
+    """Call once per detection round, on the snip frame. Zero-mean the crop
+    now so every later frame only pays for the correlation."""
+    global _zncc_tmpl
+    _zncc_tmpl = None
+    t = qimage_to_gray(qimg_full, rect_small)
+    if t is None or t.size == 0:
+        return
+    t = t - t.mean()
+    norm = float(np.sqrt((t * t).sum()))
+    if norm == 0:          # flat crop: no text to match on
+        return
+    _zncc_tmpl = {'t': t, 'h': t.shape[0], 'w': t.shape[1], 'norm': norm}
+
+
+def zncc_find(qimg_full, rect_search):
+    """Best ZNCC of this round's template inside rect_search.
+    Returns (score, QPoint top-left in FULL-frame coords), or (-1.0, None)
+    when it cannot be scored at all."""
+    if _zncc_tmpl is None:
+        return -1.0, None
+    region = qimage_to_gray(qimg_full, rect_search)
+    if region is None:
+        return -1.0, None
+    H, W = region.shape
+    h, w = _zncc_tmpl['h'], _zncc_tmpl['w']
+    if h > H or w > W:
+        return -1.0, None
+    n = float(h * w)
+    fh = _zncc_next_pow2(H + h - 1)
+    fw = _zncc_next_pow2(W + w - 1)
+    # correlation via FFT: flip the template to turn convolution into it
+    corr = np.fft.irfft2(
+        np.fft.rfft2(region, (fh, fw))
+        * np.fft.rfft2(_zncc_tmpl['t'][::-1, ::-1], (fh, fw)),
+        (fh, fw))[h - 1:H, w - 1:W]
+    # integral images give every window's sum and sum-of-squares in O(1)
+    ii = np.pad(np.cumsum(np.cumsum(region, 0), 1), ((1, 0), (1, 0)))
+    ii2 = np.pad(np.cumsum(np.cumsum(region * region, 0), 1), ((1, 0), (1, 0)))
+    s = ii[h:, w:] - ii[:-h, w:] - ii[h:, :-w] + ii[:-h, :-w]
+    s2 = ii2[h:, w:] - ii2[:-h, w:] - ii2[h:, :-w] + ii2[:-h, :-w]
+    var = s2 - s * s / n
+    valid = var > n * 0.5           # flat windows cannot contain text
+    ncc = np.where(valid,
+                   corr / (np.sqrt(np.maximum(var, 1e-9)) * _zncc_tmpl['norm']),
+                   -1.0)
+    ncc = np.clip(ncc, -1.0, 1.0)
+    idx = int(np.argmax(ncc))
+    y, x = divmod(idx, ncc.shape[1])
+    return float(ncc[y, x]), QPoint(rect_search.left() + x,
+                                    rect_search.top() + y)
+
+
+def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences,
+                              word, rect_expanded, rect_last_ocr, rect_small,
+                              this_hog, folder_path):
+    # ZNCC stand-in for the OCR probe. 'direction' and 'word' are unused:
+    # the template already carries the glyphs and their orientation.
+    # Only one rect exists here, so rect_small is returned for both slots.
+    score, top_left = zncc_find(screenshot[k][0], rect_to_ocr)
+    screenshot[k][0].copy(rect_to_ocr).save(
+        os.path.join(
+            folder_path,
+            f"{screenshot[k][1]/1000:.3f}-{subtitle_sentences[i][4]}.png")
+    )  # need delete
+    if top_left is None:        # unscorable: abstain, same as a failed OCR
+        return rect_small, rect_small, this_hog
+    if score >= ZNCC_THRESHOLD:
+        subtitle_sentences[i][3] = 1
+        if subtitle_sentences[i][4] == 2:   # move probe: adopt the new spot
+            rect_small = QRect(top_left.x(), top_left.y(),
+                               _zncc_tmpl['w'], _zncc_tmpl['h'])
+            this_hog = compute_hog(screenshot[k][0], rect_small)
+    else:
+        subtitle_sentences[i][3] = 0
+    return rect_small, rect_small, this_hog
+
+
+def sentences_one_compare_ocr_real(i, k, rect_to_ocr, direction, subtitle_sentences, word,
                               rect_expanded, rect_last_ocr, rect_small,
                               this_hog, folder_path):
     img = screenshot[k][0].copy(rect_to_ocr)
@@ -2587,8 +2795,6 @@ def anki_l0_stem(word, ts):
     # L0 media stem: sanitized word (max 18 chars) + 13-digit ms timestamp.
     # MUST be byte-identical between the jpg and mp3 of one capture: the
     # card template pairs files by everything before the LAST underscore.
-    if TEST_RANDOM_MERGE:                       # TEST ONLY: ZZTEST names
-        return f'ZZTEST_{int(ts * 1000)}'       # TEST ONLY
     w = re.sub(r'<[^>]+>', '', word)      # hand-edited spells carry html
     w = re.sub(r'[\\/:*?"<>|_\s]', '', w)[:18] or 'word'
     return f'{w}_{int(ts * 1000)}'
@@ -2601,6 +2807,41 @@ def anki_l0_quad(position):
     if len(pts) != 4:
         return '-'.join(['0'] * 8)
     return '-'.join(str(max(0, int(v))) for xy in pts for v in xy)
+
+
+def _merge_bump_schedule(cards):
+    # a merged note has fresh material and should come up as soon as
+    # possible. Cards already in review: due today with their interval
+    # untouched, so a word grown to a 30-day interval keeps that curve
+    # instead of restarting from scratch. Cards still new: stay new (the
+    # daily new-card limit keeps applying) but move to the head of the
+    # queue so they are the first new word served.
+    # invoke() returns the whole AnkiConnect envelope {'result':..,'error':..},
+    # and iterating that dict yields its key strings, not the cards
+    r = invoke('cardsInfo', cards=cards)
+    info = (r or {}).get('result') or []
+    if not info:
+        return
+    review = [c['cardId'] for c in info if c.get('type') in (2, 3)]
+    fresh = [c['cardId'] for c in info if c.get('type') in (0, 1)]
+    if review:
+        invoke('setDueDate', cards=review, days='0')   # no "!": keeps ivl
+    if not fresh:
+        return
+    try:
+        found = invoke('findCards', query=f'deck:{DECK_NAME} is:new')
+        others = invoke('cardsInfo', cards=(found or {}).get('result') or [])
+        lowest = min([c['due'] for c in (others or {}).get('result') or []]
+                     or [1])
+    except Exception:
+        lowest = 1
+    for cid in fresh:
+        try:
+            # newValues must be an int here, a string raises
+            invoke('setSpecificValueOfCard', card=cid, keys=['due'],
+                   newValues=[lowest - 1], warning_check=True)
+        except Exception as e:
+            print('merge: reposition failed:', e)
 
 
 def anki_merge_into(target_id, fields):
@@ -2625,8 +2866,7 @@ def anki_merge_into(target_id, fields):
         print('merge: updateNoteFields failed:', r and r.get('error'))
         return False
     if cards:
-        # fresh material on an old note: back to the new-card queue
-        invoke('forgetCards', cards=cards)
+        _merge_bump_schedule(cards)
     print(f"merged '{fields.get('spell', '')}' into note {target_id}")
     return True
 
@@ -2755,7 +2995,7 @@ def anki_get_and_display(anki_id, anki_check):
             window.end_byte = int(end_sec * bps) // fb * fb
         else:
             window.start_byte = window.end_byte = 0
-        print(f"[WRITE get_and_display] id={anki_id} range={fields['range']['value']} bytes={window.start_byte}-{window.end_byte} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
+        print(f"[WRITE get_and_display] id={anki_id} range={start_sec:.3f}-{end_sec:.3f} bytes={window.start_byte}-{window.end_byte} wavlen={len(window.audio_wav) if window.audio_wav else 0}")  # debug
     else:
         window.audio_wav = None
     window._qt_caps = parse_captures(fields)
@@ -2956,12 +3196,12 @@ def anki_merge_note_into(target_id, src_id):
     if not r or r.get('error'):
         return False
     if cards:
-        # the target gained captures: reschedule it as a new card
-        invoke('forgetCards', cards=cards)
+        _merge_bump_schedule(cards)
     return True
 
 
 def ask_front(text, yes_no=True):
+    global hide_on_click
     # message box forced above other windows: the main window is
     # no-activate, so a plain exec_ can open behind the game
     box = QMessageBox()
@@ -2977,7 +3217,11 @@ def ask_front(text, yes_no=True):
         windll.user32.SetForegroundWindow(int(box.winId()))
     except Exception:
         pass
-    return box.exec_() == QMessageBox.Yes
+    tmp = hide_on_click
+    hide_on_click = False
+    ans = box.exec_()
+    hide_on_click = tmp
+    return ans == QMessageBox.Yes
 
 
 def maybe_merge_on_save():
@@ -2988,7 +3232,6 @@ def maybe_merge_on_save():
     if not config['anki_combine_dup'] or not window.anki_id:
         return False
     target = _spell_index.get(norm_spell(window.label_spell.text()))
-    target = test_pick_merge_target(target)           # TEST ONLY
     if not target or str(target) == str(window.anki_id):
         return False
     if not ask_front(ui('search_dup')):
@@ -4278,6 +4521,9 @@ def set_qt_layout():
             lambda pos, w=box: show_custom_context_menu(w, pos, font_size_small))
         setup_editable_result_box(box, result_boxes)
         box.installEventFilter(window._select_all_filter)
+    # the word box behaves like the result boxes: a right-click that
+    # ENTERS it selects everything, a left-click just places the cursor
+    window.word.installEventFilter(window._select_all_filter)
 
 
     # save lights up whenever any field changes (search result or manual edit)
@@ -4483,8 +4729,9 @@ def set_result_editable(editable):
 
 
 def current_fields():
+    # word is not stored in anki any more, so editing it must not light
+    # up the save button
     return {
-        'word': window.word.text(),
         'spell': window.label_spell.text(),
         'pron': window.label_pron.text(),
         'excerpt': window.label_excerpt.toHtml(),
@@ -5065,7 +5312,7 @@ def check_screen_change(index):
 
 
 def _do_screen_change():
-    global screenshot, screenshot_thread_handle
+    global screenshot, screenshot_thread_handle, hotkey_mode
     hotkey_mode = -1
     screenshot_thread_stop.set()
 
@@ -5923,7 +6170,7 @@ def anki_create_deck():
 
 
 def anki_create_model():
-    ANKI_MODEL_VERSION = 1
+    ANKI_MODEL_VERSION = 2
     FRONT_TEMPLATE = r"""<div style="font-size: min(48px, 8vh)">{{spell}}</div>
 <script>
    // Purpose of this script: (1) stop ongoing audio from previous card (2) clean up memory from previous card (3) preload back side because it is heavy
@@ -6042,16 +6289,11 @@ def anki_create_model():
            if (!fname) return;
            if (!window.top._apCache) window.top._apCache = {};
    
-           // Parse range field
+           // play range rides in the mp3 filename: _r{start_us}-{end_us}
            var playTime = null;
-           var rawPT = "{{range}}".trim();
-           if (rawPT) {
-               var parts = rawPT.split(",");
-               if (parts.length === 2) {
-               var s = parseFloat(parts[0]);
-               var e = parseFloat(parts[1]);
-               if (isFinite(s) && isFinite(e) && s < e) playTime = [s, e];
-               }
+           var rawPT = fname.match(/_r(\d+)-(\d+)\.[^.]+$/);
+           if (rawPT && +rawPT[2] > +rawPT[1]) {
+               playTime = [+rawPT[1] / 1e6, +rawPT[2] / 1e6];
            }
    
            // Extract image src from rendered {{screenshot}} HTML
@@ -6129,7 +6371,7 @@ window._apCfg = {
     wipeCleanupMs: 420,         /* when the frozen snapshot is dropped */
     waveFadeOutMs: 160,         /* waveform fade-out on a page change */
     waveSwapMs: 220,            /* when the next page's audio is loaded */
-    silentHoldMs: 3000,         /* how long a page without audio holds */
+    silentHoldMs: 1000,         /* how long a page without audio holds */
 
     /* ---- audio ---- */
     audioFadeMaxS: 0.3,         /* longest fade at a clip edge */
@@ -6203,19 +6445,6 @@ window._apCfg = {
         var ao_ = caps.filter(function (c) { return c.mp3 && !c.img && !c.range; });
         if (io_.length === 1 && ao_.length === 1) {
             caps = [{ stem: io_[0].stem, img: io_[0].img, mp3: ao_[0].mp3 }];
-        }
-    }
-    // old-format cards (no metadata in names): fall back to the fields
-    if (caps.length && !caps[0].quad) {
-        var p = [{{position}}];
-        var imgs = caps.filter(function (c) { return c.img; });
-        if (p.length === 4 && imgs.length === 1 && !imgs[0].quad) imgs[0].quad = p;
-    }
-    var withMp3 = caps.filter(function (c) { return c.mp3; });
-    if (withMp3.length === 1 && !withMp3[0].range) {
-        var r = "{{range}}".trim().split(",");
-        if (r.length === 2 && +r[1] > +r[0]) {
-            withMp3[0].range = [+r[0], +r[1]];
         }
     }
     var start = 0, key = 'ap-page:' + (caps.length ? caps[0].stem : '');
@@ -7843,10 +8072,7 @@ body.landscape #text-wrap {
         "excerpt",
         "fuzzy",
         "screenshot",
-        "word",
-        "position",
         "audio",
-        "range",
         "time",
     ]
     if MODEL_NAME not in (invoke("modelNames") or {}).get("result", []):
@@ -8098,33 +8324,6 @@ def rebuild_spell_index(wait_prev=False):
             idx[s] = nid    # duplicate spells: oldest note wins
     _spell_index = idx
     print(f'spell index: {len(idx)} entries in {time.time() - t0:.2f}s')
-
-
-# ==================== TEST ONLY: random merge ====================
-# Real duplicates are rare, so force them: 80% of rounds merge into a
-# RANDOM existing note, 20% are treated as new notes. Every capture made
-# while this is on is named ZZTEST_* so cleanup_test_captures.py can
-# strip it (and delete the pure-test notes) afterwards.
-# Set TEST_RANDOM_MERGE = False to stop; delete this block and the two
-# call sites marked TEST ONLY when the feature is signed off.
-TEST_RANDOM_MERGE = True
-TEST_MERGE_RATE = 0.8
-
-
-def test_pick_merge_target(real_target):
-    if not TEST_RANDOM_MERGE:
-        return real_target
-    if random.random() >= TEST_MERGE_RATE:
-        print('TEST: forced NEW note')
-        return None
-    ids = [i for i in _spell_index.values()
-           if str(i) != str(window.anki_id)]
-    if not ids:
-        return real_target
-    t = random.choice(ids)
-    print('TEST: forced merge into ' + str(t))
-    return t
-# ================== END TEST ONLY ==================
 
 
 def spell_index_forget(note_id):
