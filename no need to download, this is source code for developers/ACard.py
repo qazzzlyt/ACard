@@ -236,7 +236,7 @@ def _check_and_download():
     got = 0
     try:
         req2 = Request(dl_url, headers={"User-Agent": f"{_APP_NAME}-updater"})
-        with urlopen(req2, timeout=900) as r, open(dest, "wb") as f:
+        with urlopen(req2, timeout=3600) as r, open(dest, "wb") as f:
             while chunk := r.read(65536):
                 f.write(chunk)
                 h.update(chunk)
@@ -492,7 +492,7 @@ UI_TEXT = {
     ('File is Wrong. Download Anki and select', '文件错误.下载并选择Anki'),
     'no_anki_connection': ('Failed to connect to Anki', '无法连接Anki'),
     'dup': ('ACard is already running', 'ACard已启动'),
-    'blank': ('Blank', '无'),
+    'blank': ('(Blank)', '(无)'),
     'install_anki_connect':
     ('Install Anki Connect:<br>1. Open Anki<br>2. Press Ctrl+Shift+A<br>3. Click Get Add-ons...<br>4. put 2055492159 as Code<br>5. Click OK',
      '安装Anki Connect<br>1. 打开Anki<br>2. 按下Ctrl+Shift+A<br>3. 点击 获取插件...<br>4. 代码处输入2055492159<br>5. 点击确定'
@@ -1187,15 +1187,18 @@ WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
 
 
-def show_and_exclude_from_capture(window):
+def show_and_exclude_from_capture(window, no_activate=True):
     user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
     user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
     with lock:
         window.show()
         hwnd = int(window.winId())
-        ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                     ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        if no_activate:
+            # a dialog needs to stay activatable: NOACTIVATE costs it the
+            # keyboard, and TOOLWINDOW means nothing for a modal box
+            ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                         ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         user32.SetWindowDisplayAffinity(hwnd, 0)
         ok = user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
 
@@ -2169,13 +2172,13 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     
     os.makedirs(folder_path, exist_ok=True)  #test need delete
 
-    snip_hog, subtitle_sentences, snip_index_in_sentences, rect_small, rect_expanded, direction = detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect)
+    snip_hog, subtitle_sentences, snip_index_in_sentences, rect_small, rect_small_expanded = detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect)
     
     snip_strip = screenshot[snip_index][0].copy(rect_small)  # test need delete: grab before logout, saved in debug tail
     snip_strip_time = screenshot[snip_index][1] / 1000  # test need delete
     
     ambiguous_diff_max = 0.15
-    detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
+    detect_subtitle_start(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_small_expanded,ambiguous_diff_max,folder_path)
     
     frame_duration_ms = 20
 
@@ -2190,7 +2193,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                   subtitle_sentences, ambiguous_diff_max)
     round_audio_analysis_start_time_done.set()
 
-    detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path)
+    detect_subtitle_end(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_small_expanded,ambiguous_diff_max,folder_path)
     screenshot_logout()
     end_byte, end_frame = analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
                 frame_duration_ms, snip_index_in_sentences,
@@ -2452,18 +2455,9 @@ def quad_to_smaller_rect(points):
 
 
 def detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect):
-    # same direction with original ocr
     # this is because rect will be expanded vertically for further ocr
     # if no adjustment here, the ocr is more likely to become vertical
     rect_small = quad_to_smaller_rect(points)
-    w = rect_small.width()
-    h = rect_small.height()
-    if w >= h * 1.8:
-        direction = 0  # horizontal
-    elif h >= w * 1.8:
-        direction = 1  # vertical
-    else:
-        direction = 2  # auto
 
     sentences = []
     snip_hog = compute_hog(screenshot[snip_index][0], rect_small)
@@ -2479,33 +2473,32 @@ def detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time
                 -1, -1, this_frame_time, -1, ''
             ])  # (diff_snip,diff_last,time,ocr_same) test need delete last
 
-    # expand rect
-    expand = rect.height() * 5
-    rect_expanded = rect.adjusted(0, -expand, 0, expand)
+    # expand rect_small
+    expand = rect_small.height() * 5
+    rect_small_expanded = rect_small.adjusted(0, -expand, 0, expand)
     screen_h = screenshot[snip_index][0].height()
-    if rect_expanded.top() < 0:
-        rect_expanded.setTop(0)
-    if rect_expanded.bottom() > screen_h - 1:
-        rect_expanded.setBottom(screen_h - 1)
+    if rect_small_expanded.top() < 0:
+        rect_small_expanded.setTop(0)
+    if rect_small_expanded.bottom() > screen_h - 1:
+        rect_small_expanded.setBottom(screen_h - 1)
         
-    return snip_hog, sentences, snip_index_in_sentences, rect_small, rect_expanded, direction
+    return snip_hog, sentences, snip_index_in_sentences, rect_small, rect_small_expanded
 
 
-def detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path):
+def detect_subtitle_start(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_last_zncc,rect_expanded,ambiguous_diff_max,folder_path):
     # loop left to find start
     last_hog = snip_hog
     ocr_budget_ambiguous = 3
     ocr_budget_move = 2
     diff_frame_draft_total = 0
-    rect_last_ocr = rect
     for i in range(snip_index_in_sentences - 1, -1, -1):
-        ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, last_hog, diff_frame_draft_total = sentences_one_compare(
-            i, snip_index_in_sentences, snip_index, subtitle_sentences, rect_last_ocr,
-            rect_small, rect_expanded, word, ocr_budget_ambiguous, snip_hog,
-            ocr_budget_move, direction, last_hog, diff_frame_draft_total,ambiguous_diff_max,
+        ocr_budget_ambiguous, ocr_budget_move, rect_last_zncc, last_hog, diff_frame_draft_total = sentences_one_compare(
+            i, snip_index_in_sentences, snip_index, subtitle_sentences, rect_last_zncc,
+            rect_expanded, ocr_budget_ambiguous, snip_hog,
+            ocr_budget_move, last_hog, diff_frame_draft_total,ambiguous_diff_max,
             folder_path)
         screenshot[i - snip_index_in_sentences + snip_index][0].copy(
-            rect_small
+            rect_last_zncc
         ).save(
             os.path.join(
                 folder_path,
@@ -2513,22 +2506,21 @@ def detect_subtitle_start(snip_hog,rect,snip_index_in_sentences,snip_index,subti
             ))  #test need delete
         
 
-def detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_expanded,word,direction,ambiguous_diff_max,folder_path):
+def detect_subtitle_end(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_last_zncc,rect_small_expanded,ambiguous_diff_max,folder_path):
     global lock_length, screenshot_users
     # loop left to find end
     last_hog = snip_hog
     ocr_budget_ambiguous = 3
     ocr_budget_move = 2
     diff_frame_draft_total = 0
-    rect_last_ocr = rect
     for i in range(snip_index_in_sentences + 1, len(subtitle_sentences)):
-        ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, last_hog, diff_frame_draft_total = sentences_one_compare(
-            i, snip_index_in_sentences, snip_index, subtitle_sentences, rect_last_ocr,
-            rect_small, rect_expanded, word, ocr_budget_ambiguous, snip_hog,
-            ocr_budget_move, direction, last_hog, diff_frame_draft_total, ambiguous_diff_max,
+        ocr_budget_ambiguous, ocr_budget_move, rect_last_zncc, last_hog, diff_frame_draft_total = sentences_one_compare(
+            i, snip_index_in_sentences, snip_index, subtitle_sentences, rect_last_zncc,
+            rect_small_expanded, ocr_budget_ambiguous, snip_hog,
+            ocr_budget_move, last_hog, diff_frame_draft_total, ambiguous_diff_max,
             folder_path)
         screenshot[i - snip_index_in_sentences + snip_index][0].copy(
-            rect_small
+            rect_last_zncc
         ).save(
             os.path.join(
                 folder_path,
@@ -2537,14 +2529,14 @@ def detect_subtitle_end(snip_hog,rect,snip_index_in_sentences,snip_index,subtitl
 
 
 def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sentences,
-                          rect_last_ocr, rect_small, rect_expanded, word,
+                          rect_last_zncc, rect_small_expanded,
                           ocr_budget_ambiguous, snip_hog, ocr_budget_move,
-                          direction, last_hog, diff_frame_draft_total,
+                          last_hog, diff_frame_draft_total,
                           ambiguous_diff_max,folder_path):
     ambiguous_diff_min = 0.04
 
     k = i - snip_index_in_sentences + snip_index
-    this_hog = compute_hog(screenshot[k][0], rect_small)
+    this_hog = compute_hog(screenshot[k][0], rect_last_zncc)
     diff_snip = float(np.linalg.norm(this_hog - snip_hog))
     subtitle_sentences[i][0] = diff_snip
     diff_last = float(np.linalg.norm(this_hog - last_hog))
@@ -2553,24 +2545,24 @@ def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sente
         if ambiguous_diff_min < diff_snip and diff_snip < ambiguous_diff_max and ocr_budget_ambiguous > 0:
             ocr_budget_ambiguous -= 1
             subtitle_sentences[i][4] = 1
-            rect_last_ocr, rect_small, this_hog = sentences_one_compare_ocr(
-                i, k, rect_last_ocr, direction, subtitle_sentences, word, rect_expanded,
-                rect_last_ocr, rect_small, this_hog, folder_path)
+            rect_last_zncc, this_hog = sentences_one_compare_zncc(
+                i, k, rect_last_zncc, subtitle_sentences, rect_last_zncc,
+                this_hog, folder_path)
         if diff_snip > ambiguous_diff_min and ocr_budget_move > 0 and subtitle_sentences[
                 i][3] != 1:
             ocr_budget_move -= 1
             subtitle_sentences[i][4] = 2
-            rect_last_ocr, rect_small, this_hog = sentences_one_compare_ocr(
-                i, k, rect_expanded, direction, subtitle_sentences, word, rect_expanded,
-                rect_last_ocr, rect_small, this_hog, folder_path)
+            rect_last_zncc, this_hog = sentences_one_compare_zncc(
+                i, k, rect_small_expanded, subtitle_sentences, rect_last_zncc,
+                this_hog, folder_path)
 
     if subtitle_sentences[i][3] == 0 or (subtitle_sentences[i][3] == -1
                                 and subtitle_sentences[i][0] > ambiguous_diff_max
                                 and subtitle_sentences[i][1] > ambiguous_diff_max):
         diff_frame_draft_total += 1
-    if diff_frame_draft_total >= 2:  # avoid unnecessary ocr
+    if diff_frame_draft_total >= 2:  # avoid unnecessary detect
         ocr_budget_ambiguous = 0
-    return ocr_budget_ambiguous, ocr_budget_move, rect_last_ocr, rect_small, this_hog, diff_frame_draft_total
+    return ocr_budget_ambiguous, ocr_budget_move, rect_last_zncc, this_hog, diff_frame_draft_total
 
 
 # ==== ZNCC subtitle probe =================================================
@@ -2617,16 +2609,17 @@ def zncc_prepare_template(qimg_full, rect_small):
     _zncc_tmpl = {'t': t, 'h': t.shape[0], 'w': t.shape[1], 'norm': norm}
 
 
-def zncc_find(qimg_full, rect_search):
-    """Best ZNCC of this round's template inside rect_search.
+def zncc_find(qimg_full, rect_image):
+    """Best ZNCC of this round's template inside rect_image. OpenCV naming:
+    the template is _zncc_tmpl, the image is the crop taken here.
     Returns (score, QPoint top-left in FULL-frame coords), or (-1.0, None)
     when it cannot be scored at all."""
     if _zncc_tmpl is None:
         return -1.0, None
-    region = qimage_to_gray(qimg_full, rect_search)
-    if region is None:
+    image = qimage_to_gray(qimg_full, rect_image)
+    if image is None:
         return -1.0, None
-    H, W = region.shape
+    H, W = image.shape
     h, w = _zncc_tmpl['h'], _zncc_tmpl['w']
     if h > H or w > W:
         return -1.0, None
@@ -2635,12 +2628,12 @@ def zncc_find(qimg_full, rect_search):
     fw = _zncc_next_pow2(W + w - 1)
     # correlation via FFT: flip the template to turn convolution into it
     corr = np.fft.irfft2(
-        np.fft.rfft2(region, (fh, fw))
+        np.fft.rfft2(image, (fh, fw))
         * np.fft.rfft2(_zncc_tmpl['t'][::-1, ::-1], (fh, fw)),
         (fh, fw))[h - 1:H, w - 1:W]
     # integral images give every window's sum and sum-of-squares in O(1)
-    ii = np.pad(np.cumsum(np.cumsum(region, 0), 1), ((1, 0), (1, 0)))
-    ii2 = np.pad(np.cumsum(np.cumsum(region * region, 0), 1), ((1, 0), (1, 0)))
+    ii = np.pad(np.cumsum(np.cumsum(image, 0), 1), ((1, 0), (1, 0)))
+    ii2 = np.pad(np.cumsum(np.cumsum(image * image, 0), 1), ((1, 0), (1, 0)))
     s = ii[h:, w:] - ii[:-h, w:] - ii[h:, :-w] + ii[:-h, :-w]
     s2 = ii2[h:, w:] - ii2[:-h, w:] - ii2[h:, :-w] + ii2[:-h, :-w]
     var = s2 - s * s / n
@@ -2651,36 +2644,35 @@ def zncc_find(qimg_full, rect_search):
     ncc = np.clip(ncc, -1.0, 1.0)
     idx = int(np.argmax(ncc))
     y, x = divmod(idx, ncc.shape[1])
-    return float(ncc[y, x]), QPoint(rect_search.left() + x,
-                                    rect_search.top() + y)
+    return float(ncc[y, x]), QPoint(rect_image.left() + x,
+                                    rect_image.top() + y)
 
 
-def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences,
-                              word, rect_expanded, rect_last_ocr, rect_small,
-                              this_hog, folder_path):
-    # ZNCC stand-in for the OCR probe. 'direction' and 'word' are unused:
-    # the template already carries the glyphs and their orientation.
-    # Only one rect exists here, so rect_small is returned for both slots.
-    score, top_left = zncc_find(screenshot[k][0], rect_to_ocr)
-    screenshot[k][0].copy(rect_to_ocr).save(
+def sentences_one_compare_zncc(i, k, rect_image, subtitle_sentences, rect_match, this_hog, folder_path):
+    # ZNCC roles: the template is _zncc_tmpl, cropped once from the snip frame.
+    # rect_image is the area searched in this frame - the word's own box for an
+    # ambiguous probe, the expanded strip for a move probe. rect_match is where
+    # the word sits now; only a successful move probe relocates it.
+    score, top_left = zncc_find(screenshot[k][0], rect_image)
+    screenshot[k][0].copy(rect_image).save(
         os.path.join(
             folder_path,
             f"{screenshot[k][1]/1000:.3f}-{subtitle_sentences[i][4]}.png")
     )  # need delete
     if top_left is None:        # unscorable: abstain, same as a failed OCR
-        return rect_small, rect_small, this_hog
+        return rect_match, this_hog
     if score >= ZNCC_THRESHOLD:
         subtitle_sentences[i][3] = 1
         if subtitle_sentences[i][4] == 2:   # move probe: adopt the new spot
-            rect_small = QRect(top_left.x(), top_left.y(),
+            rect_match = QRect(top_left.x(), top_left.y(),
                                _zncc_tmpl['w'], _zncc_tmpl['h'])
-            this_hog = compute_hog(screenshot[k][0], rect_small)
+            this_hog = compute_hog(screenshot[k][0], rect_match)
     else:
         subtitle_sentences[i][3] = 0
-    return rect_small, rect_small, this_hog
+    return rect_match, this_hog
 
 
-def sentences_one_compare_ocr_real(i, k, rect_to_ocr, direction, subtitle_sentences, word,
+def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences, word,
                               rect_expanded, rect_last_ocr, rect_small,
                               this_hog, folder_path):
     img = screenshot[k][0].copy(rect_to_ocr)
@@ -2783,6 +2775,99 @@ def window_change_picture(pixmap):
         window.label_screenshot.setPixmap(scaled_pixmap)
     else:
         window.label_screenshot.clear()
+    sync_pic_del_btn()
+
+
+def pic_image_rect():
+    """Where the pixmap actually sits inside the label. The label is left
+    aligned and never scales a picture narrower than itself up, so this is
+    NOT the widget's own rect."""
+    lab = getattr(window, 'label_screenshot', None)
+    pm = lab.pixmap() if lab is not None else None
+    if pm is None or pm.isNull():
+        return None
+    return QRect(0, max(0, (lab.height() - pm.height()) // 2),
+                 pm.width(), pm.height())
+
+
+def sync_pic_del_btn(pos=None):
+    """Show the delete cross only while the pointer is over the image, and
+    park it on the image's own top-right corner. pos is in label
+    coordinates; omit it to read the pointer's current position."""
+    btn = getattr(window, 'pic_del_btn', None)
+    if btn is None:
+        return
+    area = pic_image_rect()
+    # nothing to delete before this round's note exists
+    if area is None or not getattr(window, '_qt_caps', None):
+        btn.hide()
+        return
+    if pos is None:
+        pos = window.label_screenshot.mapFromGlobal(QCursor.pos())
+    if not area.contains(pos):
+        btn.hide()
+        return
+    btn.move(max(0, area.right() - btn.width() - 3), area.top() + 3)
+    btn.show()
+    btn.raise_()
+
+
+def delete_current_capture():
+    """Drop the displayed capture (image plus its audio) from the window
+    and remember its file names. Anki is only touched on the next save."""
+    global _play_session, _qt_seq_gen
+    caps = getattr(window, '_qt_caps', None) or []
+    idx = getattr(window, '_qt_page', 0)
+    if not caps or idx >= len(caps):
+        return
+    cap = caps[idx]
+    # cut the audio only when the capture being removed is the one
+    # sounding, with the same graceful fade as deleting a whole note
+    if _play_session is not None and (
+            getattr(_play_session, 'src_cap', None) is cap
+            or (len(caps) == 1
+                and getattr(_play_session, 'src_wav', None)
+                is getattr(window, 'audio_wav', None))):
+        _play_session.set_end(STOP_NOW)
+        _qt_seq_gen += 1              # the sequence was on this very page
+    pending = getattr(window, '_qt_pending_del', None)
+    if pending is None:
+        pending = window._qt_pending_del = []
+    for fn in (cap.get('img'), cap.get('mp3')):
+        if fn and fn not in pending:
+            pending.append(fn)
+    # a sequence already running holds its own list object, so flag the
+    # shared dict instead: it then skips this page and plays on
+    cap['_deleted'] = True
+    window._qt_caps = [c for c in caps if not c.get('_deleted')]
+    n = len(window._qt_caps)
+    window._qt_page = min(idx, n - 1) if n else 0
+    update_save_btn_state()
+    if not n:                          # a text-only note is legitimate
+        window.audio_wav = None
+        window.start_byte = window.end_byte = 0
+        window_change_picture(None)
+        window.show_page_signal.emit(None, 0, 0)
+        resize_window_height()
+        return
+
+    def load(cs=window._qt_caps, i=window._qt_page):
+        # the survivor is not necessarily the note's FIRST capture, the
+        # only one get_and_display loaded, so refresh the single-page
+        # playback state from it as well
+        c = cs[i]
+        if c.get('_jpg') is None and c['img']:
+            c['_jpg'] = anki_download_media(c['img'])
+        if c.get('_wav') is None and c['mp3']:
+            mp3 = anki_download_media(c['mp3'])
+            c['_wav'] = mp3_to_wav(mp3) if mp3 else None
+        window.audio_wav = c.get('_wav')
+        window.start_byte, window.end_byte = (
+            _range_to_bytes(c['_wav'], c['range']) if c.get('_wav')
+            else (0, 0))
+        window.show_page_signal.emit(c.get('_jpg'), i, len(cs))
+
+    threading.Thread(target=load, daemon=True).start()
 
 
 def window_display_word_blank():
@@ -2810,10 +2895,20 @@ def anki_l0_quad(position):
 
 
 def _merge_bump_schedule(cards):
-    # a merged note has fresh material and should come up as soon as
-    # possible. Cards already in review: due today with their interval
-    # untouched, so a word grown to a 30-day interval keeps that curve
-    # instead of restarting from scratch. Cards still new: stay new (the
+    # Pure Anki RPC whose result nobody downstream reads, so keep it off
+    # the merge path: anki_new_note's thread is joined by process_audio,
+    # and every rpc left in that path delays the audio round.
+    threading.Thread(target=_merge_bump_schedule_sync,
+                     args=(list(cards),), daemon=True).start()
+
+
+def _merge_bump_schedule_sync(cards):
+    # a merged note has fresh material and should come up soon. Cards
+    # already in review: pulled to tomorrow with their interval untouched,
+    # so a word grown to a 30-day interval keeps that curve instead of
+    # restarting from scratch. Cards already due sooner than that are left
+    # alone - rescheduling those would push them further out and add a
+    # pointless manual entry to the revlog. Cards still new: stay new (the
     # daily new-card limit keeps applying) but move to the head of the
     # queue so they are the first new word served.
     # invoke() returns the whole AnkiConnect envelope {'result':..,'error':..},
@@ -2825,7 +2920,17 @@ def _merge_bump_schedule(cards):
     review = [c['cardId'] for c in info if c.get('type') in (2, 3)]
     fresh = [c['cardId'] for c in info if c.get('type') in (0, 1)]
     if review:
-        invoke('setDueDate', cards=review, days='0')   # no "!": keeps ivl
+        # prop:due counts whole days from today, so >1 means "later than
+        # tomorrow". Letting Anki do the date maths beats deriving it from
+        # the raw due field, whose unit differs per card type.
+        q = 'cid:%s prop:due>1' % ','.join(str(c) for c in review)
+        f = invoke('findCards', query=q)
+        far = (f or {}).get('result')
+        if far is None:          # query failed: keep the old behaviour
+            print('merge: prop:due query failed, rescheduling all')
+            far = review
+        if far:
+            invoke('setDueDate', cards=far, days='1')  # no "!": keeps ivl
     if not fresh:
         return
     try:
@@ -3210,7 +3315,7 @@ def ask_front(text, yes_no=True):
     box.setStandardButtons(
         (QMessageBox.Yes | QMessageBox.No) if yes_no else QMessageBox.Ok)
     box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
-    box.show()
+    show_and_exclude_from_capture(box, no_activate=False)
     box.raise_()
     box.activateWindow()
     try:
@@ -3269,6 +3374,44 @@ def refresh_word():
     round_finish_all()
 
 
+def apply_pending_deletions():
+    """Commit the crosses clicked on the image: strip exactly those files
+    from the note's media fields.
+
+    Subtractive on purpose. Rebuilding these fields from _qt_caps would
+    wipe a capture that anki_merge_into or process_audio prepended while
+    this window was open - process_audio writes its mp3 only after the
+    subtitle scan and the encode, several seconds into the round, and the
+    window's snapshot is not refreshed until after that.
+
+    Returns False when the write failed, so the caller can bail out and
+    leave the save armed for a retry.
+    """
+    pending = getattr(window, '_qt_pending_del', None)
+    if not pending:
+        return True
+    r = invoke('notesInfo', notes=[int(window.anki_id)])
+    res = (r or {}).get('result') or []
+    live = res[0].get('fields') if res else None
+    if not live:
+        print('save: notesInfo failed, media left untouched')
+        return False
+    upd = {}
+    for name in ('screenshot', 'audio'):
+        val = live[name]['value']
+        for fn in pending:
+            val = re.sub(r'<img[^>]*src="%s"[^>]*>' % re.escape(fn), '', val)
+        upd[name] = val
+    r = invoke('updateNoteFields',
+               note={'id': int(window.anki_id), 'fields': upd})
+    if not r or r.get('error'):
+        print('save: media update failed:', r and r.get('error'))
+        return False
+    window._qt_pending_del = []
+    print('save: removed %d media file(s)' % len(pending))
+    return True
+
+
 def save_word_qt_to_anki():
     global hide_on_click
     hide_on_click = True
@@ -3278,6 +3421,10 @@ def save_word_qt_to_anki():
     fw = window.focusWidget()
     if fw is not None:
         fw.clearFocus()
+    # deletions land FIRST so a merge below carries only the survivors:
+    # anki_merge_note_into re-reads this note, it never sees _qt_caps
+    if not apply_pending_deletions():
+        return                  # write failed: leave save armed for a retry
     if maybe_merge_on_save():
         return
     word = window.word.text()
@@ -3321,7 +3468,9 @@ def refresh_history_menu():
             action.triggered.connect(
                 partial(anki_get_and_display, anki_id, True))
     else:
-        window.history_menu.setStyleSheet("")
+        # nothing to recall: grey the placeholder with the same colour the
+        # disabled save / search / delete buttons use
+        window.history_menu.setStyleSheet("QMenu::item { color: grey; }")
         window.history_menu.addAction(ui('blank'))
 
 
@@ -3544,6 +3693,22 @@ def gen_ocr_variants(word, lang, cap=100):
     return out
 
 
+_HAN_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+_KANA_RE = re.compile(r'[\u3041-\u309f\u30a1-\u30ff\uff66-\uff9f]')
+
+
+def _min_cand_len(s):
+    """Shortest a truncation is allowed to be, decided by the characters it
+    actually contains rather than by the configured source language. Han is
+    the most permissive, kana next, anything else last; a mixed candidate
+    takes the loosest floor any of its characters grants."""
+    if _HAN_RE.search(s):
+        return 1
+    if _KANA_RE.search(s):
+        return 2
+    return 3
+
+
 def search_dict(word):
     result = {
         "spell": word,
@@ -3565,24 +3730,43 @@ def search_dict(word):
         lang = SRC_LANG_CODE[src]
 
         trunc_forms = []
+
+        def _add_truncs(s, variant=None):
+            """Prefix truncations of s, longest first. Each is kept only if
+            it clears the floor its own characters set, so a lone kanji is
+            fair game while a lone kana is not."""
+            for i in range(len(s) - 1, 0, -1):
+                cand = s[:i]
+                if i < _min_cand_len(cand):
+                    continue
+                trunc_forms.append(cand)
+                if variant:
+                    alt = variant(cand)
+                    if alt != cand:
+                        trunc_forms.append(alt)
+
         if src == '日本語':
             candidates = get_base_forms(word, with_trunc=False)
             hira = kata_to_hira(word)
             if hira != word:
                 candidates += get_base_forms(hira, with_trunc=False)
+            # honorific お/ご, dropped only when a kanji follows it. The
+            # kanji test is what keeps おとこ and おかしい from being
+            # mangled into とこ and かしい. Listed before the truncations
+            # because it is far likelier to be the word actually wanted.
+            if len(word) > 1 and word[0] in 'おごオゴ' and _HAN_RE.match(word[1]):
+                bare = word[1:]
+                if len(bare) >= _min_cand_len(bare):
+                    trunc_forms.append(bare)
+                _add_truncs(bare, kata_to_hira)
             # prefix truncations are NOT high matches: they may only
             # rescue the primary dict, never pull in another language
-            for i in range(len(word) - 1, 1, -1):
-                trunc_forms.append(word[:i])
-                h = kata_to_hira(word[:i])
-                if h != word[:i]:
-                    trunc_forms.append(h)
+            _add_truncs(word, kata_to_hira)
         elif src == '中文':
             if not _trad_map:
                 _load_trad_map(_conn_dict)
             candidates = [word, _to_simp(word)]
-            for i in range(len(word) - 1, 1, -1):
-                trunc_forms += [word[:i], _to_simp(word[:i])]
+            _add_truncs(word, _to_simp)
         else:
             candidates = get_english_base_forms(word)
         cands = []
@@ -3676,6 +3860,34 @@ def search_dict(word):
         # area stays in the configured language
         fuzzy_entries = []
         seen = {result["spell"]} if row else set()
+        # jmdict files 子供 / 子ども / 小供 as separate entries carrying
+        # identical text, so dedupe on the body as well as the headword
+        seen_text = {result["excerpt"]} if row else set()
+
+        def _take_fuzzy(r):
+            if r["spell"] in seen or not r["excerpt"]:
+                return
+            if r["excerpt"] in seen_text:
+                return
+            seen.add(r["spell"])
+            seen_text.add(r["excerpt"])
+            fuzzy_entries.append(r)
+
+        # same-key siblings come first: はし is 端 AND 橋 AND 箸 AND 嘴 in
+        # one dict, but only the first became the main hit and the prefix
+        # expansion below skips the key itself, so they would vanish
+        for w in cands:
+            siblings = c.execute(
+                "SELECT e.spell, e.pron, e.excerpt FROM keys k "
+                "JOIN entries e ON e.id = k.entry_id "
+                "WHERE k.dict = ? AND k.key = ? "
+                "GROUP BY e.id ORDER BY MIN(k.rowid)",
+                (order[0], w)).fetchall()
+            for r in siblings:
+                _take_fuzzy(r)
+            if siblings:
+                break
+
         for w in cands + fuzzy_variant_keys + truncs:
             frows = c.execute(
                 "SELECT e.spell, e.pron, e.excerpt FROM keys k "
@@ -3684,10 +3896,7 @@ def search_dict(word):
                 "GROUP BY e.id ORDER BY MIN(k.rowid) LIMIT 8",
                 (order[0], w + '%', w)).fetchall()
             for r in frows:
-                if r["spell"] in seen or not r["excerpt"]:
-                    continue
-                seen.add(r["spell"])
-                fuzzy_entries.append(r)
+                _take_fuzzy(r)
             if len(fuzzy_entries) >= 4:
                 break
 
@@ -4390,6 +4599,12 @@ def set_qt_layout():
         windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
                                      ex_style & ~WS_EX_NOACTIVATE)
         windll.user32.SetForegroundWindow(hwnd)
+        # same rule as the result boxes: entering this one drops the
+        # selection everywhere else. The group is assembled further down
+        # in this function, so read it off window at click time.
+        for other in getattr(window, '_selection_group', ()):
+            if other is not window.word:
+                clear_widget_selection(other)
         orig_word_press(event)
         window.word.setFocus()
         hide_on_click = False  # user clicked on word input, disarm auto-hide
@@ -4504,6 +4719,12 @@ def set_qt_layout():
                         o, '_ap_entered', False))
                 elif event.reason() in (Qt.TabFocusReason,
                                         Qt.BacktabFocusReason):
+                    # QLineEdit drops its own selection on focus out but
+                    # QTextEdit keeps it, so tabbing away from excerpt or
+                    # fuzzy would leave two boxes looking selected
+                    for other in getattr(window, '_selection_group', ()):
+                        if other is not obj:
+                            clear_widget_selection(other)
                     QTimer.singleShot(0, obj.selectAll)
             elif event.type() == QEvent.MouseButtonPress:
                 if event.button() == Qt.RightButton and \
@@ -4515,12 +4736,20 @@ def set_qt_layout():
     window._select_all_filter = _SelectAllOnFocus(window)  # keep a live ref
 
     result_boxes = [window.label_spell, window.label_pron, window.label_excerpt, window.label_fuzzy]
+    # the search box joins the result boxes' selection group: entering any
+    # one of them drops whatever was selected in the others
+    window._selection_group = result_boxes + [window.word]
     for box in result_boxes:
         box.setContextMenuPolicy(Qt.CustomContextMenu)
         box.customContextMenuRequested.connect(
             lambda pos, w=box: show_custom_context_menu(w, pos, font_size_small))
-        setup_editable_result_box(box, result_boxes)
+        setup_editable_result_box(box, window._selection_group)
         box.installEventFilter(window._select_all_filter)
+        if isinstance(box, QTextEdit):
+            # Tab moves to the next field instead of typing a tab. The Qt
+            # default swallows it, and since entering a box selects all of
+            # it, that tab would replace everything the user had selected.
+            box.setTabChangesFocus(True)
     # the word box behaves like the result boxes: a right-click that
     # ENTERS it selects everything, a left-click just places the cursor
     window.word.installEventFilter(window._select_all_filter)
@@ -4537,6 +4766,41 @@ def set_qt_layout():
     window.label_screenshot = QLabel("", central)
     main_layout.addWidget(window.label_screenshot)
     window.label_screenshot.mousePressEvent = play_audio
+
+    # delete-capture cross. Parented to the image label, so a click on it
+    # never reaches the label's play handler underneath.
+    cross = max(18, int(bar_height * 0.62))
+    window.pic_del_btn = QToolButton(window.label_screenshot)
+    window.pic_del_btn.setText('✕')
+    window.pic_del_btn.setCursor(Qt.PointingHandCursor)
+    window.pic_del_btn.setFixedSize(cross, cross)
+    window.pic_del_btn.setStyleSheet(
+        'QToolButton { background: rgba(0, 0, 0, 150); color: white;'
+        ' border: none; border-radius: 3px; font-size: %dpx; }'
+        'QToolButton:hover { background: rgba(200, 40, 40, 220); }'
+        % max(10, int(cross * 0.55)))
+    window.pic_del_btn.clicked.connect(delete_current_capture)
+    window.pic_del_btn.hide()
+    window.label_screenshot.setMouseTracking(True)
+
+    def _pic_enter(event):
+        sync_pic_del_btn()
+        QLabel.enterEvent(window.label_screenshot, event)
+
+    def _pic_move(event):
+        sync_pic_del_btn(event.pos())
+        QLabel.mouseMoveEvent(window.label_screenshot, event)
+
+    def _pic_leave(event):
+        # moving onto the cross (a child widget) also sends Leave to the
+        # label; reading the live pointer position sorts that out, since
+        # the cross sits inside the image area
+        sync_pic_del_btn()
+        QLabel.leaveEvent(window.label_screenshot, event)
+
+    window.label_screenshot.enterEvent = _pic_enter
+    window.label_screenshot.mouseMoveEvent = _pic_move
+    window.label_screenshot.leaveEvent = _pic_leave
     # page nav under the image: only visible for multi-capture notes
     window.page_nav = QWidget(central)
     _nav_lay = QHBoxLayout(window.page_nav)
@@ -4550,6 +4814,7 @@ def set_qt_layout():
     window.page_prev_btn.clicked.connect(lambda: qt_play_pages(-1, False))
     _nav_lay.addWidget(window.page_prev_btn)
     window.page_nav_label = QLabel('1/1', window.page_nav)
+    window.page_nav_label.setFont(QFont('Segoe UI Symbol', int(font_size_btn/2)))
     _nav_lay.addWidget(window.page_nav_label)
     window.page_next_btn = QToolButton(window.page_nav)
     window.page_next_btn.setText('▶')
@@ -4742,13 +5007,15 @@ def current_fields():
 def set_save_baseline():
     # snapshot current content as "saved"; call on load / create / after save
     window._saved_fields = current_fields()
+    window._qt_pending_del = []      # deletions are either committed or gone
     update_save_btn_state()
 
 
 def update_save_btn_state(*_):
     # light up save only when there is a note AND content differs from the snapshot
     changed = (window.anki_id is not None
-               and getattr(window, '_saved_fields', None) != current_fields())
+               and (getattr(window, '_saved_fields', None) != current_fields()
+                    or bool(getattr(window, '_qt_pending_del', None))))
     window.save_btn.setEnabled(changed)
     window.save_btn.setStyleSheet('' if changed else 'color: grey;')
 
@@ -5066,6 +5333,8 @@ def qt_play_pages(delta, auto_advance):
                 return
             idx = start if k is None else (start + k) % n
             c = caps[idx]
+            if c.get('_deleted'):
+                continue        # removed mid-sequence: skip it, play on
             jpg = c.get('_jpg')
             if jpg is None and c['img']:
                 jpg = anki_download_media(c['img'])
@@ -5088,6 +5357,7 @@ def qt_play_pages(delta, auto_advance):
                 _play_session.abort()
             s = AudioPlayback(wav)
             s.src_wav = wav
+            s.src_cap = c       # lets a delete tell whether THIS page sounds
             _play_session = s
             s.play_bytes(sb)
             if eb is not None:
@@ -6171,7 +6441,30 @@ def anki_create_deck():
 
 def anki_create_model():
     ANKI_MODEL_VERSION = 2
-    FRONT_TEMPLATE = r"""<div style="font-size: min(48px, 8vh)">{{spell}}</div>
+    FRONT_TEMPLATE = r"""<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
+<script>
+   // A lone space inside spell is stray (OCR, hand edits). A run of two
+   // or more is deliberate, so leave those alone. Walk text nodes only:
+   // the field can carry html, and touching innerHTML would eat spaces
+   // inside tags. fromCharCode(160) instead of an escape, since
+   // backslashes do not survive the trip through Python and AnkiConnect.
+   (function () {
+       var SP = new RegExp('[ ' + String.fromCharCode(160) + ']+', 'g');
+       function strip(node) {
+           for (var n = node.firstChild; n; n = n.nextSibling) {
+               if (n.nodeType === 3) {
+                   n.nodeValue = n.nodeValue.replace(SP, function (m) {
+                       return m.length === 1 ? '' : m;
+                   });
+               } else if (n.nodeType === 1) {
+                   strip(n);
+               }
+           }
+       }
+       var el = document.getElementById('spellText');
+       if (el) strip(el);
+   })();
+</script>
 <script>
    // Purpose of this script: (1) stop ongoing audio from previous card (2) clean up memory from previous card (3) preload back side because it is heavy
    
@@ -6179,8 +6472,22 @@ def anki_create_model():
        if (!obj) return; 
        if (obj.gain) {
            var now = obj.ctx.currentTime;
+           // A card can be answered while its clip is still playing. Fading
+           // a flat 600 ms would then keep sounding past the end of the
+           // range the user selected, so never fade for longer than what is
+           // actually left of it (the Back template publishes the bounds).
+           if (obj.endT != null && obj.webStart != null) {
+               var leftMs = (obj.endT
+                   - (obj.webOffset + (now - obj.webStart))) * 1000;
+               if (leftMs < ms) ms = Math.max(0, leftMs);
+           }
            obj.gain.gain.cancelScheduledValues(now);
            obj.gain.gain.setValueAtTime(obj.gain.gain.value, now);
+           if (ms < 20) {           // nothing left worth curving
+               obj.gain.gain.setValueAtTime(0, now);
+               try { obj.node.stop(); } catch (e) {}
+               return;
+           }
    
            // Equal-power S-curve: starts slow, fast in middle, slow at end
            var steps = 64;
@@ -6374,13 +6681,14 @@ window._apCfg = {
     silentHoldMs: 1000,         /* how long a page without audio holds */
 
     /* ---- audio ---- */
+    minPlayS: 0.2,              /* ranges this short or shorter stay silent */
     audioFadeMaxS: 0.3,         /* longest fade at a clip edge */
     audioFadeRefVol: 0.01,      /* loudness that already needs a full fade */
     switchFadeS: 0.15,          /* fade when a page switch cuts playback */
     switchStopMs: 200,          /* when the faded-out source is stopped */
     targetPeakMobile: 0.45,     /* normalized peak, phones */
     targetPeakDesktop: 0.3,     /* normalized peak, desktop */
-    maxGainMobile: 8,           /* gain ceiling, phones */
+    maxGainMobile: 10,          /* gain ceiling, phones */
     maxGainDesktop: 3,          /* gain ceiling, desktop */
 
     /* ---- ios audio self-healing (rarely worth touching) ---- */
@@ -6458,9 +6766,34 @@ window._apCfg = {
     window._apCap = function () { return caps[window._apCur] || {}; };
 })();
 </script>
-<div style="font-size: min(48px, 8vh)">{{spell}}</div>
+<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
 <div style="font-size: 20px">
 <span id="pron">{{pron}}</span>
+<script>
+   // A lone space inside spell/pron is stray (OCR, hand edits). A run of
+   // two or more is deliberate, so leave those alone. Walk text nodes
+   // only: these fields can carry html, and touching innerHTML would eat
+   // spaces inside tags. fromCharCode(160) instead of an escape, since
+   // backslashes do not survive the trip through Python and AnkiConnect.
+   (function () {
+       var SP = new RegExp('[ ' + String.fromCharCode(160) + ']+', 'g');
+       function strip(node) {
+           for (var n = node.firstChild; n; n = n.nextSibling) {
+               if (n.nodeType === 3) {
+                   n.nodeValue = n.nodeValue.replace(SP, function (m) {
+                       return m.length === 1 ? '' : m;
+                   });
+               } else if (n.nodeType === 1) {
+                   strip(n);
+               }
+           }
+       }
+       ['spellText', 'pron'].forEach(function (id) {
+           var el = document.getElementById(id);
+           if (el) strip(el);
+       });
+   })();
+</script>
 <div id="main-wrap">
    <div id="left-col">
       <div
@@ -6746,12 +7079,12 @@ window._apCfg = {
       <div class="ap-wrap">
          <div class="ap-track" id="ap-track" style="touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;">
             <canvas id="ap-wave"></canvas>
-            <div class="ap-range" id="ap-range"></div>
-            <div class="ap-progress" id="ap-progress"></div>
-            <div class="ap-handle ap-handle-start" id="ap-h-start" data-role="start" style="touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;">
+            <div class="ap-range" id="ap-range" style="visibility:hidden"></div>
+            <div class="ap-progress" id="ap-progress" style="visibility:hidden"></div>
+            <div class="ap-handle ap-handle-start" id="ap-h-start" data-role="start" style="visibility:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;">
                <div class="ap-handle-visual"></div>
             </div>
-            <div class="ap-handle ap-handle-end" id="ap-h-end" data-role="end" style="touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;">
+            <div class="ap-handle ap-handle-end" id="ap-h-end" data-role="end" style="visibility:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;">
                <div class="ap-handle-visual"></div>
             </div>
             <div id="ap-zoom" style="display:none;position:absolute;pointer-events:none;z-index:10;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.18);">
@@ -6776,6 +7109,7 @@ window._apCfg = {
           const hStart = document.getElementById("ap-h-start");
           const hEnd = document.getElementById("ap-h-end");
           const HIT_OUTER = parseFloat(getComputedStyle(track).getPropertyValue("--hit-outer")) || 0;
+          let _apWidgetsShown = false;   // hidden until updateUI() places them
           const zoomEl = document.getElementById("ap-zoom");
           const zoomCanvas = document.getElementById("ap-zoom-canvas");
           function STORAGE_KEY() { return "ap-range:" + filename; }
@@ -6853,6 +7187,15 @@ window._apCfg = {
               const endVis = hEnd.querySelector(".ap-handle-visual");
               if (startVis) startVis.style.width = visualW + "px";
               if (endVis) endVis.style.width = visualW + "px";
+              if (!_apWidgetsShown) {
+                  // first real layout: until now they all sat at left:0,
+                  // bunched together on the far left while audio decoded
+                  _apWidgetsShown = true;
+                  hStart.style.visibility = '';
+                  hEnd.style.visibility = '';
+                  rangeEl.style.visibility = '';
+                  progEl.style.visibility = '';
+              }
           }
           function updateProgressFromTime(t) {
               if (!duration) return;
@@ -7021,6 +7364,18 @@ window._apCfg = {
           function playRangeInternal() {
               stopCurrent();
               if (!audioBuffer || !audioCtx || !duration) return;
+              // a range this short is a stray drag, not a clip worth
+              // hearing. Stay silent, but still let a running sequence
+              // move on, or it would stall on this page forever.
+              if (endT - startT <= window._apCfg.minPlayS) {
+                  updateProgressFromTime(startT);
+                  const _silentGen = _apMyGen;
+                  setTimeout(function () {
+                      if (_silentGen !== window.top._apGen) return;
+                      if (window._apSeqNext) window._apSeqNext();
+                  }, window._apCfg.silentHoldMs);
+                  return;
+              }
               if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") audioCtx.resume();
               if (volCache.s !== startT || volCache.e !== endT) computeVol();
               const vol = volCache.vol;
@@ -7087,10 +7442,16 @@ window._apCfg = {
               curFadeOutS = fadeOutS;
               fadeArmed = false;
 
+              // the card can be answered while this is still playing, so
+              // the next card's fadeStop needs the range bounds to avoid
+              // fading past them
               window.top._audio = {
                   node: source,
                   gain: gain,
                   ctx: audioCtx,
+                  endT: endT,
+                  webStart: webStart,
+                  webOffset: webOffset,
               };
               rafId = requestAnimationFrame(watchProgress);
           }
@@ -7099,6 +7460,10 @@ window._apCfg = {
               if (!currentSource) {
                   rafId = null;
                   return;
+              }
+              if (window.top._audio
+                      && window.top._audio.node === currentSource) {
+                  window.top._audio.endT = endT;   // handle may be dragged
               }
               const elapsed = audioCtx.currentTime - webStart;
               const t = webOffset + elapsed;
@@ -7410,26 +7775,33 @@ window._apCfg = {
    </div>
    </div>
 </div>
-<div style="text-align: center">
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 70px; width: fit-content; margin: 14px auto">
    <span id="etymSpell" style="display: none">{{spell}}</span>
+   <a
+      id="dictBtn"
+      href="#"
+      onclick="return window._apSearch(this)"
+      style="
+      display: inline-block;
+      text-align: center;
+      padding: 12px 22px;
+      background: #4f46e5;
+      color: #fff;
+      border-radius: 10px;
+      text-decoration: none;
+      font-size: 18px;
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      "
+      >
+   Meaning
+   </a>
    <a
       id="etymBtn"
       href="#"
-      onclick="
-      var d = document.createElement('div');
-      d.innerHTML = document.getElementById('etymSpell').innerHTML.replace(/<[^>]*>/g, ' ');
-
-      var spell = d.textContent.split(String.fromCharCode(160)).join(' ').replace(/ +/g, ' ').trim();
-      var kw = /[぀-ヿ㐀-鿿]/u.test(spell) ? '語源' : 'Origin';
-      var base = window.useGoogle
-          ? 'https://www.google.com/search?q='
-          : 'https://cn.bing.com/search?q=';
-        this.href = base + encodeURIComponent(spell + ' ' + kw);
-        return true;
-      "
+      onclick="return window._apSearch(this)"
       style="
       display: inline-block;
-      margin-left: 150px;
+      text-align: center;
       padding: 12px 22px;
       background: #4f46e5;
       color: #fff;
@@ -7442,8 +7814,11 @@ window._apCfg = {
    Origin
    </a>
 </div>
-<button onclick="exportRanges()">Copy Audio Time</button>
-<button onclick="importRanges()">Import Audio Time</button>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; width: fit-content; margin: 0 auto">
+   <button onclick="exportRanges()">Copy Audio Time</button>
+   <button onclick="importRanges()">Import Audio Time</button>
+</div>
+<div id="apTimeField" style="display:none">{{time}}</div>
 <script>
    function exportRanges() {
        if (window._exportShowing) return;
@@ -7500,11 +7875,20 @@ window._apCfg = {
        }, 100);
    }
    function importRanges() {
-       var json = '{{time}}'.trim()
-       .replace(/&nbsp;/g, ' ')
-       .replace(/&amp;/g, '&')
-       .replace(/&lt;/g, '<')
-       .replace(/&gt;/g, '>');
+       // read the field from the DOM, never as a JS string literal: a
+       // newline in the field breaks the literal and kills this whole
+       // script block. textContent already decodes the HTML entities.
+       // fromCharCode instead of escapes: backslashes do not survive the
+       // template's trip through Python and AnkiConnect intact.
+       var _tf = document.getElementById('apTimeField');
+       var _NB = String.fromCharCode(160);
+       var _LF = String.fromCharCode(10);
+       var _CR = String.fromCharCode(13);
+       var json = (_tf ? _tf.textContent : '')
+       .split(_NB).join(' ')
+       .split(_LF).join('')
+       .split(_CR).join('')
+       .trim();
        if (!json) {
            alert(`field "time" is empty
    sync another device first, then open the same note`);
@@ -7546,12 +7930,32 @@ window._apCfg = {
    }
    checkConnectivity();
 
+   // one search path for every lookup button: the button carries only its
+   // keyword, the spell scrape and the engine choice live here
+   window._apSearch = function (el) {
+       var d = document.createElement('div');
+       d.innerHTML = document.getElementById('etymSpell')
+           .innerHTML.replace(/<[^>]*>/g, ' ');
+       var spell = d.textContent.split(String.fromCharCode(160)).join(' ')
+           .replace(/ +/g, ' ').trim();
+       var base = window.useGoogle
+           ? 'https://www.google.com/search?q='
+           : 'https://cn.bing.com/search?q=';
+       el.href = base + encodeURIComponent(spell + ' ' + (el.dataset.kw || ''));
+       return true;
+   };
+
     {
-    const btn = document.getElementById('etymBtn');
+    // the CJK test runs once here and nowhere else
     const spellText = document.getElementById('etymSpell').textContent;
-    const kw = /[぀-ヿ㐀-鿿]/u.test(spellText) ? '語源' : 'Origin';
-    btn.textContent = kw;
-    btn.dataset.kw = kw;
+    const cjk = /[぀-ヿ㐀-鿿]/u.test(spellText);
+    [['dictBtn', '辞典', 'Meaning'],
+     ['etymBtn', '語源', 'Origin']].forEach(function (spec) {
+        const b = document.getElementById(spec[0]);
+        if (!b) return;
+        b.textContent = cjk ? spec[1] : spec[2];
+        b.dataset.kw = b.textContent;
+    });
     }
 </script>
 
