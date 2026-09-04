@@ -1,4 +1,4 @@
-__version__ = "0.0.3"
+__version__ = "0.0.5"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -306,7 +306,7 @@ import datetime
 import uuid
 import sys, psutil
 # Beta expiry date
-BETA_EXPIRY = datetime.date(2026, 8, 31)
+BETA_EXPIRY = datetime.date(2026, 9, 30)
 # Allowed MAC addresses (last 8 hex digits, lowercase, no separators)
 ALLOWED_MAC_SUFFIXES = [
     '2489',  # add allowed suffixes here
@@ -752,48 +752,6 @@ def _load_db(filename, conn_var, ready_event):
     ready_event.set()
 
 
-def moji_session(stop_event):
-    global session
-    session = requests.Session()
-    session.headers.update({
-        "accept": "*/*",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "content-type": "application/json",
-        "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "origin": "https://www.mojidict.com",
-        "referer": "https://www.mojidict.com/"
-    })
-    session.post("https://api.mojidict.com/parse/functions/word-clickSearchV2",
-                 json={
-                     "searchText": "moji",
-                     "_ApplicationId": "E62VyFVLMiW7kvbtVq3p"
-                 })
-    moji_keep_alive_thread(stop_event)
-
-
-def moji_keep_alive_thread(stop_event):
-    global last_moji_search_time
-    dummy = {}
-    dummy_event = threading.Event()
-    while not stop_event.is_set():
-        if time.time(
-        ) - last_moji_search_time > 590:  # not sure how long moji session will expire. in my test at 2026/03/01, longest survivor is 1192s
-            # if last search was recent, do not refresh the session
-            # moji search is connected via racing in this project. if too many connections at the same time, the session will fail
-            # when keep alive session is running, there is a small chance that it coincides with a real search. In this case, session number will double and real session might fail
-            # to lower this probability, keep alive session will not run if a real search happend recently
-            last_moji_search_time = time.time()
-            for _ in range(3):  # used for racing. 3 try for each moji search
-                threading.Thread(target=search_mojidict_exact,
-                                 args=('テスト', dummy, dummy_event),
-                                 daemon=True).start()
-                threading.Thread(target=search_mojidict_fuzzy,
-                                 args=('テスト', dummy, dummy_event),
-                                 daemon=True).start()
-        time.sleep(5)
-
-
 # Mouse hook constants
 WH_MOUSE_LL = 14
 WM_LBUTTONDOWN = 0x0201
@@ -989,7 +947,7 @@ def on_press(key):
                 if window.isVisible():
                     selected = (widget_selected_text(window.label_spell)
                                 or widget_selected_text(window.label_pron)
-                                or widget_selected_text(window.label_excerpt))
+                                or widget_selected_text(window.label_definition))
                     if selected:
                         window.copy_text_signal.emit(selected)
     elif hotkey_mode == 2:
@@ -1070,58 +1028,95 @@ HK_DEBUG = True
 def hk_log(what):
     """One line per press of the configured hotkey, dumping everything that
     can affect whether the hotkey fires and whether snip can be exited.
+
+    The format is uniform on purpose: every field is key=value, no value
+    ever contains a space, and fields are separated by exactly one space -
+    so any single field greps cleanly out of the log.
+
     Runs on the mouse-hook thread, so every read is defensive: one broken
-    field must never cost the whole line."""
+    field must never cost the whole line.
+    """
     if not HK_DEBUG:
         return
 
     def g(fn):
+        """fn()'s value as a space-free string; never raises."""
         try:
-            return fn()
+            v = fn()
         except Exception as e:
-            return f'<{type(e).__name__}>'
+            return '<%s>' % type(e).__name__
+        if v is True:
+            return '1'
+        if v is False:
+            return '0'
+        return str(v).replace(' ', '')
+
+    def fmt_hk():
+        out = []
+        for h in config['hotkey']:
+            if h.get('type') == 'mouse':
+                out.append('mouse:%s' % h.get('button'))
+            else:
+                out.append('kb:%s' % '+'.join(
+                    list(h.get('modifiers') or []) + [str(h.get('key', ''))]))
+        return ','.join(out) or '-'
+
+    def fmt_pt(p):
+        return '%d,%d' % (p.x(), p.y()) if p is not None else '-'
 
     try:
         s = globals().get('snip')
         w = globals().get('window')
         now = time.time()
-        stamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        print(' | '.join([
-            f'[HK {stamp}] {what}',
+        fields = (
+            # when, and which hotkey fired
+            ('at', datetime.now().strftime('%H:%M:%S.%f')[:-3]),
+            ('src', str(what).replace(' ', ':')),
             # what decides whether the hotkey fires at all
-            f'mode={hotkey_mode}'
-            f' hk={g(lambda: config["hotkey"])}'
-            f' since_openclose={round(now - _snip_open_close_time, 2)}'
-            f' rb_supp={_rb_down_suppressed}'
-            f' mods={g(lambda: sorted(str(m)[4:] for m in current_modifiers))}'
-            f' kb_alive={g(lambda: keyboard_listener.is_alive())}',
+            ('mode', g(lambda: hotkey_mode)),
+            ('hk', g(fmt_hk)),
+            ('since_openclose', g(lambda: round(now - _snip_open_close_time, 2))),
+            ('rb_supp', g(lambda: _rb_down_suppressed)),
+            ('mods', g(lambda: '+'.join(sorted(str(m)[4:]
+                                               for m in current_modifiers)) or '-')),
+            ('kb_alive', g(lambda: keyboard_listener.is_alive())),
             # snip state: a stuck drag / virtual cursor blocks the exit
-            f'snip#{g(lambda: id(s) % 100000 if s is not None else None)}'
-            f' vis={g(lambda: s.isVisible())}'
-            f' drag={getattr(s, "dragging", "?")}'
-            f' pos={getattr(s, "start_pos", "?")}->{getattr(s, "end_pos", "?")}'
-            f' raw_on={getattr(s, "_raw_on", "?")}'
-            f' vmode={getattr(s, "_vmode", "?")}'
-            f' vdrag={getattr(s, "_vslider_drag", "?")}'
-            f'/{getattr(s, "_vpanel_drag", "?")}'
-            f' vhover={getattr(s, "_vhover", "?")}'
-            f' slider={g(lambda: s.slider.value())}'
-            f'/{g(lambda: s.slider.maximum())}'
-            f' scroll={getattr(s, "_scroll_step", "?")}'
-            f' last_ms={getattr(s, "last_slider_time_ms", "?")}',
+            ('snip_id', g(lambda: id(s) % 100000 if s is not None else '-')),
+            ('snip_vis', g(lambda: s.isVisible())),
+            ('drag', g(lambda: s.dragging)),
+            ('pos_start', g(lambda: fmt_pt(s.start_pos))),
+            ('pos_end', g(lambda: fmt_pt(s.end_pos))),
+            ('raw_on', g(lambda: s._raw_on)),
+            ('vmode', g(lambda: s._vmode)),
+            ('vdrag_slider', g(lambda: s._vslider_drag)),
+            ('vdrag_panel', g(lambda: s._vpanel_drag)),
+            ('vhover', g(lambda: s._vhover)),
+            ('slider', g(lambda: s.slider.value())),
+            ('slider_max', g(lambda: s.slider.maximum())),
+            ('scroll', g(lambda: s._scroll_step)),
+            ('last_ms', g(lambda: s.last_slider_time_ms)),
             # close_snip does screenshot[slider.value()] -> IndexError risk
-            f'shots={g(lambda: len(screenshot))}'
-            f' shot_thread={g(lambda: screenshot_thread_handle.is_alive())}'
-            f' shot_stop={g(lambda: screenshot_thread_stop.is_set())}',
+            ('shots', g(lambda: len(screenshot))),
+            ('shot_thread', g(lambda: screenshot_thread_handle.is_alive())),
+            ('shot_stop', g(lambda: screenshot_thread_stop.is_set())),
+            ('lock', g(lambda: lock_length)),
+            ('users', g(lambda: screenshot_users)),
+            # all four 0 while nothing is running means a round died halfway
+            # and every later check_processing will burn its full 5 s
+            ('rd_display', g(lambda: round_display.is_set())),
+            ('rd_anki_id', g(lambda: round_anki_id_generated.is_set())),
+            ('rd_audio_done', g(lambda: round_audio_analysis_start_time_done.is_set())),
+            ('rd_audio_sent', g(lambda: round_anki_audio_sent.is_set())),
             # window + signal wiring; close_recv > 1 means duplicate connects
-            f'win_vis={g(lambda: w.isVisible())}'
-            f' page={g(lambda: w.stack.currentIndex())}'
-            f' hide_on_click={globals().get("hide_on_click", "?")}'
-            f' lock={globals().get("lock_length", "?")}'
-            f' close_recv={g(lambda: w.receivers(w.close_snip_signal))}',
-        ]))
+            ('win_vis', g(lambda: w.isVisible())),
+            ('page', g(lambda: w.stack.currentIndex())),
+            ('hide_on_click', g(lambda: hide_on_click)),
+            ('close_recv', g(lambda: w.receivers(w.close_snip_signal))),
+        )
+        print('[HK] ' + ' '.join('%s=%s' % kv for kv in fields))
     except Exception as e:
-        print(f'[HK] log failed: {e!r}')
+        print('[HK] log failed: %r' % (e,))
+
 # ==== HKDEBUG END ==========================================================
 
 
@@ -2014,7 +2009,7 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
     if ocr_result:
         # if ocr successful, go search dictionary
         word = ocr_result[0][0]
-        print(word)  # test
+        print("ocr: " + word)  # test
         word_info = {}
         search_dict_thread = threading.Thread(target=lambda: word_info.update(
             search_dict(word)))  # test need to consider no result
@@ -2055,7 +2050,7 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                     f = r['result'][0]['fields']
                     word_info['spell'] = f['spell']['value']
                     word_info['pron'] = f['pron']['value']
-                    word_info['excerpt'] = f['excerpt']['value']
+                    word_info['definition'] = f['definition']['value']
                     word_info['fuzzy'] = f['fuzzy']['value']
                     # the page count is known NOW: show the nav at once;
                     # flipping blocks until the round finalizes the note
@@ -2067,14 +2062,14 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                   if merge_target else 'path: new note')
         if word_info['spell'] != '':
             window_display_word(word_info['spell'], word_info['pron'],
-                                word_info['excerpt'], word_info['fuzzy'], None,
+                                word_info['definition'], word_info['fuzzy'], None,
                                 False, True)
             #window.setMaximumSize(16777215, 16777215)
             refresh_window(False)
             show_and_exclude_from_capture(window)
             if window.isMinimized():
                 window.showNormal()
-                window.raise_()
+            window.raise_()
             round_display.set()
             threading.Thread(target=after_display,
                              args=(word_info, word, points, audio_bytes,
@@ -2083,12 +2078,13 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                                    merge_target),
                              daemon=True).start()
         else:  # test maybe delete, won't happen
+            print(1/0)  # test
             window_display_word_blank()
             refresh_window(False)
             show_and_exclude_from_capture(window)
             if window.isMinimized():
                 window.showNormal()
-                window.raise_()
+            window.raise_()
             print('search dict fail for ' + word)
             screenshot_logout()
             round_finish_all()
@@ -2110,14 +2106,14 @@ def resize_window_height():
     for box in [window.label_spell, window.label_pron]:
         box.setVisible(True)
         h += box.sizeHint().height()
-    ex = window.label_excerpt
+    ex = window.label_definition
     ex.setVisible(True)
     doc = ex.document()
     doc.setTextWidth(content_width)
     eh = int(math.ceil(doc.size().height())) + 8
     ex.setFixedHeight(eh)
     h += eh
-    # fuzzy box: sized like excerpt, hidden entirely when empty
+    # fuzzy box: sized like definition, hidden entirely when empty
     fz = window.label_fuzzy
     if fz.toPlainText().strip():
         fz.setVisible(True)
@@ -2744,7 +2740,7 @@ def compute_hog(qimg_full, rect_small):
     return hist / (hist.sum() + 1e-8)
 
 
-def window_display_word(spell, pron, excerpt, fuzzy, pixmap, change_picture, btn_enabled):
+def window_display_word(spell, pron, definition, fuzzy, pixmap, change_picture, btn_enabled):
     # QApplication.focusWidget() is None while our window is inactive
     # (game in foreground), so ask the window for its focus child instead
     fw = window.focusWidget()
@@ -2754,7 +2750,7 @@ def window_display_word(spell, pron, excerpt, fuzzy, pixmap, change_picture, btn
         window_change_picture(pixmap)
     window.label_spell.setText(spell.strip())
     window.label_pron.setText(pron.strip())
-    window.label_excerpt.setHtml(excerpt.strip().removesuffix('<div><br></div>'))
+    window.label_definition.setHtml(definition.strip().removesuffix('<div><br></div>'))
     window.label_fuzzy.setHtml((fuzzy or '').strip())
     set_btn_status(btn_enabled)
     set_result_editable(btn_enabled)   # not-found -> read-only
@@ -3004,8 +3000,8 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp,
                                            fields['word'])
             return
         # unreadable target falls through to a plain add (per spec)
-    if fields.get('excerpt'):
-        fields['excerpt'] += '<div><br></div>'
+    if fields.get('definition'):
+        fields['definition'] += '<div><br></div>'
     # word is not a field any more: it rides in the media filenames
     _word = fields.pop('word', '')
     result = invoke("addNote",
@@ -3066,7 +3062,7 @@ def anki_get_and_display(anki_id, anki_check):
     pixmap.loadFromData(
         anki_download_media(fields['screenshot']['value'].split('"')[1]))
     window_display_word(fields['spell']['value'], fields['pron']['value'],
-                        fields['excerpt']['value'], fields['fuzzy']['value'],
+                        fields['definition']['value'], fields['fuzzy']['value'],
                         pixmap, True, True)
     window.word.setText('')   # word is not stored any more
 
@@ -3369,7 +3365,7 @@ def refresh_word():
     if word:
         word_info = search_dict(word)
         window_display_word(word_info['spell'], word_info['pron'],
-                            word_info['excerpt'], word_info['fuzzy'], None,
+                            word_info['definition'], word_info['fuzzy'], None,
                             False, True)
     round_finish_all()
 
@@ -3431,7 +3427,7 @@ def save_word_qt_to_anki():
     word_info = {
         'spell': window.label_spell.text(),
         'pron': window.label_pron.text(),
-        'excerpt': window.label_excerpt.toHtml(),
+        'definition': window.label_definition.toHtml(),
         'fuzzy': window.label_fuzzy.toHtml() if window.label_fuzzy.toPlainText().strip() else '',
     }
 
@@ -3547,7 +3543,7 @@ def _norm_key(s):
 
 def _key_rows(c, dic, w):
     return c.execute(
-        "SELECT e.spell, e.pron, e.excerpt, k.key FROM keys k "
+        "SELECT e.spell, e.pron, e.definition, k.key FROM keys k "
         "JOIN entries e ON e.id = k.entry_id "
         "WHERE k.dict = ? AND k.key = ? ORDER BY k.rowid",
         (dic, w)).fetchall()
@@ -3574,9 +3570,9 @@ def _lookup_one(c, dic, lang, w):
         if hit is not None:
             if first is None:
                 first = hit
-            if hit['excerpt']:  # first alias target with content wins
+            if hit['definition']:  # first alias target with content wins
                 return hit
-    if first is not None and first['excerpt']:
+    if first is not None and first['definition']:
         return first
     if rows:
         return rows[0]
@@ -3713,7 +3709,7 @@ def search_dict(word):
     result = {
         "spell": word,
         "pron": "",
-        "excerpt": "",
+        "definition": "",
         "fuzzy": "",
     }
     word = re.sub(
@@ -3818,7 +3814,7 @@ def search_dict(word):
                 r = _lookup_one(c, dic, lang, w)
                 if r is None:
                     continue
-                if r['excerpt']:
+                if r['definition']:
                     row = r
                     break
                 if empty_hit is None:
@@ -3832,7 +3828,7 @@ def search_dict(word):
             for dic in order:
                 for w in ocr_cands:
                     r = _lookup_one(c, dic, lang, w)
-                    if r is not None and r['excerpt']:
+                    if r is not None and r['definition']:
                         row = r
                         break
                 if row:
@@ -3842,7 +3838,7 @@ def search_dict(word):
             # content-bearing hits only
             for w in truncs:
                 r = _lookup_one(c, order[0], lang, w)
-                if r is not None and r['excerpt']:
+                if r is not None and r['definition']:
                     row = r
                     break
         if row is None:
@@ -3850,7 +3846,7 @@ def search_dict(word):
         if row:
             result["spell"] = row["spell"]
             result["pron"] = row["pron"] or ""
-            result["excerpt"] = row["excerpt"] or ""
+            result["definition"] = row["definition"] or ""
         else:
             # final miss: dump everything we tried, to grow the table
             print('search_dict MISS:', word,
@@ -3862,15 +3858,15 @@ def search_dict(word):
         seen = {result["spell"]} if row else set()
         # jmdict files 子供 / 子ども / 小供 as separate entries carrying
         # identical text, so dedupe on the body as well as the headword
-        seen_text = {result["excerpt"]} if row else set()
+        seen_text = {result["definition"]} if row else set()
 
         def _take_fuzzy(r):
-            if r["spell"] in seen or not r["excerpt"]:
+            if r["spell"] in seen or not r["definition"]:
                 return
-            if r["excerpt"] in seen_text:
+            if r["definition"] in seen_text:
                 return
             seen.add(r["spell"])
-            seen_text.add(r["excerpt"])
+            seen_text.add(r["definition"])
             fuzzy_entries.append(r)
 
         # same-key siblings come first: はし is 端 AND 橋 AND 箸 AND 嘴 in
@@ -3878,7 +3874,7 @@ def search_dict(word):
         # expansion below skips the key itself, so they would vanish
         for w in cands:
             siblings = c.execute(
-                "SELECT e.spell, e.pron, e.excerpt FROM keys k "
+                "SELECT e.spell, e.pron, e.definition FROM keys k "
                 "JOIN entries e ON e.id = k.entry_id "
                 "WHERE k.dict = ? AND k.key = ? "
                 "GROUP BY e.id ORDER BY MIN(k.rowid)",
@@ -3890,7 +3886,7 @@ def search_dict(word):
 
         for w in cands + fuzzy_variant_keys + truncs:
             frows = c.execute(
-                "SELECT e.spell, e.pron, e.excerpt FROM keys k "
+                "SELECT e.spell, e.pron, e.definition FROM keys k "
                 "JOIN entries e ON e.id = k.entry_id "
                 "WHERE k.dict = ? AND k.key LIKE ? AND k.key != ? "
                 "GROUP BY e.id ORDER BY MIN(k.rowid) LIMIT 8",
@@ -3905,12 +3901,12 @@ def search_dict(word):
             r0 = fuzzy_entries.pop(0)
             result["spell"] = r0["spell"]
             result["pron"] = r0["pron"] or ""
-            result["excerpt"] = r0["excerpt"] or ""
+            result["definition"] = r0["definition"] or ""
 
         blocks = []
         for r in fuzzy_entries[:3]:
             header = f'{r["spell"]}　{r["pron"]}'.strip()
-            blocks.append(f'{header}<br>{r["excerpt"]}')
+            blocks.append(f'{header}<br>{r["definition"]}')
         result["fuzzy"] = "<br><br>".join(blocks)
 
     except Exception as e:
@@ -4178,251 +4174,6 @@ def _to_simp(word):
     return ''.join(_trad_map.get(c, c) for c in word)
 
 
-POS_MAP = {
-    # Godan verbs
-    "Godan verb with 'u' ending": "Godan-u",
-    "Godan verb with 'u' ending (special class)": "Godan-u(sp)",
-    "Godan verb with 'tsu' ending": "Godan-tsu",
-    "Godan verb with 'ru' ending": "Godan-ru",
-    "Godan verb with 'ru' ending (irregular verb)": "Godan-ru(irr)",
-    "Godan verb with 'ku' ending": "Godan-ku",
-    "Godan verb with 'gu' ending": "Godan-gu",
-    "Godan verb with 'su' ending": "Godan-su",
-    "Godan verb with 'bu' ending": "Godan-bu",
-    "Godan verb with 'mu' ending": "Godan-mu",
-    "Godan verb with 'nu' ending": "Godan-nu",
-    "Godan verb - Iku/Yuku special class": "Godan-iku",
-    "Godan verb - -aru special class": "Godan-aru",
-    # Ichidan verbs
-    "Ichidan verb": "Ichidan",
-    "Ichidan verb - kureru special class": "Ichidan-kureru",
-    "Ichidan verb - zuru verb (alternative form of -jiru verbs)":
-    "Ichidan-zuru",
-    # Special verbs
-    "Kuru verb - special class": "Kuru",
-    "Suru verb - included": "Suru",
-    "Suru verb - special class": "Suru(sp)",
-    "su verb - precursor to the modern suru": "Su",
-    "auxiliary verb": "Aux.verb",
-    "auxiliary adjective": "Aux.adj",
-    "auxiliary": "Aux",
-    "intransitive verb": "vi",
-    "transitive verb": "vt",
-    "irregular nu verb": "v-nu(irr)",
-    "irregular ru verb, plain form ends with -ri": "v-ru(irr)",
-    # Archaic verbs (keep short)
-    "Nidan verb (upper class) with 'bu' ending (archaic)": "Nidan-u-bu",
-    "Nidan verb (upper class) with 'gu' ending (archaic)": "Nidan-u-gu",
-    "Nidan verb (upper class) with 'hu/fu' ending (archaic)": "Nidan-u-fu",
-    "Nidan verb (upper class) with 'ku' ending (archaic)": "Nidan-u-ku",
-    "Nidan verb (upper class) with 'ru' ending (archaic)": "Nidan-u-ru",
-    "Nidan verb (upper class) with 'tsu' ending (archaic)": "Nidan-u-tsu",
-    "Nidan verb (upper class) with 'yu' ending (archaic)": "Nidan-u-yu",
-    "Nidan verb (lower class) with 'dzu' ending (archaic)": "Nidan-l-dzu",
-    "Nidan verb (lower class) with 'gu' ending (archaic)": "Nidan-l-gu",
-    "Nidan verb (lower class) with 'hu/fu' ending (archaic)": "Nidan-l-fu",
-    "Nidan verb (lower class) with 'ku' ending (archaic)": "Nidan-l-ku",
-    "Nidan verb (lower class) with 'mu' ending (archaic)": "Nidan-l-mu",
-    "Nidan verb (lower class) with 'nu' ending (archaic)": "Nidan-l-nu",
-    "Nidan verb (lower class) with 'ru' ending (archaic)": "Nidan-l-ru",
-    "Nidan verb (lower class) with 'su' ending (archaic)": "Nidan-l-su",
-    "Nidan verb (lower class) with 'tsu' ending (archaic)": "Nidan-l-tsu",
-    "Nidan verb (lower class) with 'u' ending and 'we' conjugation (archaic)":
-    "Nidan-l-we",
-    "Nidan verb (lower class) with 'yu' ending (archaic)": "Nidan-l-yu",
-    "Nidan verb (lower class) with 'zu' ending (archaic)": "Nidan-l-zu",
-    "Nidan verb with 'u' ending (archaic)": "Nidan-u",
-    "Yodan verb with 'bu' ending (archaic)": "Yodan-bu",
-    "Yodan verb with 'gu' ending (archaic)": "Yodan-gu",
-    "Yodan verb with 'hu/fu' ending (archaic)": "Yodan-fu",
-    "Yodan verb with 'ku' ending (archaic)": "Yodan-ku",
-    "Yodan verb with 'mu' ending (archaic)": "Yodan-mu",
-    "Yodan verb with 'ru' ending (archaic)": "Yodan-ru",
-    "Yodan verb with 'su' ending (archaic)": "Yodan-su",
-    "Yodan verb with 'tsu' ending (archaic)": "Yodan-tsu",
-    # Adjectives
-    "adjective (keiyoushi)": "I-adj",
-    "adjective (keiyoushi) - yoi/ii class": "I-adj(yoi)",
-    "adjectival nouns or quasi-adjectives (keiyodoshi)": "Na-adj",
-    "archaic/formal form of na-adjective": "Na-adj(arch)",
-    "pre-noun adjectival (rentaishi)": "Pre-noun adj",
-    "noun or verb acting prenominally": "Pre-noun",
-    "'taru' adjective": "Taru-adj",
-    "'ku' adjective (archaic)": "Ku-adj",
-    "'shiku' adjective (archaic)": "Shiku-adj",
-    # Nouns
-    "noun (common) (futsuumeishi)": "Noun",
-    "noun or participle which takes the aux. verb suru": "Noun (suru)",
-    "nouns which may take the genitive case particle 'no'": "Noun (no)",
-    "noun, used as a prefix": "Noun (prefix)",
-    "noun, used as a suffix": "Noun (suffix)",
-    # Adverbs
-    "adverb (fukushi)": "Adverb",
-    "adverb taking the 'to' particle": "Adverb (to)",
-    # Other
-    "expressions (phrases, clauses, etc.)": "Expression",
-    "interjection (kandoushi)": "Interjection",
-    "conjunction": "Conjunction",
-    "particle": "Particle",
-    "pronoun": "Pronoun",
-    "prefix": "Prefix",
-    "suffix": "Suffix",
-    "counter": "Counter",
-    "numeric": "Numeric",
-    "copula": "Copula",
-    "unclassified": "Uncl",
-}
-
-
-def shorten_pos(parts_of_speech):
-    shortened = [POS_MAP.get(p, p) for p in parts_of_speech]
-    return ", ".join(shortened)
-
-
-def search_jisho(word, result):
-    try:
-        url = f"https://jisho.org/api/v1/search/words?keyword={word}"
-        res = session.get(url, timeout=6).json()
-        data = res.get("data", [])
-        if not data:
-            return result
-
-        # excerpt: first entry, up to 3 senses
-        entry = data[0]
-        japanese = entry.get("japanese", [{}])
-        senses = entry.get("senses", [])
-
-        result["spell"] = japanese[0].get("word", word)
-        result["pron"] = japanese[0].get("reading", "")
-
-        excerpt_lines = []
-        for s in senses[:3]:
-            defs = ", ".join(s.get("english_definitions", []))
-            pos = shorten_pos(s.get("parts_of_speech", []))
-            excerpt_lines.append(f"[{pos}] {defs}" if pos else defs)
-        result["excerpt"] = "<br>".join(excerpt_lines)
-
-        # fuzzy: data[1:4], each entry formatted as spell | reading \n [pos] defs
-        fuzzy_blocks = []
-        for entry in data[1:4]:
-            japanese = entry.get("japanese", [{}])
-            senses = entry.get("senses", [])
-            spell = japanese[0].get("word", "")
-            reading = japanese[0].get("reading", "")
-            header = f"{spell} | {reading}" if spell else reading
-            if senses:
-                defs = ", ".join(senses[0].get("english_definitions", []))
-                pos = shorten_pos(senses[0].get("parts_of_speech", []))
-                body = f"[{pos}] {defs}" if pos else defs
-            else:
-                body = ""
-            fuzzy_blocks.append(f"{header}<br>{body}")
-        result["fuzzy"] = "<br><br>".join(fuzzy_blocks)
-
-    except Exception as e:
-        print(f"jisho search fail: {e}")
-    return result
-
-
-def search_moji_api(word, result):
-    global last_moji_search_time
-    last_moji_search_time = time.time()
-    done_event_fuzzy = threading.Event()
-    done_event_exact = threading.Event()
-    for _ in range(3):
-        threading.Thread(target=search_mojidict_fuzzy,
-                         args=(word, result, done_event_fuzzy),
-                         daemon=True).start()
-        threading.Thread(target=search_mojidict_exact,
-                         args=(word, result, done_event_exact),
-                         daemon=True).start()
-    done_event_fuzzy.wait(timeout=6)
-    done_event_exact.wait(timeout=6)
-    return result
-
-
-def search_mojidict_fuzzy(word, result, done_event_fuzzy):
-    t = time.time()
-    try:
-        data = {
-            "functions": [
-                {
-                    "name": "search-all",
-                    "params": {
-                        "text": word,
-                        "types": [
-                            102,
-                            106,
-                            103,
-                        ],
-                    },
-                },
-            ],
-            "_ClientVersion":
-            "js3.4.1",
-            "_ApplicationId":
-            "E62VyFVLMiW7kvbtVq3p",
-            "g_os":
-            "PCWeb",
-            "g_ver":
-            "v4.8.8.20240829",
-            "_InstallationId":
-            dummy_uuid,
-        }
-
-        response = session.post(
-            "https://api.mojidict.com/parse/functions/union-api",
-            json=data,
-            timeout=5)
-
-        fuzzy_result = ''
-        response_json = response.json(
-        )["result"]["results"]["search-all"]["result"]["word"]["searchResult"]
-        k = min(len(response_json), 3)  # only take top 3 results
-        for i in range(k):
-            fuzzy_result += response_json[i].get("title", "") or ''
-            fuzzy_result += "<br>"
-            fuzzy_result += response_json[i].get("excerpt", "") or ''
-            fuzzy_result += "<br><br>"
-
-        result["fuzzy"] = fuzzy_result.strip().removesuffix("<br><br>")
-        print('fuzzy ' + str(time.time() - t))
-    except Exception as e:
-        print("moji fuzzy fail")
-    done_event_fuzzy.set()
-
-
-def search_mojidict_exact(word, result, done_event_exact):
-    t = time.time()
-    try:
-        data = {
-            "searchText": word,
-            "langEnv": "zh-CN_ja",
-            "_ClientVersion": "js3.4.1",
-            "_ApplicationId": "E62VyFVLMiW7kvbtVq3p",
-            "g_os": "PCWeb",
-            "g_ver": "v4.8.8.20240829",
-            "_InstallationId": dummy_uuid,
-        }
-
-        response = session.post(
-            "https://api.mojidict.com/parse/functions/word-clickSearchV2",
-            json=data,
-            timeout=5)
-        response_json = response.json()["result"]["result"]
-
-        word_info = response_json["word"][0]
-        result["spell"] = word_info.get("spell", "") or ''
-        result["pron"] = word_info.get("pron", "") or ''
-        #result["accent"] = word_info.get("accent","")  or ''
-        #result["romaji"] = word_info.get("romaji","")  or ''
-        result["excerpt"] = word_info.get("excerpt", "") or ''
-        print('exact ' + str(time.time() - t))
-    except Exception as e:
-        print("moji exact fail")
-    done_event_exact.set()
-
-
 class DraggableTitleBar(QWidget):
 
     def __init__(self, parent=None):
@@ -4667,24 +4418,24 @@ def set_qt_layout():
     window.label_pron.setFont(font)
     main_layout.addWidget(window.label_pron)
 
-    window.label_excerpt = QTextEdit(central)
-    window.label_excerpt.setAcceptRichText(False)   # paste as plain text: keep newlines, drop bold/size
-    window.label_excerpt.setAlignment(Qt.AlignLeft)
-    window.label_excerpt.setFrameStyle(QTextEdit.NoFrame)
-    window.label_excerpt.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    window.label_excerpt.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    window.label_excerpt.document().setDocumentMargin(0)
-    window.label_excerpt.setStyleSheet(
+    window.label_definition = QTextEdit(central)
+    window.label_definition.setAcceptRichText(False)   # paste as plain text: keep newlines, drop bold/size
+    window.label_definition.setAlignment(Qt.AlignLeft)
+    window.label_definition.setFrameStyle(QTextEdit.NoFrame)
+    window.label_definition.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    window.label_definition.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    window.label_definition.document().setDocumentMargin(0)
+    window.label_definition.setStyleSheet(
         "QTextEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; " + sel_style + " }"
         "QTextEdit:focus { background: #ffffff; border: 1px solid #3399ff; }")
     font = QFont("Microsoft YaHei", font_size_small)
     font.setBold(False)
-    window.label_excerpt.setFont(font)
-    main_layout.addWidget(window.label_excerpt)
-    window.label_excerpt.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+    window.label_definition.setFont(font)
+    main_layout.addWidget(window.label_definition)
+    window.label_definition.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
     window.label_fuzzy = QTextEdit(central)
-    window.label_fuzzy.setAcceptRichText(False)   # paste as plain text, same as excerpt
+    window.label_fuzzy.setAcceptRichText(False)   # paste as plain text, same as definition
     window.label_fuzzy.setFrameStyle(QTextEdit.NoFrame)
     window.label_fuzzy.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     window.label_fuzzy.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -4695,7 +4446,7 @@ def set_qt_layout():
     window.label_fuzzy.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
     #window.label_pron.setVisible(False)
-    #window.label_excerpt.setVisible(False)
+    #window.label_definition.setVisible(False)
 
     class _SelectAllOnFocus(QObject):
         # right-clicking (or tabbing into) a result box selects its whole
@@ -4720,7 +4471,7 @@ def set_qt_layout():
                 elif event.reason() in (Qt.TabFocusReason,
                                         Qt.BacktabFocusReason):
                     # QLineEdit drops its own selection on focus out but
-                    # QTextEdit keeps it, so tabbing away from excerpt or
+                    # QTextEdit keeps it, so tabbing away from definition or
                     # fuzzy would leave two boxes looking selected
                     for other in getattr(window, '_selection_group', ()):
                         if other is not obj:
@@ -4735,7 +4486,7 @@ def set_qt_layout():
 
     window._select_all_filter = _SelectAllOnFocus(window)  # keep a live ref
 
-    result_boxes = [window.label_spell, window.label_pron, window.label_excerpt, window.label_fuzzy]
+    result_boxes = [window.label_spell, window.label_pron, window.label_definition, window.label_fuzzy]
     # the search box joins the result boxes' selection group: entering any
     # one of them drops whatever was selected in the others
     window._selection_group = result_boxes + [window.word]
@@ -4759,7 +4510,7 @@ def set_qt_layout():
     window.word.textChanged.connect(update_save_btn_state)
     window.label_spell.textChanged.connect(update_save_btn_state)
     window.label_pron.textChanged.connect(update_save_btn_state)
-    window.label_excerpt.textChanged.connect(update_save_btn_state)
+    window.label_definition.textChanged.connect(update_save_btn_state)
     window.label_fuzzy.textChanged.connect(update_save_btn_state)
 
 
@@ -4983,10 +4734,10 @@ _FUZZY_STYLE_EDIT = _FUZZY_STYLE_RO + "QTextEdit:focus { background: #ffffff; bo
 
 
 def set_result_editable(editable):
-    # spell/pron/excerpt/fuzzy are editable only when a real note is shown;
+    # spell/pron/definition/fuzzy are editable only when a real note is shown;
     # read-only mode keeps text selectable but shows no focus highlight
     styles = _RESULT_STYLE_EDIT if editable else _RESULT_STYLE_RO
-    for box in (window.label_spell, window.label_pron, window.label_excerpt):
+    for box in (window.label_spell, window.label_pron, window.label_definition):
         box.setReadOnly(not editable)
         box.setStyleSheet(styles[type(box)])
     window.label_fuzzy.setReadOnly(not editable)
@@ -4999,7 +4750,7 @@ def current_fields():
     return {
         'spell': window.label_spell.text(),
         'pron': window.label_pron.text(),
-        'excerpt': window.label_excerpt.toHtml(),
+        'definition': window.label_definition.toHtml(),
         'fuzzy': window.label_fuzzy.toHtml() if window.label_fuzzy.toPlainText().strip() else '',
     }
 
@@ -5643,7 +5394,41 @@ def toggle_to_setting():
     QTimer.singleShot(0, re_elide)   # after the page is laid out
 
 
+def _log_processing_timeout(event, waited):
+    """A wait that never fires means a round stalled somewhere. It is not
+    reproducible on demand, so dump everything that could explain it in
+    one block rather than a bare line."""
+    import traceback
+    names = {id(e): n for n, e in (
+        ('round_display', round_display),
+        ('round_anki_id_generated', round_anki_id_generated),
+        ('round_audio_analysis_start_time_done',
+         round_audio_analysis_start_time_done),
+        ('round_anki_audio_sent', round_anki_audio_sent))}
+    frame = traceback.extract_stack()[-3]      # skip this fn + its caller
+    live = [t.name for t in threading.enumerate() if t.is_alive()]
+    print('===================== PROCESSING TIMEOUT =====================')
+    print(f'  waited      : {waited:.1f}s for {names.get(id(event), event)!r}')
+    print(f'  called from : {os.path.basename(frame.filename)}:{frame.lineno}'
+          f' in {frame.name}()')
+    print('  round events: ' + ', '.join(
+        f'{names[id(e)]}={int(e.is_set())}' for e in _round_events))
+    print(f'  anki_id     : {getattr(window, "anki_id", None)!r}'
+          f'   last_new_note: {anki_last_new_note!r}')
+    print(f'  hotkey_mode : {hotkey_mode!r}'
+          f'   lock_length: {lock_length!r}'
+          f'   screenshot_users: {screenshot_users!r}')
+    print(f'  anki_check_needed: {anki_check_needed!r}'
+          f'   ankiconnect up: {anki_connect_is_running()!r}')
+    print(f'  qt page     : {getattr(window, "_qt_page", None)!r}'
+          f'   caps: {len(getattr(window, "_qt_caps", None) or [])}'
+          f'   caps_event: {int(_qt_caps_event.is_set())}')
+    print(f'  threads({len(live)}): ' + ', '.join(live))
+    print('==============================================================')
+
+
 def check_processing(event):
+    t0 = time.time()
     for i in range(100):
         if event.is_set():
             break
@@ -5652,7 +5437,10 @@ def check_processing(event):
             time.sleep(0.05)
             window._toast = Toast(ui('processing'), duration=2000)
     else:
-        print('time out in waiting for processing')  # test need more detail
+        try:
+            _log_processing_timeout(event, time.time() - t0)
+        except Exception as e:      # a debug dump must never break a round
+            print('time out in waiting for processing (dump failed: %r)' % e)
     if hasattr(window, '_toast') and window._toast:
         window._toast.dismiss()
         window._toast = None
@@ -6440,7 +6228,7 @@ def anki_create_deck():
 
 
 def anki_create_model():
-    ANKI_MODEL_VERSION = 2
+    ANKI_MODEL_VERSION = 3
     FRONT_TEMPLATE = r"""<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
 <script>
    // A lone space inside spell is stray (OCR, hand edits). A run of two
@@ -6690,6 +6478,10 @@ window._apCfg = {
     targetPeakDesktop: 0.3,     /* normalized peak, desktop */
     maxGainMobile: 10,          /* gain ceiling, phones */
     maxGainDesktop: 3,          /* gain ceiling, desktop */
+    loudPercentile: 0.01,       /* loudest fraction ignored when measuring
+                                   the level - a click is not the level */
+    maxOvershoot: 4,            /* how far the loudest samples may run past
+                                   full scale before the gain is held back */
 
     /* ---- ios audio self-healing (rarely worth touching) ---- */
     watchdogMs: [300, 1200],    /* clock checks after playback starts */
@@ -7296,19 +7088,39 @@ window._apCfg = {
               // gain per segment (no compression), pushed to just under
               // full scale (no clipping). Checks every channel.
               volCache = { s: startT, e: endT, vol: 1 };
-              if (!audioBuffer) return;
+              // test need delete: one line per range change into #dbg-panel
+              function volDbg(extra) {
+                  if (!window._apDbgLog) return;
+                  window._apDbgLog('vol ' + startT.toFixed(2) + '-'
+                      + endT.toFixed(2) + 's ' + extra
+                      + ' vol=' + volCache.vol.toFixed(2));
+              }
+              if (!audioBuffer) { volDbg('nobuf'); return; }
               const sr = audioBuffer.sampleRate;
               const s0 = Math.max(0, Math.floor(startT * sr));
-              let peak = 0;
+              // The level is read off a high percentile rather than the
+              // single loudest sample: one stray click used to eat the
+              // whole headroom and leave the body of the clip too quiet.
+              // Silence inside the range does NOT drag a percentile down
+              // the way an average would - it only shifts which samples
+              // land in the ignored top slice.
+              const BINS = 1000;
+              const hist = new Int32Array(BINS + 1);
+              let peak = 0, total = 0;
               for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
                   const data = audioBuffer.getChannelData(ch);
                   const s1 = Math.min(Math.floor(endT * sr), data.length);
                   for (let i = s0; i < s1; i++) {
                       const a = Math.abs(data[i]);
                       if (a > peak) peak = a;
+                      hist[a >= 1 ? BINS : (a * BINS) | 0]++;
+                      total++;
                   }
               }
-              if (peak < 0.001) return;          // silence: leave it alone
+              if (peak < 0.001) {                // silence: leave it alone
+                  volDbg('peak=' + peak.toFixed(4) + ' SILENT');
+                  return;
+              }
               // per-device target peak: phones (weak speakers) get a hotter
               // level than PCs; UA-based detection, iPad included
               var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
@@ -7319,7 +7131,33 @@ window._apCfg = {
               var maxGain = isMobile
                   ? window._apCfg.maxGainMobile
                   : window._apCfg.maxGainDesktop;
-              volCache.vol = Math.min(targetPeak / peak, maxGain);
+              // walk down from the loudest bin until the ignored slice is
+              // spent; where the walk stops is the level to normalize to
+              const skip = total * window._apCfg.loudPercentile;
+              let level = 0, acc = 0;
+              for (let b = BINS; b >= 0; b--) {
+                  acc += hist[b];
+                  if (acc >= skip) { level = b / BINS; break; }
+              }
+              if (level < 0.001) level = peak;   // content shorter than the
+                                                 // slice: fall back to peak
+              // the top slice may clip - it is transient by definition -
+              // but only so far, or a range that is mostly silence would
+              // push the real content way past full scale
+              const clipGuard = window._apCfg.maxOvershoot / peak;
+              volCache.vol = Math.min(targetPeak / level, clipGuard, maxGain);
+              volDbg('peak=' + peak.toFixed(4)
+                  + ' lvl=' + level.toFixed(4)
+                  + ' crest=' + (peak / level).toFixed(1)
+                  + ' dev=' + (isMobile ? 'mob' : 'pc')
+                  + ' tgt=' + targetPeak
+                  + ' want=' + (targetPeak / level).toFixed(2)
+                  + ' guard=' + clipGuard.toFixed(2)
+                  + ' cap=' + maxGain
+                  + ' bound=' + (volCache.vol === maxGain ? 'CAP'
+                      : volCache.vol === clipGuard ? 'GUARD' : 'target')
+                  + ' out=' + (level * volCache.vol).toFixed(3)
+                  + '/' + (peak * volCache.vol).toFixed(2));
           }
           function rebuildAndReplay(tag) {
               if (_apMyGen !== window.top._apGen) return;
@@ -7763,13 +7601,13 @@ window._apCfg = {
       })();
    </script>
    <div id="text-wrap">
-      {{#excerpt}}
-      <div id="excerpt-text" style="font-size: 18px; text-align: left">{{excerpt}}</div>
+      {{#definition}}
+      <div id="definition-text" style="font-size: 18px; text-align: left">{{definition}}</div>
       <script>
-      var e = document.getElementById('excerpt-text');
+      var e = document.getElementById('definition-text');
       e.innerHTML = e.innerHTML.replace(/(<div><br><[/]div>|<br>)$/i, '');
       </script>
-      {{/excerpt}} {{#excerpt}}{{#fuzzy}}<br />{{/fuzzy}}{{/excerpt}} {{#fuzzy}}
+      {{/definition}} {{#definition}}{{#fuzzy}}<br />{{/fuzzy}}{{/definition}} {{#fuzzy}}
       <div style="font-size: 18px; text-align: left">{{fuzzy}}</div>
       {{/fuzzy}}
    </div>
@@ -8473,7 +8311,7 @@ body.landscape #text-wrap {
     MODEL_FIELDS = [
         "spell",
         "pron",
-        "excerpt",
+        "definition",
         "fuzzy",
         "screenshot",
         "audio",
@@ -8497,6 +8335,25 @@ body.landscape #text-wrap {
         fields_in_anki = invoke("modelFieldNames", modelName=MODEL_NAME)
         if fields_in_anki and fields_in_anki.get("result"):
             existing = fields_in_anki["result"]
+
+            # one-off rename: if the user has an old model with 'excerpt' but no 'definition', rename it to 'definition'
+            if 'excerpt' in existing and 'definition' not in existing:
+                # one-off rename, and it has to happen BEFORE the loop
+                # below: that loop would otherwise add an EMPTY
+                # 'definition' and strand every note's text in 'excerpt'
+                r = invoke('modelFieldRename', modelName=MODEL_NAME,
+                           oldFieldName='excerpt', newFieldName='definition')
+                if r and not r.get('error'):
+                    existing = ['definition' if f == 'excerpt' else f
+                                for f in existing]
+                    print("anki: renamed field 'excerpt' -> 'definition'")
+                    # the rename changed the model, so the recorded hash no
+                    # longer describes it. Version 0 makes the guard below
+                    # skip its hash test; it re-records both right after.
+                    update_config('anki_model_version_and_hash', [0, ''])
+                else:
+                    print('anki: field rename FAILED:', r and r.get('error'))
+
             for field in MODEL_FIELDS:
                 if field not in existing:
                     invoke("modelFieldAdd",
@@ -8750,11 +8607,9 @@ def _spell_index_boot():
 if config['anki_combine_dup']:
     threading.Thread(target=_spell_index_boot, daemon=True).start()
 
-session = None  # moji session
 dummy_uuid = str(uuid.uuid4())
 hotkey_mode = 1  # -1 = ignore all, 0 = config, 1 = main, 2 = in snip
 keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-last_moji_search_time = 0
 anki_sync_running = False
 _dict_loading = False
 
@@ -9071,7 +8926,7 @@ def show_tip():
     mon = snip.sct.monitors[config['monitor_index']]
     fit_w = window.label_spell.fontMetrics().horizontalAdvance(
         window.label_spell.text()) + 40           # actual text pixel width + margins
-    floor = max(360, int(mon['width'] * 0.2))      # lower bound: keep excerpt readable
+    floor = max(360, int(mon['width'] * 0.2))      # lower bound: keep definition readable
     cap = int(mon['width'] * 0.5)                   # upper bound: avoid over-wide window
     window.setFixedWidth(max(floor, min(fit_w, cap)))
     resize_window_height()
