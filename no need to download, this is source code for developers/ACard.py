@@ -1,4 +1,4 @@
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -1278,7 +1278,7 @@ def screenshot_logout():
         screenshot_users -= 1
         if screenshot_users <= 0:
             lock_length = 0
-    print(screenshot_users)
+    print('screenshot_users: ' + str(screenshot_users))
 
 
 def screenshot_thread():
@@ -1597,8 +1597,10 @@ class Snip(QWidget):
             self.slider_container.setAttribute(Qt.WA_UnderMouse, True)
 
     def start(self):
-        global lock_length, screenshot_users, hide_on_click, _spell_index_thread
+        global lock_length, screenshot_users, hide_on_click, _spell_index_thread, hotkey_mode, _snip_open_close_time
         check_processing(round_display)
+        hotkey_mode = 2
+        _snip_open_close_time = time.time()
         if config['anki_combine_dup']:
             # refresh the note index for THIS round; anki add/merge joins
             # this thread first (a stale index degrades to a plain add)
@@ -2006,10 +2008,13 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
     round_reset()
     ocr_result = run_ocr(image, ocr, on_error, 2)
 
+    word = ''
     if ocr_result:
-        # if ocr successful, go search dictionary
         word = ocr_result[0][0]
         print("ocr: " + word)  # test
+
+    if word != '':
+        # if ocr successful, go search dictionary
         word_info = {}
         search_dict_thread = threading.Thread(target=lambda: word_info.update(
             search_dict(word)))  # test need to consider no result
@@ -2223,11 +2228,26 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
             audio_mp3 = wav_to_mp3(audio_wav_after_trim)
             # L0 naming: same stem as the jpg (pairing key) + play range
             # in microseconds; range field kept for the desktop reader
-            audio_name = anki_upload_media(
-                audio_mp3,
-                anki_l0_stem(word, anki_new_note_time_stamp)
-                + f'_r{round(float(play_start_time) * 1e6)}'
-                + f'-{round(float(play_end_time) * 1e6)}.mp3')
+            _mp3_name = (anki_l0_stem(word, anki_new_note_time_stamp)
+                         + f'_r{round(float(play_start_time) * 1e6)}'
+                         + f'-{round(float(play_end_time) * 1e6)}.mp3')
+            # Both failures seen so far were transient SQLite errors on the
+            # collection db (a locked db, and an IOERR_SHMSIZE), the kind
+            # that clears by itself. Three retries; if they all miss, the
+            # capture simply keeps no audio - never a reason to hang.
+            audio_name = None
+            for _try in range(2):
+                if _try:
+                    time.sleep(1.5)
+                audio_name = anki_upload_media(audio_mp3, _mp3_name)
+                if audio_name and not audio_name.get('error') \
+                        and audio_name.get('result'):
+                    if _try:
+                        print('process_audio: mp3 upload OK on retry %d'
+                              % _try)
+                    break
+                print('process_audio: mp3 upload attempt %d/4 failed: %s'
+                      % (_try + 1, audio_name and audio_name.get('error')))
             if not audio_name or audio_name.get('error') \
                     or not audio_name.get('result'):
                 print('process_audio: mp3 upload FAILED:',
@@ -2264,14 +2284,23 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                 # the round's note (fresh or merge target) is final now:
                 # let the window know its pages; badge shows for >=2 and
                 # clicking the image sequences through all of them
-                window._qt_caps = parse_captures({
-                    'screenshot': {'value': old_shot},
-                    'audio': {'value': fields['audio']},
-                })
-                window.show_page_signal.emit(
-                    None, 0, len(window._qt_caps))
-                _qt_caps_event.set()
-                qt_preload_pages()
+                pass
+        # The window has to be told what this note holds no matter how the
+        # upload went: _qt_caps_event gates the page arrows, and a round
+        # that never sets it leaves an arrow visibly stuck down until the
+        # 20 s wait in qt_play_pages gives up. Re-read the note rather than
+        # reconstruct it - it is one rpc, and it is the truth.
+        _info = invoke('notesInfo', notes=[int(anki_id_processed)])
+        if _info and not _info.get('error') and _info.get('result') \
+                and _info['result'][0].get('fields'):
+            window._qt_caps = parse_captures(_info['result'][0]['fields'])
+        else:
+            window._qt_caps = []
+            print('process_audio: caps read FAILED:',
+                  _info and _info.get('error'))
+        window.show_page_signal.emit(None, 0, len(window._qt_caps))
+        _qt_caps_event.set()
+        qt_preload_pages()
     
     anki_new_note_thread.join()
     round_finish_all()
@@ -3471,9 +3500,6 @@ def refresh_history_menu():
 
 
 def on_click_snip():
-    global hotkey_mode, _snip_open_close_time
-    hotkey_mode = 2
-    _snip_open_close_time = time.time()
     bridge.click_snip.emit()
 
 
@@ -3631,7 +3657,8 @@ OCR_CONFUSION = {
         'よ': ['ょ'], 'ょ': ['よ'],
         'ッ': ['ツ'],
         '元': ['え'],
-        '＜': ['く'], '<': ['く'],
+        '世': ['せ'], 'せ': ['世'],
+        '＜': ['く'], '<': ['く'], '《': ['く'],
         '5': ['ら'],
         '-': ['ー'], '－': ['ー'], '～': ['ー'],
     },
@@ -3705,6 +3732,16 @@ def _min_cand_len(s):
     return 3
 
 
+_OCR_EDGE_RE = re.compile(r'^[^\w぀-ヿ一-鿿]+|[^\w぀-ヿ一-鿿]+$')
+
+
+def _trim_ocr_edges(s):
+    """Drop the brackets and stray punctuation OCR tends to hallucinate
+    around a word. Kept as a function because the confusion pass has to
+    apply the very same rule, one step later than the main word does."""
+    return _OCR_EDGE_RE.sub('', s)
+
+
 def search_dict(word):
     result = {
         "spell": word,
@@ -3712,9 +3749,11 @@ def search_dict(word):
         "definition": "",
         "fuzzy": "",
     }
-    word = re.sub(
-        r'^[^\w぀-ヿ一-鿿]+|[^\w぀-ヿ一-鿿]+$',
-        '', word)  # remove potential wrong sign from ocr
+    # the confusion pass below needs the string BEFORE this trim: '<' and
+    # '-' are exactly what it maps ('<'->'く', '-'->'ー'), and they sit at
+    # a word edge far more often than inside one
+    raw_word = word
+    word = _trim_ocr_edges(word)   # remove potential wrong sign from ocr
     src = config.get('src_lang', SRC_LANGS[0])
     dst = config.get('dst_lang', DST_LANGS[0])
     order = LOOKUP_ORDER.get((src, dst))
@@ -3780,10 +3819,16 @@ def search_dict(word):
         # Lower trust than cands: content-bearing exact hits only, tried
         # only after every cand missed. Each variant reuses the normal
         # transform pipeline (conjugation / kana / simp).
-        raw_variants = gen_ocr_variants(word, lang)
+        # generated from the UNTRIMMED string so a confusable sitting at a
+        # word edge still gets its chance, then trimmed per variant so
+        # brackets and genuinely stray punctuation still fall away
+        raw_variants = [(_trim_ocr_edges(v), n)
+                        for v, n in gen_ocr_variants(raw_word, lang)]
         ocr_cands = []
-        fuzzy_variant_keys = []   # single-swap, >=3 chars: may join fuzzy
+        fuzzy_variant_keys = []   # single-swap, >=3 chars AFTER the trim
         for v, n_subs in raw_variants:
+            if not v or v == word:
+                continue          # trimmed back to the original: not a variant
             if lang == 'ja':
                 vforms = get_base_forms(v, with_trunc=False)
                 vh = kata_to_hira(v)

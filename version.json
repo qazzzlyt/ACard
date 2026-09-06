@@ -1,0 +1,12 @@
+{
+  "version": "0.0.6",
+  "sha256": "32edbb7501ff641f5f684d541d3577d8a7b013cafe8c62dba4f596982ba2f4bb",
+  "size": 182865328,
+  "mirrors": [
+    "https://pub-78bde70cc75344bfb88a764dc7565c84.r2.dev/0.0.6/ACard.exe",
+    "https://github.com/qazzzlyt/ACard/releases/download/0.0.6/ACard.exe",
+    "https://gh-proxy.com/https://github.com/qazzzlyt/ACard/releases/download/0.0.6/ACard.exe"
+  ],
+  "notes": "",
+  "pub_date": "2026-09-06T09:23:26Z"
+}
