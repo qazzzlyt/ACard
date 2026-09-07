@@ -1,4 +1,4 @@
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -6,9 +6,16 @@ import tempfile, threading, time
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-GITHUB_OWNER = "qazzzlyt"
-GITHUB_REPO  = "ACard"
-_APP_NAME    = "ACard"
+_APP_NAME = "ACard"
+
+# Three independent hosts. The whole point is that no single one of them
+# has to be reachable - whichever answers, the highest version wins.
+_MANIFEST_URLS = (
+    "https://pub-78bde70cc75344bfb88a764dc7565c84.r2.dev/version.json",
+    "https://acard.pages.dev/version.json",
+    "https://raw.githubusercontent.com/qazzzlyt/ACard/main/version.json",
+)
+_CHECK_EVERY = 6 * 3600
 
 
 def _ulog(msg):
@@ -79,8 +86,25 @@ def _sweep_stale_files() -> None:
             if not d.is_dir():
                 continue
             for f in d.iterdir():
-                if f.name in ("pending.json", "cleanup.bat"):
-                    continue  # cleanup.bat may still be mid-run, never touch
+                if f.name in ("pending.json", "downloader.lock"):
+                    continue
+                if f.name.startswith("cleanup") and f.suffix == ".bat":
+                    # a previous exit's script may still be mid-run, and it
+                    # deletes itself when done - so only sweep the ones that
+                    # clearly never got that far
+                    try:
+                        if time.time() - f.stat().st_mtime < 3600:
+                            continue
+                    except OSError:
+                        pass
+                if f.suffix == ".part":
+                    # an unfinished download, picked up again on the next
+                    # check; only sweep it once it is clearly abandoned
+                    try:
+                        if time.time() - f.stat().st_mtime < 7 * 86400:
+                            continue
+                    except OSError:
+                        pass
                 if f.is_file() and str(f).lower() not in keep:
                     try:
                         f.unlink()
@@ -97,6 +121,95 @@ def _sha256(path: Path) -> str:
         while chunk := f.read(65536):
             h.update(chunk)
     return h.hexdigest()
+
+_FILE_ATTRS = ((0x1, 'READONLY'), (0x2, 'HIDDEN'), (0x4, 'SYSTEM'),
+               (0x10, 'DIRECTORY'), (0x400, 'REPARSE_POINT'))
+
+
+def _path_diag(path: Path) -> str:
+    """Why might this path refuse a write? A directory sitting on the name
+    and a READONLY leftover both surface as the same PermissionError, and
+    only the raw attribute bits tell them apart."""
+    out = []
+    try:
+        import ctypes
+        # ctypes types the return value as a signed int, so
+        # INVALID_FILE_ATTRIBUTES arrives as -1, not 0xFFFFFFFF. Left
+        # unhandled, every bit test below matches and a path that simply
+        # is not there reads back as READONLY+DIRECTORY - the two answers
+        # this whole diagnostic exists to distinguish.
+        attr = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attr in (-1, 0xFFFFFFFF):
+            out.append('attrs=<unavailable: missing or access denied>')
+        else:
+            names = ','.join(n for bit, n in _FILE_ATTRS if attr & bit)
+            out.append('attrs=0x%X(%s)' % (attr, names or '-'))
+    except Exception as e:
+        out.append('attrs=<%r>' % (e,))
+    try:
+        st = path.stat()
+        out.append('size=%d mtime=%s'
+                   % (st.st_size,
+                      time.strftime('%m-%d %H:%M:%S',
+                                    time.localtime(st.st_mtime))))
+    except Exception as e:
+        out.append('stat=<%r>' % (e,))
+    return ' '.join(out)
+
+
+def _dir_writable(d: Path) -> str:
+    probe = d / ('probe-%d.tmp' % os.getpid())
+    try:
+        probe.write_text('x', encoding='ascii')
+        probe.unlink()
+        return 'writable'
+    except Exception as e:
+        return 'NOT writable (%r)' % (e,)
+
+
+def _dump_update_dir() -> None:
+    """One snapshot per launch of the folder the exit script must be written
+    into. On the machines where quitting fails this is what distinguishes a
+    taken name, a read-only leftover, and a folder nobody can write at all."""
+    d = _update_dir()
+    _ulog('update dir %s -> %s' % (d, _dir_writable(d)))
+    try:
+        entries = sorted(d.iterdir())
+    except OSError as e:
+        _ulog('   cannot list: %r' % (e,))
+        return
+    if not entries:
+        _ulog('   (empty)')
+    for f in entries:
+        _ulog('   %-30s %s' % (f.name, _path_diag(f)))
+
+
+def _write_bat(text: str):
+    """Put the exit script somewhere it can actually run, and say exactly
+    what refused when a location will not take it. The original code wrote
+    one fixed name in one fixed folder; cmd.exe holds a batch file open for
+    its whole run, and on some machines that name stays permanently
+    unwritable - which took the entire quit path down with it."""
+    stamp = '%d-%d' % (os.getpid(), int(time.time()))
+    cands = [_update_dir() / ('cleanup-%s.bat' % stamp),
+             Path(tempfile.gettempdir()) / ('ACard-cleanup-%s.bat' % stamp),
+             _staging_dir() / ('cleanup-%s.bat' % stamp)]
+    errs = []
+    for c in cands:
+        try:
+            c.parent.mkdir(parents=True, exist_ok=True)
+            c.write_text(text, encoding='utf-8-sig')
+            if errs:
+                _ulog('exit bat: fell back to %s' % c)
+            return c
+        except Exception as e:
+            errs.append((c, e))
+    for c, e in errs:
+        _ulog('exit bat: %s refused: %r' % (c, e))
+        _ulog('   target %s' % _path_diag(c))
+        _ulog('   folder %s -> %s' % (c.parent, _dir_writable(c.parent)))
+    return None
+
 
 def _generate_exit_bat():
     """Generate a bat that (always) deletes this _MEI folder after exit,
@@ -125,8 +238,6 @@ def _generate_exit_bat():
         except Exception:
             p.unlink(missing_ok=True)
 
-    bat = _update_dir() / "cleanup.bat"
-
     # Build the optional update (move) block
     if new_exe:
         update_block = (
@@ -148,7 +259,7 @@ def _generate_exit_bat():
     else:
         update_block = ''
 
-    bat.write_text(
+    bat = _write_bat(
         f'@echo off\n'
         f'chcp 65001 >nul\n'
         f'{update_block}'
@@ -163,9 +274,16 @@ def _generate_exit_bat():
         f'    goto retrymei\n'
         f')\n'
         f':end\n'
-        f'del "%~f0"\n',
-        encoding="utf-8-sig"
+        # /f, because a read-only leftover that cannot delete itself is
+        # exactly how one of these files becomes permanent
+        f'del /f "%~f0"\n'
     )
+    if bat is None:
+        _ulog('exit bat NOT created - the _MEI folder stays behind%s'
+              % (' and the staged update will not be applied' if new_exe
+                 else ''))
+        return
+    _ulog('exit bat: %s' % bat)
     subprocess.Popen(
         [
             'powershell', '-WindowStyle', 'Hidden', '-NonInteractive', '-Command',
@@ -176,9 +294,125 @@ def _generate_exit_bat():
     )
 
 
+def _valid_manifest(obj) -> bool:
+    """Cloudflare Pages answers a missing file with 200 and its index.html,
+    so 'the request worked' proves nothing - the shape is what decides."""
+    try:
+        return bool(isinstance(obj, dict)
+                    and isinstance(obj["version"], str)
+                    and len(obj["sha256"]) == 64
+                    and int(obj["size"]) > 0
+                    and [u for u in obj["mirrors"] if isinstance(u, str)])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _fetch_manifest():
+    """Read every anchor and keep the highest version any of them offers.
+    One host being unreachable or stale must not hold the update back."""
+    best = None
+    for url in _MANIFEST_URLS:
+        try:
+            req = Request(url, headers={"User-Agent": f"{_APP_NAME}-updater",
+                                        "Cache-Control": "no-cache"})
+            with urlopen(req, timeout=20) as r:
+                obj = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            _ulog(f"manifest unreadable at {url}: {e!r}")
+            continue
+        if not _valid_manifest(obj):
+            _ulog(f"not a manifest at {url}, ignored")
+            continue
+        _ulog(f"{url} -> {obj['version']}")
+        if best is None or _parse_ver(obj["version"]) > _parse_ver(best["version"]):
+            best = obj
+    return best
+
+
+def _download_one(url, part: Path, total: int) -> bool:
+    """Append to `part` from one mirror, resuming whatever is already there.
+    Every mirror serves identical bytes - the manifest's sha256 is what
+    proves it - so a part begun on one host can be finished on another."""
+    have = part.stat().st_size if part.exists() else 0
+    headers = {"User-Agent": f"{_APP_NAME}-updater"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    try:
+        # a 60s socket timeout is also the no-progress timeout: a mirror
+        # that accepts the connection and then stalls gets dropped
+        with urlopen(Request(url, headers=headers), timeout=60) as r:
+            code = r.getcode()
+            if code == 206:
+                # gh-proxy honours Range without advertising Accept-Ranges,
+                # so the response decides, never the header
+                rng = r.headers.get("Content-Range", "")
+                if not rng.endswith("/" + str(total)):
+                    _ulog(f"   different file here ({rng!r}), skipping")
+                    return False
+                mode = "ab"
+            elif code == 200:
+                if have:
+                    _ulog("   Range ignored, restarting from 0")
+                mode, have = "wb", 0
+            else:
+                _ulog(f"   HTTP {code}")
+                return False
+            with open(part, mode) as f:
+                while chunk := r.read(65536):
+                    f.write(chunk)
+                    have += len(chunk)
+    except Exception as e:
+        _ulog(f"   stopped at {have / 1e6:.1f} MB: {e!r}")
+        return part.exists() and part.stat().st_size >= total
+    return have >= total
+
+
+def _claim_downloader() -> bool:
+    """Only one process may write the .part file. A second launch shows the
+    'ACard already running' dialog and waits there for a click, but its
+    updater thread is alive the whole time - two processes appending to one
+    file interleave, and the sha256 check then throws away all 183 MB."""
+    lock = _update_dir() / "downloader.lock"
+    for _ in range(3):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                pid = int(lock.read_text().strip() or 0)
+            except (OSError, ValueError):
+                pid = 0
+            if pid == os.getpid():
+                return True
+            try:
+                # the name check matters: a recycled pid must not lock
+                # updates out for good, the same reason check_dup() does it
+                import psutil
+                alive = (psutil.pid_exists(pid)
+                         and 'acard' in psutil.Process(pid).name().lower())
+            except Exception:
+                # cannot tell - take over rather than disable updates
+                alive = False
+            if alive:
+                _ulog(f"another ACard (pid {pid}) holds the downloader lock")
+                return False
+            try:
+                lock.unlink()
+            except OSError:
+                return False
+        except OSError as e:
+            _ulog(f"downloader lock unusable ({e!r}), carrying on")
+            return True
+    return False
+
+
 def _check_and_download():
-    """Check GitHub; silently download + stage if a newer version exists."""
-    # Skip if the temp drive has less than 500MB free
+    """Read the manifest, pull the exe from whichever mirror answers, and
+    stage it. Nothing here touches the running exe."""
     try:
         free = shutil.disk_usage(tempfile.gettempdir()).free
         if free < 500 * 1024 * 1024:
@@ -188,31 +422,15 @@ def _check_and_download():
         _ulog(f"abort: cannot read temp disk usage: {e!r}")
         return
 
-    t0 = time.time()
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-        req = Request(url, headers={"Accept": "application/vnd.github.v3+json",
-                                    "User-Agent": f"{_APP_NAME}-updater"})
-        with urlopen(req, timeout=30) as r:
-            release = json.loads(r.read())
-        _ulog(f"api ok in {time.time() - t0:.1f}s, "
-              f"latest={release.get('tag_name')!r}, running={__version__!r}")
-    except Exception as e:
-        _ulog(f"api FAILED after {time.time() - t0:.1f}s: {e!r}")
+    man = _fetch_manifest()
+    if man is None:
+        _ulog("no anchor answered with a usable manifest")
         return
-
-    if _parse_ver(release.get("tag_name", "")) <= _parse_ver(__version__):
-        _ulog("already up to date")
-        return
-
-    dl_url = next(
-        (a["browser_download_url"] for a in release.get("assets", [])
-         if a["name"] == _asset_name()),
-        None,
-    )
-    if not dl_url:
-        _ulog(f"abort: no asset named {_asset_name()!r} in the release "
-              f"(assets: {[a.get('name') for a in release.get('assets', [])]})")
+    version = man["version"]
+    sha = man["sha256"].lower()
+    total = int(man["size"])
+    if _parse_ver(version) <= _parse_ver(__version__):
+        _ulog(f"already up to date (running {__version__}, latest {version})")
         return
 
     staged = _staged_path()
@@ -220,35 +438,52 @@ def _check_and_download():
     if p.exists():
         try:
             info = json.loads(p.read_text(encoding="utf-8"))
-            if (info.get("version") == release["tag_name"]
+            if (info.get("version") == version
                     and staged.is_file()
                     and _sha256(staged) == info.get("checksum")):
-                _ulog(f"{release['tag_name']} already staged, "
-                      f"applies on next exit")
-                return          # this release is already staged and ready
+                _ulog(f"{version} already staged, applies on next exit")
+                return
         except Exception as e:
             _ulog(f"pending.json unreadable, ignoring it: {e!r}")
 
-    dest = _update_dir() / _asset_name()
-    h = hashlib.sha256()
-    _ulog(f"downloading {release['tag_name']} from {dl_url}")
-    t1 = time.time()
-    got = 0
-    try:
-        req2 = Request(dl_url, headers={"User-Agent": f"{_APP_NAME}-updater"})
-        with urlopen(req2, timeout=3600) as r, open(dest, "wb") as f:
-            while chunk := r.read(65536):
-                f.write(chunk)
-                h.update(chunk)
-                got += len(chunk)
-        dt = time.time() - t1
-        _ulog(f"downloaded {got / 1e6:.1f} MB in {dt:.0f}s "
-              f"({got / 1e6 / max(dt, 0.1):.2f} MB/s)")
-    except Exception as e:
-        _ulog(f"download FAILED after {time.time() - t1:.0f}s, "
-              f"{got / 1e6:.1f} MB received: {e!r}")
-        dest.unlink(missing_ok=True)
+    if not _claim_downloader():
         return
+
+    part = _update_dir() / f"{_APP_NAME}-{version}.exe.part"
+    if part.exists() and part.stat().st_size > total:
+        _ulog("part file longer than the manifest says, discarding it")
+        part.unlink(missing_ok=True)
+    have = part.stat().st_size if part.exists() else 0
+    _ulog(f"want {version}: {total / 1e6:.1f} MB, already have "
+          f"{have / 1e6:.1f} MB")
+
+    t0 = time.time()
+    # complete already, from a cycle whose staging failed afterwards: verify
+    # and stage it again without asking any mirror for a single byte
+    done = have >= total
+    if done:
+        _ulog("already complete on disk, skipping straight to verification")
+    for url in (() if done else man["mirrors"]):
+        if not isinstance(url, str):
+            continue
+        _ulog(f"trying {url}")
+        if _download_one(url, part, total):
+            done = True
+            break
+    if not done:
+        have = part.stat().st_size if part.exists() else 0
+        _ulog(f"no mirror finished it; {have / 1e6:.1f} MB kept for next time")
+        return
+
+    got = _sha256(part)
+    if got != sha:
+        # there is no telling which mirror contributed the bad bytes, so
+        # resuming onto this file would just poison the next attempt too
+        _ulog(f"sha256 mismatch (got {got[:12]}, manifest says {sha[:12]}) "
+              f"- discarding the whole download")
+        part.unlink(missing_ok=True)
+        return
+    _ulog(f"downloaded and verified {version} in {time.time() - t0:.0f}s")
 
     # Stage on the exe's DRIVE (not next to the exe): proves the target
     # drive has room, and turns the final swap into a same-drive copy.
@@ -257,31 +492,38 @@ def _check_and_download():
         sdir = _staging_dir()
         sdir.mkdir(parents=True, exist_ok=True)
         _hide_path(sdir)
-        if shutil.disk_usage(sdir.anchor).free < dest.stat().st_size + 100 * 1024 * 1024:
-            dest.unlink(missing_ok=True)
+        if shutil.disk_usage(sdir.anchor).free < total + 100 * 1024 * 1024:
+            _ulog("abort: not enough room on the exe's drive to stage")
             return
-        shutil.copyfile(dest, staged)
-        ok = _sha256(staged) == h.hexdigest()
+        shutil.copyfile(part, staged)
+        ok = _sha256(staged) == sha
     except OSError as e:
         _ulog(f"staging FAILED: {e!r}")
         ok = False
     if not ok:
-        _ulog("staging discarded (copy failed or checksum mismatch)")
-        for junk in (staged, dest):
-            try:
-                junk.unlink(missing_ok=True)
-            except OSError:
-                pass
+        # the part passed sha256 - it is good. Staging failures are usually
+        # persistent (a full drive, or ACard.exe.new taken by a directory or
+        # a read-only leftover), so discarding it turns this into a silent
+        # 183 MB download every six hours, forever.
+        _ulog("staging discarded, keeping the verified download for a retry")
+        _ulog("   target %s" % _path_diag(staged))
+        _ulog("   folder %s -> %s"
+              % (staged.parent, _dir_writable(staged.parent)))
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
         return
 
-    dest.unlink(missing_ok=True)     # temp copy no longer needed
-    _pending_path().write_text(
-        json.dumps({"version": release["tag_name"],
+    part.unlink(missing_ok=True)
+    p.write_text(
+        json.dumps({"version": version,
                     "staged_path": str(staged),
-                    "checksum": h.hexdigest()}, indent=2),
+                    "checksum": sha}, indent=2),
         encoding="utf-8",
     )
-    _ulog(f"staged {release['tag_name']} at {staged}, applies on next exit")
+    _ulog(f"staged {version} at {staged}, applies on next exit")
+
 
 def _update_loop():
     time.sleep(5)
@@ -290,12 +532,17 @@ def _update_loop():
         _sweep_stale_files()
     except Exception as e:
         _ulog(f"sweep failed: {e!r}")
+    try:
+        _dump_update_dir()
+    except Exception as e:
+        _ulog(f"update dir dump failed: {e!r}")
     while True:
         try:
             _check_and_download()
         except Exception as e:
             _ulog(f"unexpected error: {e!r}")
-        time.sleep(30 * 60)     # re-check every 30 minutes while running
+        time.sleep(_CHECK_EVERY)
+
 
 if getattr(sys, 'frozen', False):
     threading.Thread(target=_update_loop, daemon=True).start()
@@ -5654,11 +5901,11 @@ def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
                                             subtitle_end_time)
 
     # shift end to middle to find first letter
-    one_letter_audio_ms = 100
+    one_letter_audio_ms = 60
     letter_audio_frame_target = one_letter_audio_ms // frame_duration_ms
     letter_audio_frame_now = 0
     for i in range(subtitle_end_frame, -1, -1):
-        if rms[i] > 0.005:
+        if rms[i] > 0.004:
             letter_audio_frame_now += 1
         else:
             letter_audio_frame_now -= 2
@@ -8989,12 +9236,29 @@ def show_title_menu(global_pos):
 
 
 def on_quit():
+    """Quitting is unconditional. The tray icon is gone by the second step,
+    so anything that throws or blocks after it leaves a process the user can
+    neither see nor quit - which is exactly what was reported."""
+    def _try(step, fn):
+        try:
+            fn()
+        except Exception as e:
+            # names the failing step in ACard.log, so the next report
+            # already carries its own cause
+            print(f'[quit] {step} failed: {e!r}')
+
+    # 20s rather than a few: _generate_exit_bat legitimately hashes a
+    # 183 MB staged exe first, which is slow on a spinning disk
+    wd = threading.Timer(20.0, lambda: os._exit(0))
+    wd.daemon = True
+    wd.start()
+
     threading.Thread(target=anki_sync_on_quit, daemon=True).start()
-    window._save_position()  # save window position
-    tray.hide()              # remove tray icon
-    recorder.stop()          # stop native audio capture thread
-    _generate_exit_bat()     # generate bat: delete _MEI (and apply update if pending)
-    rotate_log_if_needed()   # close log and rotate if it grew past the cap
+    _try('save_position', window._save_position)  # save window position
+    _try('tray.hide', tray.hide)                  # remove tray icon
+    _try('recorder.stop', recorder.stop)          # stop native audio thread
+    _try('exit_bat', _generate_exit_bat)          # delete _MEI, apply update
+    _try('rotate_log', rotate_log_if_needed)      # close and trim the log
     try:
         psutil.Process(os.getpid()).parent().kill()  # kill PyInstaller bootloader
     except Exception:
