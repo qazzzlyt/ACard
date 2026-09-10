@@ -1,4 +1,4 @@
-__version__ = "0.0.8"
+__version__ = "0.0.10"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -26,10 +26,48 @@ def _ulog(msg):
     except Exception:
         pass
 
+_UPDATE_DIR = [None]
+_UPDATE_DIR_LOCK = threading.Lock()
+
+
 def _update_dir() -> Path:
-    d = Path(tempfile.gettempdir()) / f"{_APP_NAME}-update"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """Scratch space for the updater: the .part download, pending.json and
+    the downloader lock. LOCALAPPDATA first - TEMP is where security
+    software looks hardest at a program writing an exe and a bat, and it is
+    also what Storage Sense and Disk Cleanup prune, which silently eats a
+    half-finished download. TEMP stays as a fallback, because one machine
+    has already turned a single fixed folder into a total updater outage.
+    Nothing here needs to share a drive with the exe; only _staging_dir()
+    does. Never TEMP itself: the sweep walks whatever this returns and
+    deletes what it does not recognise."""
+    if _UPDATE_DIR[0] is not None:
+        return _UPDATE_DIR[0]
+    # one answer for the whole process: the updater thread and the main
+    # thread at quit both ask, and if they disagreed the exit script would
+    # hunt for pending.json in a folder the download never used
+    with _UPDATE_DIR_LOCK:
+        if _UPDATE_DIR[0] is not None:
+            return _UPDATE_DIR[0]
+        tmp = Path(tempfile.gettempdir())
+        first = Path(os.environ.get("LOCALAPPDATA", tmp)) / _APP_NAME / "updater"
+        for d in (first, tmp / f"{_APP_NAME}-update",
+                  tmp / f"{_APP_NAME}-update-alt"):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                # unique per process AND per thread: a shared probe name
+                # makes concurrent callers delete each other's file and
+                # cascade down the ladder for no reason
+                probe = d / f"w{os.getpid()}-{threading.get_ident()}.tmp"
+                probe.write_text("x", encoding="ascii")
+                probe.unlink()
+            except Exception:
+                continue
+            if d != first:
+                _ulog(f"update dir falls back to {d}")
+            _UPDATE_DIR[0] = d
+            return d
+        _UPDATE_DIR[0] = first  # nothing writable; callers report it
+        return first
 
 def _pending_path() -> Path:
     return _update_dir() / "pending.json"
@@ -81,7 +119,10 @@ def _sweep_stale_files() -> None:
                 p.unlink(missing_ok=True)
         except Exception:
             p.unlink(missing_ok=True)
-    for d in (_update_dir(), _staging_dir()):
+    # the legacy TEMP folder gets swept too: anyone who ran an older build
+    # may still have a 183 MB .part in it that nothing will ever look at
+    legacy = Path(tempfile.gettempdir()) / f"{_APP_NAME}-update"
+    for d in dict.fromkeys((_update_dir(), _staging_dir(), legacy)):
         try:
             if not d.is_dir():
                 continue
@@ -413,13 +454,14 @@ def _claim_downloader() -> bool:
 def _check_and_download():
     """Read the manifest, pull the exe from whichever mirror answers, and
     stage it. Nothing here touches the running exe."""
+    work = _update_dir()
     try:
-        free = shutil.disk_usage(tempfile.gettempdir()).free
+        free = shutil.disk_usage(work).free
         if free < 500 * 1024 * 1024:
-            _ulog(f"abort: temp drive has only {free / 1e6:.0f} MB free")
+            _ulog(f"abort: {work.drive} has only {free / 1e6:.0f} MB free")
             return
     except OSError as e:
-        _ulog(f"abort: cannot read temp disk usage: {e!r}")
+        _ulog(f"abort: cannot read disk usage for {work}: {e!r}")
         return
 
     man = _fetch_manifest()
@@ -450,7 +492,17 @@ def _check_and_download():
         return
 
     part = _update_dir() / f"{_APP_NAME}-{version}.exe.part"
-    if part.exists() and part.stat().st_size > total:
+    try:
+        # prove the file can be written before spending three mirrors on it:
+        # a local refusal looks exactly like every mirror failing at 0.0 MB
+        with open(part, "ab"):
+            pass
+    except OSError as e:
+        _ulog(f"cannot open {part}: {e!r}")
+        _ulog(f"   folder {part.parent} -> {_dir_writable(part.parent)}")
+        _ulog("   the mirrors are fine; skipping this cycle")
+        return
+    if part.stat().st_size > total:
         _ulog("part file longer than the manifest says, discarding it")
         part.unlink(missing_ok=True)
     have = part.stat().st_size if part.exists() else 0
