@@ -1,4 +1,4 @@
-__version__ = "0.0.11"
+__version__ = "0.1.0"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, platform, shutil, subprocess, sys
@@ -601,53 +601,6 @@ if getattr(sys, 'frozen', False):
 
 # ── End auto-updater ──────────────────────────────────────────────────────────
 
-import datetime
-import uuid
-import sys, psutil
-# Beta expiry date
-BETA_EXPIRY = datetime.date(2026, 9, 30)
-# Allowed MAC addresses (last 8 hex digits, lowercase, no separators)
-ALLOWED_MAC_SUFFIXES = [
-    '2489',  # add allowed suffixes here
-]
-
-
-def get_all_mac_suffixes():
-    suffixes = set()
-    for iface, addrs in psutil.net_if_addrs().items():
-        for addr in addrs:
-            if addr.family == psutil.AF_LINK:
-                mac = addr.address.replace('-', '').replace(':', '').lower()
-                if len(mac) == 12 and mac != '000000000000':
-                    suffixes.add(mac[-4:])
-    return suffixes
-
-
-def check_beta():
-    if datetime.date.today() > BETA_EXPIRY:
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
-            'ACard',
-            '测试版本已过期 请下载正式版ACard. Test version expired. Download formal version.'
-        )
-        sys.exit()
-
-    return
-
-    suffixes = get_all_mac_suffixes()
-    if not suffixes.intersection(ALLOWED_MAC_SUFFIXES):
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror('ACard', '你不是测试人员 请等待正式版发布')
-        sys.exit()
-
-
-check_beta()
 import sys
 import os
 from datetime import datetime
@@ -677,13 +630,11 @@ LOG_KEEP_BYTES = 3 * 1024 * 1024
 
 def setup_logging():
     global _log_file, _log_path
-    # Determine where the exe (or script) lives
-    if getattr(sys, 'frozen', False):
-        exe_dir = os.path.dirname(sys.executable)
-    else:
-        exe_dir = os.path.dirname(os.path.abspath(__file__))
-    log_path = os.path.join(os.path.expanduser("~"), "Downloads", "acard",
-                            "ACard.log")
+    # next to config.json (%LOCALAPPDATA%\ACard): a per-user folder every
+    # install has, where Downloads may be redirected or missing
+    from platformdirs import user_config_dir
+    log_path = os.path.join(user_config_dir('ACard', appauthor=False),
+                            'ACard.log')
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log_file = open(log_path, 'a', encoding='utf-8')
     # Tee to both original console and log file
@@ -2463,19 +2414,76 @@ def after_display(word_info, word, points, audio_bytes, snip_index,
         round_finish_all()
 
 
+# Per-capture debug dump: a timestamped folder under Downloads\acard with
+# sentences.csv, audio.wav and every probed frame as PNG. Off for release;
+# the detection trace goes to the log either way.
+DEBUG_DUMP = False
+
+_TRACE_START = ('subtitle_start_time', 'subtitle_start_frame',
+                'subtitle_start_frame_to_middle',
+                'subtitle_start_frame_to_middle_to_side',
+                'subtitle_start_frame_to_middle_to_side_after_blank_frame',
+                'start_byte')
+_TRACE_END = ('subtitle_end_time', 'subtitle_end_frame',
+              'subtitle_end_frame_to_middle',
+              'subtitle_end_frame_to_middle_to_side',
+              'subtitle_end_frame_to_middle_to_side_after_blank_frame',
+              'end_byte')
+
+
+def detect_trace(frame_duration_ms, audio_start_time, dbg_start, dbg_end,
+                 origin=0.0):
+    """One 'label=value @pos' per stage of play START/END detection. pos is
+    seconds on the capture's timeline counted from `origin`: 0 for the
+    whole capture (the dump's audio.wav), the trim start for the Anki mp3."""
+    bps = recorder.BYTES_PER_SEC
+    fdur = frame_duration_ms / 1000
+    out = [f'frame_duration_ms={frame_duration_ms}']
+    for lbls, vals in ((_TRACE_START, dbg_start), (_TRACE_END, dbg_end)):
+        for lbl, v in zip(lbls, vals):
+            if lbl.endswith('_time'):
+                t = v - audio_start_time
+            elif lbl.endswith('_byte'):
+                t = v / bps
+            else:
+                t = v * fdur
+            out.append(f'{lbl}={v} @{t - origin:.3f}s')
+    return out
+
+
+def log_detect_trace(word, mp3_name, frame_duration_ms, audio_start_time,
+                     dbg_start, dbg_end, trim_start_byte, trim_len_bytes):
+    """The trace with every position shifted onto the Anki mp3, so an '@'
+    reads straight off the card: start_byte's '@' is the start handle."""
+    bps = recorder.BYTES_PER_SEC
+    t0 = trim_start_byte / bps
+    lines = [f'[detect] {word} | {mp3_name or "no mp3"} | trim '
+             f'{t0:.3f}-{t0 + trim_len_bytes / bps:.3f}s of the capture,'
+             f' @ = position in the mp3']
+    lines += detect_trace(frame_duration_ms, audio_start_time,
+                          dbg_start, dbg_end, origin=t0)
+    # one write for the whole block: nothing another thread prints can
+    # land in the middle of it
+    sys.stdout.write('\n'.join(lines) + '\n')
+
+
 def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,rect,word,anki_new_note_time_stamp,anki_new_note_thread,spell=''):
 
-    folder_path = os.path.join(
-        os.path.expanduser("~"), "Downloads", "acard",
-        time.strftime("%Y%m%d_%H%M%S",
-                        time.localtime(audio_start_time)))  #test need delete
-    
-    os.makedirs(folder_path, exist_ok=True)  #test need delete
+    # debug dump folder, see DEBUG_DUMP; None turns every dump write off
+    folder_path = None
+    if DEBUG_DUMP:
+        folder_path = os.path.join(
+            os.path.expanduser("~"), "Downloads", "acard",
+            time.strftime("%Y%m%d_%H%M%S",
+                          time.localtime(audio_start_time)))
+        os.makedirs(folder_path, exist_ok=True)
 
     snip_hog, subtitle_sentences, snip_index_in_sentences, rect_small, rect_small_expanded = detect_subtitle_prepare(points, snip_index, audio_start_time, audio_end_time, rect)
-    
-    snip_strip = screenshot[snip_index][0].copy(rect_small)  # test need delete: grab before logout, saved in debug tail
-    snip_strip_time = screenshot[snip_index][1] / 1000  # test need delete
+
+    if DEBUG_DUMP:
+        # grabbed before screenshot_logout() lets the frames go
+        snip_strip = screenshot[snip_index][0].copy(rect_small)
+        snip_strip_time = screenshot[snip_index][1] / 1000
     
     ambiguous_diff_max = 0.15
     detect_subtitle_start(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_small_expanded,ambiguous_diff_max,folder_path)
@@ -2491,6 +2499,9 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     start_byte, start_frame = analyze_audio_start(audio_bytes, audio_start_time, rms, rms_moving_average,
                   frame_duration_ms, snip_index_in_sentences,
                   subtitle_sentences, ambiguous_diff_max)
+    # snapshot now: the next capture's analysis overwrites _dbg, and the
+    # trace is only written once this round is over
+    trace_start = list(getattr(analyze_audio_start, '_dbg', []))
     round_audio_analysis_start_time_done.set()
 
     detect_subtitle_end(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_small,rect_small_expanded,ambiguous_diff_max,folder_path)
@@ -2498,8 +2509,9 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     end_byte, end_frame = analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
                 frame_duration_ms, snip_index_in_sentences,
                 subtitle_sentences, ambiguous_diff_max,start_frame)
+    trace_end = list(getattr(analyze_audio_end, '_dbg', []))
 
-    audio_bytes_after_trim, play_start_time, play_end_time = analyze_audio_trim(frame_duration_ms, rms, rms_moving_average, start_byte, start_frame, end_byte, end_frame, audio_bytes)
+    audio_bytes_after_trim, play_start_time, play_end_time, trim_start_byte = analyze_audio_trim(frame_duration_ms, rms, rms_moving_average, start_byte, start_frame, end_byte, end_frame, audio_bytes)
 
     audio_wav_after_trim = pcm_to_wav_bytes(audio_bytes_after_trim)
 
@@ -2509,6 +2521,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     # matching without waiting silently drops the audio
     round_anki_id_generated.wait(timeout=5)
     anki_id_processed = None
+    _mp3_name = ''   # stays empty when this round writes no mp3
     anki_last_new_note_snapshot = anki_last_new_note  # avoid anki_last_new_note changed during matching
     if anki_new_note_time_stamp == anki_last_new_note_snapshot[0]:
         anki_id_processed = int(anki_last_new_note_snapshot[1])
@@ -2604,7 +2617,17 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     anki_new_note_thread.join()
     round_finish_all()
         
-    # test need delete
+    # the detection trace, positions on the Anki mp3's timeline. Written
+    # from its own thread once the round is over, all of it in one go
+    threading.Thread(
+        target=log_detect_trace,
+        args=(word, _mp3_name, frame_duration_ms, audio_start_time,
+              trace_start, trace_end, trim_start_byte,
+              len(audio_bytes_after_trim)),
+        daemon=True).start()
+
+    if not DEBUG_DUMP:
+        return
     import csv
     snip_strip.save(
         os.path.join(folder_path, f"{snip_strip_time:.3f}-snip.png"))
@@ -2653,31 +2676,8 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
         f'{max(_wx) - min(_wx)},{max(_wy) - min(_wy)}')
     rows[0][SENTENCE_COLS + 3] = folder_path
     rows[1][SENTENCE_COLS + 3] = f'{audio_start_time:.3f}'
-    bps = recorder.BYTES_PER_SEC
-    fdur = frame_duration_ms / 1000
-    step_vals = [f'frame_duration_ms={frame_duration_ms}']
-    start_labels = [
-        'subtitle_start_time', 'subtitle_start_frame',
-        'subtitle_start_frame_to_middle',
-        'subtitle_start_frame_to_middle_to_side',
-        'subtitle_start_frame_to_middle_to_side_after_blank_frame',
-        'start_byte']
-    end_labels = [
-        'subtitle_end_time', 'subtitle_end_frame',
-        'subtitle_end_frame_to_middle',
-        'subtitle_end_frame_to_middle_to_side',
-        'subtitle_end_frame_to_middle_to_side_after_blank_frame',
-        'end_byte']
-    for lbls, fn in ((start_labels, analyze_audio_start),
-                     (end_labels, analyze_audio_end)):
-        for lbl, v in zip(lbls, getattr(fn, '_dbg', [])):
-            if lbl.endswith('_time'):
-                t = v - audio_start_time
-            elif lbl.endswith('_byte'):
-                t = v / bps
-            else:
-                t = v * fdur
-            step_vals.append(f'{lbl}={v} @{t:.3f}s')
+    step_vals = detect_trace(frame_duration_ms, audio_start_time,
+                             trace_start, trace_end)
     for i, val in enumerate(step_vals):
         while len(rows) <= i + 2:
             rows.append([''] * (SENTENCE_COLS + 4))
@@ -2821,13 +2821,14 @@ def detect_subtitle_start(snip_hog,snip_index_in_sentences,snip_index,subtitle_s
             rect_expanded, ocr_budget_ambiguous, snip_hog,
             ocr_budget_move, last_hog, diff_frame_draft_total,ambiguous_diff_max,
             folder_path)
-        screenshot[i - snip_index_in_sentences + snip_index][0].copy(
-            rect_last_zncc
-        ).save(
-            os.path.join(
-                folder_path,
-                f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
-            ))  #test need delete
+        if folder_path:
+            screenshot[i - snip_index_in_sentences + snip_index][0].copy(
+                rect_last_zncc
+            ).save(
+                os.path.join(
+                    folder_path,
+                    f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
+                ))
         
 
 def detect_subtitle_end(snip_hog,snip_index_in_sentences,snip_index,subtitle_sentences,rect_last_zncc,rect_small_expanded,ambiguous_diff_max,folder_path):
@@ -2843,13 +2844,14 @@ def detect_subtitle_end(snip_hog,snip_index_in_sentences,snip_index,subtitle_sen
             rect_small_expanded, ocr_budget_ambiguous, snip_hog,
             ocr_budget_move, last_hog, diff_frame_draft_total, ambiguous_diff_max,
             folder_path)
-        screenshot[i - snip_index_in_sentences + snip_index][0].copy(
-            rect_last_zncc
-        ).save(
-            os.path.join(
-                folder_path,
-                f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
-            ))  #test need delete
+        if folder_path:
+            screenshot[i - snip_index_in_sentences + snip_index][0].copy(
+                rect_last_zncc
+            ).save(
+                os.path.join(
+                    folder_path,
+                    f"{screenshot[i - snip_index_in_sentences + snip_index][1]/1000:.3f}.png"
+                ))
 
 
 def sentences_one_compare(i, snip_index_in_sentences, snip_index, subtitle_sentences,
@@ -2978,11 +2980,11 @@ def sentences_one_compare_zncc(i, k, rect_image, subtitle_sentences, rect_match,
     # ambiguous probe, the expanded strip for a move probe. rect_match is where
     # the word sits now; only a successful move probe relocates it.
     score, top_left = zncc_find(screenshot[k][0], rect_image)
-    screenshot[k][0].copy(rect_image).save(
-        os.path.join(
-            folder_path,
-            f"{screenshot[k][1]/1000:.3f}-{subtitle_sentences[i][4]}.png")
-    )  # need delete
+    if folder_path:
+        screenshot[k][0].copy(rect_image).save(
+            os.path.join(
+                folder_path,
+                f"{screenshot[k][1]/1000:.3f}-{subtitle_sentences[i][4]}.png"))
     if top_left is None:        # unscorable: abstain, same as a failed OCR
         return rect_match, this_hog
     if score >= ZNCC_THRESHOLD:
@@ -2994,61 +2996,6 @@ def sentences_one_compare_zncc(i, k, rect_image, subtitle_sentences, rect_match,
     else:
         subtitle_sentences[i][3] = 0
     return rect_match, this_hog
-
-
-def sentences_one_compare_ocr(i, k, rect_to_ocr, direction, subtitle_sentences, word,
-                              rect_expanded, rect_last_ocr, rect_small,
-                              this_hog, folder_path):
-    img = screenshot[k][0].copy(rect_to_ocr)
-    ocr_result = run_ocr(img, ocr, on_error, direction)
-    img.save(
-        os.path.join(folder_path,
-                     f"{screenshot[k][1]/1000:.3f}-{subtitle_sentences[i][4]}.png")
-    )  # need delete
-    if ocr_result:
-        matched = find_match_in_ocr_result(ocr_result, word)
-        if matched:
-            subtitle_sentences[i][3] = 1
-            if subtitle_sentences[i][4] == 2:
-                coords = matched[1]
-                offset = rect_expanded.topLeft()
-                points = [
-                    offset + QPoint(int(coords[0]), int(coords[1])),
-                    offset + QPoint(int(coords[2]), int(coords[3])),
-                    offset + QPoint(int(coords[4]), int(coords[5])),
-                    offset + QPoint(int(coords[6]), int(coords[7])),
-                ]
-                rect_list = quad_to_rect(points, force=True)
-                rect_last_ocr = QRect(rect_list[0], rect_list[2])
-                rect_small = quad_to_smaller_rect(points)
-            this_hog = compute_hog(screenshot[k][0], rect_small)
-        else:
-            subtitle_sentences[i][3] = 0
-        #print(f'{i}_rect_small.jpg: {ocr_result}')
-    return rect_last_ocr, rect_small, this_hog
-
-
-def find_match_in_ocr_result(ocr_result, word):
-    # exact match first
-    matched = next((r for r in ocr_result if r[0] == word), None)
-    if matched:
-        return matched
-
-    # determine minimum match length based on language
-    is_cjk = any('\u3000' <= c <= '\u9fff' or '\u4e00' <= c <= '\u9fff'
-                 or '\u3040' <= c <= '\u30ff' for c in word)
-    min_len = 2 if is_cjk else 4
-
-    # partial match from longest to shortest
-    for n in range(len(word) - 1, min_len - 1, -1):
-        for candidate in [word[:n], word[-n:]]:
-            matched = next(
-                (r for r in ocr_result
-                 if r[0] and (candidate in r[0] or r[0] in candidate)), None)
-            if matched:
-                return matched
-
-    return None
 
 
 def compute_hog(qimg_full, rect_small):
@@ -5902,11 +5849,12 @@ def analyze_audio_start(audio_bytes, audio_start_time, rms, rms_moving_average,
                                         recorder.BYTES_PER_SAMPLE,
                                         recorder.BYTES_PER_SEC, search_ms)
     
+    # every stage's result, read by the detection trace in the log
     analyze_audio_start._dbg = [
         subtitle_start_time, subtitle_start_frame,
         subtitle_start_frame_to_middle, subtitle_start_frame_to_middle_to_side,
         subtitle_start_frame_to_middle_to_side_after_blank_frame,
-        start_byte]  # test need delete
+        start_byte]
     
     window.start_byte = start_byte
 
@@ -5994,12 +5942,12 @@ def analyze_audio_end(audio_bytes, audio_start_time, rms, rms_moving_average,
                                         recorder.BYTES_PER_SAMPLE,
                                         recorder.BYTES_PER_SEC, search_ms)
     
-    # test need delete
+    # every stage's result, read by the detection trace in the log
     analyze_audio_end._dbg = [
         subtitle_end_time, subtitle_end_frame,
         subtitle_end_frame_to_middle, subtitle_end_frame_to_middle_to_side,
         subtitle_end_frame_to_middle_to_side_after_blank_frame,
-        end_byte]  # test need delete
+        end_byte]
     window.end_byte = end_byte
     # deliver END to the live session if it is playing THIS capture
 
@@ -6093,9 +6041,11 @@ def analyze_audio_trim(frame_duration_ms, rms, rms_moving_average, start_byte, s
     play_start_time = max(play_start_bytes_remove_blank / recorder.BYTES_PER_SEC, 0)
     play_end_time = max(play_end_bytes_remove_blank / recorder.BYTES_PER_SEC, 0)
 
+    # the trim start goes out too: it is where the Anki mp3 begins on the
+    # capture's timeline, and the log's detection trace is measured from it
     return audio_bytes[
         trim_start_bytes:
-        trim_end_bytes], play_start_time, play_end_time
+        trim_end_bytes], play_start_time, play_end_time, trim_start_bytes
 
 def analyze_audio(audio_bytes, audio_start_time, rms, rms_moving_average,
                   frame_duration_ms, snip_index_in_sentences,
@@ -6572,7 +6522,7 @@ def anki_create_deck():
 
 
 def anki_create_model():
-    ANKI_MODEL_VERSION = 3
+    ANKI_MODEL_VERSION = 4
     FRONT_TEMPLATE = r"""<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
 <script>
    // A lone space inside spell is stray (OCR, hand edits). A run of two
@@ -6821,7 +6771,7 @@ window._apCfg = {
     targetPeakMobile: 0.45,     /* normalized peak, phones */
     targetPeakDesktop: 0.3,     /* normalized peak, desktop */
     maxGainMobile: 10,          /* gain ceiling, phones */
-    maxGainDesktop: 3,          /* gain ceiling, desktop */
+    maxGainDesktop: 2.5,          /* gain ceiling, desktop */
     loudPercentile: 0.01,       /* loudest fraction ignored when measuring
                                    the level - a click is not the level */
     maxOvershoot: 4,            /* how far the loudest samples may run past
@@ -6831,7 +6781,8 @@ window._apCfg = {
     watchdogMs: [300, 1200],    /* clock checks after playback starts */
     rebuildQuota: 4,            /* context rebuilds allowed per tap */
     warmupMs: 400,              /* clock probe after returning to the app */
-    warmupTries: 5              /* probe attempts before giving up */
+    warmupProbeTries: 3,        /* extra clock probes before rebuilding */
+    warmupTries: 5              /* rebuilds before giving up */
 };
 </script>
 <script>
@@ -6981,9 +6932,6 @@ window._apCfg = {
                  cache.bitmap = bm;
                  _rebuildBusy = false;
                  try { renderScreenshot(); } catch (e) {}
-                 if (window.top._imgDbg) {
-                     window.top._imgDbg.healed = (window.top._imgDbg.healed || 0) + 1;
-                 }
              }
              function refetch() {
                  var _src3 = window._apCap().img;
@@ -7245,6 +7193,20 @@ window._apCfg = {
           const hStart = document.getElementById("ap-h-start");
           const hEnd = document.getElementById("ap-h-end");
           const HIT_OUTER = parseFloat(getComputedStyle(track).getPropertyValue("--hit-outer")) || 0;
+          // Hit geometry as authored, in CSS px. Pinch zoom magnifies CSS px
+          // without reflowing, so at scale 3 a 50px grab zone covers 150
+          // physical px and the two handles own most of the screen. The finger
+          // is still the same size, so divide these by the scale and the grab
+          // zone stays physically constant. The visible bracket is left alone
+          // on purpose: zooming in to see it should make it bigger.
+          const HIT_UP = parseFloat(getComputedStyle(track).getPropertyValue("--hit-up")) || 0;
+          const HIT_DOWN = parseFloat(getComputedStyle(track).getPropertyValue("--hit-down")) || 0;
+          const HIT_INNER = parseFloat(getComputedStyle(track).getPropertyValue("--hit-inner")) || 0;
+          function apScale() {
+              const vv = window.visualViewport;
+              // only ever shrink - a scale below 1 would inflate the zone
+              return vv && vv.scale > 1 ? vv.scale : 1;
+          }
           let _apWidgetsShown = false;   // hidden until updateUI() places them
           const zoomEl = document.getElementById("ap-zoom");
           const zoomCanvas = document.getElementById("ap-zoom-canvas");
@@ -7315,8 +7277,13 @@ window._apCfg = {
               const trackW = track.clientWidth;
               const startAnchor = (sp / 100) * trackW;
               const endAnchor = (ep / 100) * trackW;
-              hStart.style.setProperty("--hit-outer", Math.max(0, Math.min(HIT_OUTER, startAnchor)) + "px");
-              hEnd.style.setProperty("--hit-outer", Math.max(0, Math.min(HIT_OUTER, trackW - endAnchor)) + "px");
+              const z = apScale();
+              const hitOuter = HIT_OUTER / z;
+              track.style.setProperty("--hit-up", HIT_UP / z + "px");
+              track.style.setProperty("--hit-down", HIT_DOWN / z + "px");
+              track.style.setProperty("--hit-inner", HIT_INNER / z + "px");
+              hStart.style.setProperty("--hit-outer", Math.max(0, Math.min(hitOuter, startAnchor)) + "px");
+              hEnd.style.setProperty("--hit-outer", Math.max(0, Math.min(hitOuter, trackW - endAnchor)) + "px");
               const gapPx = ((ep - sp) / 100) * trackW;
               const visualW = Math.max(0, Math.min(20, gapPx - 2));
               const startVis = hStart.querySelector(".ap-handle-visual");
@@ -7432,14 +7399,7 @@ window._apCfg = {
               // gain per segment (no compression), pushed to just under
               // full scale (no clipping). Checks every channel.
               volCache = { s: startT, e: endT, vol: 1 };
-              // test need delete: one line per range change into #dbg-panel
-              function volDbg(extra) {
-                  if (!window._apDbgLog) return;
-                  window._apDbgLog('vol ' + startT.toFixed(2) + '-'
-                      + endT.toFixed(2) + 's ' + extra
-                      + ' vol=' + volCache.vol.toFixed(2));
-              }
-              if (!audioBuffer) { volDbg('nobuf'); return; }
+              if (!audioBuffer) return;
               const sr = audioBuffer.sampleRate;
               const s0 = Math.max(0, Math.floor(startT * sr));
               // The level is read off a high percentile rather than the
@@ -7461,10 +7421,7 @@ window._apCfg = {
                       total++;
                   }
               }
-              if (peak < 0.001) {                // silence: leave it alone
-                  volDbg('peak=' + peak.toFixed(4) + ' SILENT');
-                  return;
-              }
+              if (peak < 0.001) return;          // silence: leave it alone
               // per-device target peak: phones (weak speakers) get a hotter
               // level than PCs; UA-based detection, iPad included
               var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
@@ -7490,57 +7447,58 @@ window._apCfg = {
               // push the real content way past full scale
               const clipGuard = window._apCfg.maxOvershoot / peak;
               volCache.vol = Math.min(targetPeak / level, clipGuard, maxGain);
-              volDbg('peak=' + peak.toFixed(4)
-                  + ' lvl=' + level.toFixed(4)
-                  + ' crest=' + (peak / level).toFixed(1)
-                  + ' dev=' + (isMobile ? 'mob' : 'pc')
-                  + ' tgt=' + targetPeak
-                  + ' want=' + (targetPeak / level).toFixed(2)
-                  + ' guard=' + clipGuard.toFixed(2)
-                  + ' cap=' + maxGain
-                  + ' bound=' + (volCache.vol === maxGain ? 'CAP'
-                      : volCache.vol === clipGuard ? 'GUARD' : 'target')
-                  + ' out=' + (level * volCache.vol).toFixed(3)
-                  + '/' + (peak * volCache.vol).toFixed(2));
           }
           function rebuildAndReplay(tag) {
               if (_apMyGen !== window.top._apGen) return;
-              if (rebuilds >= window._apCfg.rebuildQuota) {
-                  if (window._apDbgLog) window._apDbgLog("au:giveup " + tag);
-                  return;
-              }
+              if (rebuilds >= window._apCfg.rebuildQuota) return;
               rebuilds++;
-              if (window._apDbgLog) window._apDbgLog("au:rebuild" + rebuilds + " " + tag);
               try { audioCtx.close(); } catch (e) {}
               const AC = window.AudioContext || window.webkitAudioContext;
               audioCtx = new AC();
               window.top._apAudioCtx = audioCtx;
               playRangeInternal();
           }
-          function warmupClock(attempt) {
-              // on return from background: verify the clock actually
-              // advances; silently rebuild frozen contexts so the next
-              // tap lands on a live one. Never touches a moving clock.
-              attempt = attempt || 0;
+          function warmupClock(attempt, tries) {
+              // Only ever judges a context that already claims to be
+              // running while its clock stands still - the zombie this was
+              // written for. It must NOT resume: iOS flips the state to
+              // "running" the moment resume() lands even while the audio
+              // unit stays dead, and redrawAll's attempts at 100ms and
+              // 700ms - the ones that actually take - guard on state and
+              // would then skip themselves, leaving the interrupted clip
+              // permanently silent. A suspended or interrupted context is
+              // left to those.
+              attempt = attempt || 0;   // rebuilds so far
+              tries = tries || 0;       // probes on this context
               if (!audioCtx) return;
-              if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") {
-                  try { audioCtx.resume(); } catch (e) {}
-              }
+              if (audioCtx.state !== "running") return;
               const c0 = audioCtx;
               const t0 = c0.currentTime;
               setTimeout(function () {
                   if (_apMyGen !== window.top._apGen) return;
                   if (audioCtx !== c0) return;
                   const adv = c0.currentTime - t0;
-                  if (window._apDbgLog) window._apDbgLog(
-                      "au:warm" + attempt + " +" + adv.toFixed(3) + " " + c0.state);
-                  if (adv > 0 || attempt >= window._apCfg.warmupTries)
+                  if (adv > 0) return;
+                  if (tries + 1 < window._apCfg.warmupProbeTries) {
+                      // give the unit more time before calling it dead:
+                      // a clock can take a beat to start after an interrupt
+                      warmupClock(attempt, tries + 1);
                       return;
+                  }
+                  if (currentSource) {
+                      // rebuilding means closing, and closing chops what is
+                      // still attached - a click, then silence. Leave it:
+                      // the next tap runs stopCurrent() and the playback
+                      // watchdog rebuilds through rebuildAndReplay, whose
+                      // quota onVisible has just reset.
+                      return;
+                  }
+                  if (attempt >= window._apCfg.warmupTries) return;
                   try { c0.close(); } catch (e) {}
                   const AC = window.AudioContext || window.webkitAudioContext;
                   audioCtx = new AC();
                   window.top._apAudioCtx = audioCtx;
-                  warmupClock(attempt + 1);
+                  warmupClock(attempt + 1, 0);
               }, window._apCfg.warmupMs);
           }
           function playRangeInternal() {
@@ -7585,8 +7543,6 @@ window._apCfg = {
                       if (_apMyGen !== window.top._apGen) return;
                       if (currentSource !== zsrc || audioCtx !== zctx) return;
                       const adv = zctx.currentTime - zt;
-                      if (window._apDbgLog) window._apDbgLog(
-                          "au:tick" + ms + " +" + adv.toFixed(3) + " " + zctx.state);
                       if (adv === 0) rebuildAndReplay("t" + ms);
                   }, ms);
               });
@@ -7860,7 +7816,7 @@ window._apCfg = {
               const dx = p.x - lastClientX;
               lastClientX = p.x;
               const vDist = Math.abs(p.y - downClientY);
-              const speed = Math.max(0.125, 1 - vDist / 200);
+              const speed = Math.max(0.125, 1 - vDist / 100);
               const timeDelta = (dx / dragRect.width) * duration * speed;
               if (dragging === "start") {
                   startT = Math.max(0, Math.min(startT + timeDelta, endT - 0.05));
@@ -7898,6 +7854,21 @@ window._apCfg = {
               addTracked(hEnd, "touchstart", onDown, { passive: false });
               addTracked(document, "touchmove", onMove, { passive: false });
               addTracked(document, "touchend", onUp);
+          }
+          // Pinch zoom fires resize on visualViewport only, never on window,
+          // so without this the zones keep whatever size they had at load and
+          // stay oversized for the rest of the zoomed session. Coalesced to
+          // one pass per frame: the event fires continuously while pinching
+          // and updateUI() reads clientWidth, which forces layout.
+          if (window.visualViewport) {
+              let zoomRaf = 0;
+              addTracked(window.visualViewport, "resize", function () {
+                  if (zoomRaf) return;
+                  zoomRaf = requestAnimationFrame(function () {
+                      zoomRaf = 0;
+                      updateUI();
+                  });
+              });
           }
           window.playRange = function () {
               rebuilds = 0;   // each real tap earns a fresh repair quota
@@ -8141,33 +8112,23 @@ window._apCfg = {
     }
 </script>
 
-<div id="dbg-panel" style="margin-top: 32px; text-align: left; font-family: monospace; font-size: 10px; line-height: 1.5; color: #999; white-space: pre-wrap; -webkit-user-select: text; user-select: text"></div>
 <script>
-   // --- canvas blank-after-lock probe: OBSERVE ONLY, no repair ---
+   // --- blank-canvas self-heal ---
+   // A locked or long-backgrounded device can hand the word image's canvas
+   // back blank. Every 3 s and on every visibility/focus event, sample it;
+   // when it goes blank after having been painted, or renders blank from
+   // the start, redraw it from the cached bitmap, else rebuild the bitmap
+   // from the cached blob. rebuildWordImage() is the other half: it goes
+   // back to the network when the blob itself has died.
    (function () {
        var W = window.top;
-       if (!W._imgDbg) W._imgDbg = { log: [], blank: 0, timer: null };
-       var D = W._imgDbg;
+       if (!W._imgHeal) W._imgHeal = { timer: null };
+       var D = W._imgHeal;
        D.fname = (window._apCap && window._apCap().mp3) || '';
        D.everPainted = false;
        D.lastState = null;
-       D.freshBlankLogged = false;
-       var NL = String.fromCharCode(10);
+       D.freshBlankTried = false;
 
-       function ts() {
-           var d = new Date();
-           function p(n) { return (n < 10 ? '0' : '') + n; }
-           return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-       }
-       function render() {
-           var el = document.getElementById('dbg-panel');
-           if (el) el.textContent = D.log.slice(-30).join(NL);
-       }
-       function log(msg) {
-           D.log.push(ts() + ' ' + msg);
-           if (D.log.length > 60) D.log.shift();
-           render();
-       }
        function sample() {
            var canvas = document.getElementById('word-img-canvas');
            if (!canvas || canvas.style.display === 'none') return 'nocanvas';
@@ -8187,32 +8148,14 @@ window._apCfg = {
                return 'err:' + e.name;
            }
        }
-       function bitmapState() {
-           // liveness test on an OFFSCREEN canvas: never touches the visible one
-           var cache = W._apCache && W._apCache[D.fname];
-           if (!cache || !cache.bitmap) return 'bm-missing';
-           try {
-               var c = document.createElement('canvas');
-               c.width = 8;
-               c.height = 8;
-               var x = c.getContext('2d');
-               x.drawImage(cache.bitmap, 0, 0, 8, 8);
-               var d = x.getImageData(0, 0, 8, 8).data;
-               var sum = 0;
-               for (var i = 0; i < d.length; i++) sum += d[i];
-               return sum === 0 ? 'bm-dead' : 'bm-alive';
-           } catch (e) {
-               return 'bm-err:' + e.name;
-           }
-       }
-       function probeHeal(tag) {
+       function heal() {
            var cache = W._apCache && W._apCache[D.fname];
            var canvas = document.getElementById('word-img-canvas');
            if (!cache || !canvas) return;
            try {
                if (cache.bitmap) {
                    canvas.getContext('2d').drawImage(cache.bitmap, 0, 0);
-                   if (sample() === 'painted') { log(tag + ' redraw-ok'); D.lastState = 'painted'; return; }
+                   if (sample() === 'painted') { D.lastState = 'painted'; return; }
                }
            } catch (e) {}
            if (cache.blob && typeof createImageBitmap === 'function') {
@@ -8220,79 +8163,36 @@ window._apCfg = {
                    cache.bitmap = bm;
                    try {
                        canvas.getContext('2d').drawImage(bm, 0, 0);
-                       log(tag + ' ' + (sample() === 'painted' ? 'recreate-ok' : 'recreate-blank'));
                        D.lastState = sample();
-                   } catch (e) { log(tag + ' recreate-err'); }
-               }, function () { log(tag + ' recreate-fail'); });
-           } else {
-               log(tag + ' no-blob');
+                   } catch (e) {}
+               }, function () {});
            }
        }
-       function check(src) {
-           if (D.healed && D.healed !== D.healedSeen) {
-               D.healedSeen = D.healed;
-               log('img self-heal #' + D.healed);
-           }
+       function check() {
            var st = sample();
            if (st === 'painted') D.everPainted = true;
            if (st !== D.lastState) {
-               var flipped = D.lastState !== null;
                D.lastState = st;
-               if (st === 'blank' && D.everPainted) {
-                   D.blank += 1;
-                   log(src + ' BLANK #' + D.blank + ' | ' + bitmapState());
-                   probeHeal('heal:');
-               } else if (flipped) {
-                   log(src + ' ' + st);
-               }
+               if (st === 'blank' && D.everPainted) heal();
            }
-           if (st === 'blank' && !D.everPainted && !D.freshBlankLogged) {
-               D.freshBlankLogged = true;
-               log(src + ' render-blank | ' + bitmapState());
-               probeHeal('heal:');
+           if (st === 'blank' && !D.everPainted && !D.freshBlankTried) {
+               D.freshBlankTried = true;
+               heal();
            }
        }
 
-       // ---- audio-side observation (no repair) ----
-       var ctx = W._apAudioCtx;
-       if (ctx) {
-           if (ctx.state !== 'running') log('au:ctx ' + ctx.state);
-           ctx.onstatechange = function () {
-               log('au:state ' + ctx.state);
-           };
-       } else {
-           log('au:ctx none');
-       }
-       if (window.playRange && !window.playRange._dbgWrapped) {
-           var origPlay = window.playRange;
-           var wrapped = function () {
-               var c = W._apAudioCtx;
-               log('au:play ' + (c ? c.state : 'noctx'));
-               return origPlay.apply(this, arguments);
-           };
-           wrapped._dbgWrapped = true;
-           window.playRange = wrapped;
-       }
-       window._apDbgLog = log;   // probe output for the play-clock ticks
        if (D.timer) clearInterval(D.timer);
-       D.timer = setInterval(function () { check('t'); }, 3000);
-       if (!document._imgDbgArmed) {
-           document._imgDbgArmed = true;
+       D.timer = setInterval(check, 3000);
+       if (!document._imgHealArmed) {
+           document._imgHealArmed = true;
            var evs = ['visibilitychange', 'pageshow', 'pagehide', 'focus', 'blur', 'resume', 'freeze'];
            for (var i = 0; i < evs.length; i++) {
                (function (ev) {
                    var tgt = (ev === 'focus' || ev === 'blur') ? window : document;
-                   tgt.addEventListener(ev, function () {
-                       log('ev:' + ev + (ev === 'visibilitychange' ? '/' + document.visibilityState : ''));
-                       check('ev');
-                   });
+                   tgt.addEventListener(ev, check);
                })(evs[i]);
            }
-           log('probe armed');
-       } else {
-           log('card shown');
        }
-       render();
    })();
 </script>
 <script>
@@ -9358,8 +9258,5 @@ tray.setContextMenu(menu)
 tray.show()
 tray.activated.connect(tray_show)
 keyboard_listener.start()
-time.sleep(0.3)  # test need delete
-print(f"keyboard_listener alive: {keyboard_listener.is_alive()}"
-      )  # test need delete
 threading.Thread(target=_start_mouse_hook, daemon=True).start()
 sys.exit(app.exec_())
