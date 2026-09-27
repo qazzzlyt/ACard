@@ -4976,6 +4976,11 @@ def set_qt_layout():
     donate_row.addWidget(patreon_btn)
 
     settings_layout.addLayout(donate_row)
+    # donate row hidden for now; True brings it back. The widgets are still
+    # built, so the column widths worked out below stay exactly as before
+    SHOW_DONATE = False
+    for w in (donate_label, afdian_btn, patreon_btn):
+        w.setVisible(SHOW_DONATE)
 
     # align the left label column so all controls start at the same x
     label_col = [lang_label, screen_label, hotkey_label, anki_label, donate_label]
