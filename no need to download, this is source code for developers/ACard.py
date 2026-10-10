@@ -1,4 +1,4 @@
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, shutil, subprocess, sys
