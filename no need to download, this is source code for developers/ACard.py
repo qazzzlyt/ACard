@@ -1,7 +1,7 @@
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
-import hashlib, json, os, platform, shutil, subprocess, sys
+import hashlib, json, os, shutil, subprocess, sys
 import tempfile, threading, time
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -601,8 +601,6 @@ if getattr(sys, 'frozen', False):
 
 # ── End auto-updater ──────────────────────────────────────────────────────────
 
-import sys
-import os
 from datetime import datetime
 
 
@@ -683,35 +681,34 @@ def exception_hook(exctype, value, traceback):
 sys.excepthook = exception_hook
 _last_time = None
 
-import os
 import threading
 import shutil
-import uuid
 import base64
 import wave
 import io
 from mss import mss
+import mss.windows as _mss_windows
+# BitBlt's CAPTUREBLT makes Windows hide and redraw the cursor on every
+# grab, so the capture loop keeps it flickering. The flag exists to pull
+# in layered windows, which DWM already composites into the screen anyway.
+_mss_windows.CAPTUREBLT = 0
 import sqlite3
 import socket
-import sys
-import time
 import psutil
 import math
 import hashlib
 import json
 import subprocess
 import tempfile
-import time
 import re
 import requests
 import random
 from functools import partial
-from pynput import keyboard, mouse
+from pynput import keyboard
 from collections import deque
 from pathlib import Path
 import pyaudio
 import numpy as np
-import xml.etree.ElementTree as ET
 import unicodedata
 from ctypes import wintypes, CDLL, create_unicode_buffer, CFUNCTYPE, WINFUNCTYPE, Structure, WinDLL, windll, byref, cast, POINTER, pointer, cdll, string_at, sizeof, c_char, c_bool, c_char_p, c_float, c_int, c_int32, c_uint64, c_void_p, c_wchar_p, c_long, c_longlong, c_ulong, c_short, c_size_t
 
@@ -727,8 +724,8 @@ BASE = get_base()
 dll = CDLL(os.path.join(BASE, 'CVUtils.dll'))
 native_dll = CDLL(os.path.join(BASE, 'NativeUtils.dll'))
 
-from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow, QWidget, QMenu, QSlider, QToolTip, QLabel, QVBoxLayout, QLineEdit, QTextEdit, QSizePolicy, QHBoxLayout, QToolButton, QStyle, QStyleOptionSlider, QStackedWidget, QComboBox, QPushButton, QSystemTrayIcon, QMenu, QAction
-from PyQt5.QtCore import Qt, QRect, QEvent, QObject, pyqtSignal, QTimer, QBuffer, QIODevice, QPoint, QMetaObject, QEventLoop
+from PyQt5.QtWidgets import QApplication, QMessageBox, QFileDialog, QMainWindow, QWidget, QMenu, QSlider, QLabel, QVBoxLayout, QLineEdit, QTextEdit, QSizePolicy, QHBoxLayout, QToolButton, QStyle, QStyleOptionSlider, QStackedWidget, QComboBox, QPushButton, QSystemTrayIcon, QAction
+from PyQt5.QtCore import Qt, QRect, QEvent, QObject, pyqtSignal, QTimer, QBuffer, QIODevice, QPoint, QEventLoop
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QImage, QCursor, QFont, QIcon, QPolygon
 
 UI_TEXT = {
@@ -764,10 +761,11 @@ UI_TEXT = {
     'quit': ('Quit', '退出'),
     'processing': ('Previous note under processing...', '上一词条处理中...'),
     'no_ocr_result': ('No text detected', '未检测到文字'),
-    'not_found': ('Not found in dictionary', '查词失败'),
     'donate': ('Donate', '捐助'),
     'afadian': ('afadian', '爱发电'),
     'patreon': ('Patreon', 'Patreon'),
+    'tray_hint': ('ACard is still running in the tray. Click the icon to open it again.',
+                  'ACard 已最小化到托盘，点击托盘图标即可重新打开'),
 }
 
 
@@ -991,15 +989,6 @@ def qmsg(str):
 
 _conn_dict = None
 _conn_dict_ready = threading.Event()
-_current_dict_key = None
-
-
-def _load_db(filename, conn_var, ready_event):
-    conn = sqlite3.connect(os.path.join(BASE, filename),
-                           check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    globals()[conn_var] = conn
-    ready_event.set()
 
 
 # Mouse hook constants
@@ -1384,19 +1373,6 @@ def _snip_scroll(delta):
         snip.slider.setValue(snip.slider.value() + int(step))
 
 
-def force_activate(hwnd):
-    foreground_hwnd = windll.user32.GetForegroundWindow()
-    foreground_tid = windll.user32.GetWindowThreadProcessId(
-        foreground_hwnd, None)
-    current_tid = windll.kernel32.GetCurrentThreadId()
-    if foreground_tid != current_tid:
-        windll.user32.AttachThreadInput(foreground_tid, current_tid, True)
-        windll.user32.SetForegroundWindow(hwnd)
-        windll.user32.AttachThreadInput(foreground_tid, current_tid, False)
-    else:
-        windll.user32.SetForegroundWindow(hwnd)
-
-
 def convert_max_fps(
 ):  # convert max_fps tier to show current tier's range and total frame
     global max_fps
@@ -1445,10 +1421,7 @@ def show_and_exclude_from_capture(window, no_activate=True):
             windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
                                          ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         user32.SetWindowDisplayAffinity(hwnd, 0)
-        ok = user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
-
-    #if not ok:
-    #raise WinError(get_last_error())
+        user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
 
 
 def frame_interview(fps, cut_target, delete_frame_index):
@@ -1737,6 +1710,10 @@ class RAWINPUT(Structure):
 
 
 class Snip(QWidget):
+    # start() bookkeeping, see there
+    _in_lookup = False       # _do_snip is inside run_ocr_and_display
+    _start_queued = False    # a start() put off until that has finished
+    _starting = False        # a start() is waiting in check_processing
 
     def __init__(self):
         super().__init__(
@@ -1846,9 +1823,31 @@ class Snip(QWidget):
         if self.slider_container.rect().contains(pos):
             self.slider_container.setAttribute(Qt.WA_UnderMouse, True)
 
+    def _start_again(self):
+        self._start_queued = False
+        self.start()
+
     def start(self):
         global lock_length, screenshot_users, hide_on_click, _spell_index_thread, hotkey_mode, _snip_open_close_time
-        check_processing(round_display)
+        # a hotkey pressed while the last snip was being looked up runs here
+        # from refresh_window()'s processEvents, INSIDE run_ocr_and_display
+        # and before it sets round_display: waiting now could only time out.
+        # Come back once that round is on screen
+        if self._in_lookup:
+            if not self._start_queued:
+                self._start_queued = True
+                QTimer.singleShot(50, self._start_again)
+            return
+        # the snip is already up, or another start() is waiting further down
+        # the stack (check_processing pumps events): a second start would log
+        # in to the screenshots twice and log out only once
+        if hotkey_mode == 2 or self._starting:
+            return
+        self._starting = True
+        try:
+            check_processing(round_display)
+        finally:
+            self._starting = False
         hotkey_mode = 2
         _snip_open_close_time = time.time()
         if config['anki_combine_dup']:
@@ -2232,7 +2231,13 @@ class Snip(QWidget):
         self.dragging = False
         self.update()
         check_processing(round_anki_audio_sent)
-        rect = QRect(self.start_pos, self.end_pos).normalized()
+        # corners, not normalized(): QRect's two-point form counts both
+        # corners in, so a release exactly 1px left of or above the press
+        # makes a 0-wide rect that normalized() leaves empty - and an empty
+        # crop is a null QImage that run_ocr cannot read
+        x1, x2 = sorted((self.start_pos.x(), self.end_pos.x()))
+        y1, y2 = sorted((self.start_pos.y(), self.end_pos.y()))
+        rect = QRect(QPoint(x1, y1), QPoint(x2, y2))
         cropped = self.background.copy(rect)
         click_time = time.time()
         audio_bytes, audio_start_time, audio_end_time = recorder.capture_last(
@@ -2247,17 +2252,22 @@ class Snip(QWidget):
                 update_config('playback_hint_left', n)
                 if n <= 0:
                     self.hint_label.deleteLater()
-        run_ocr_and_display(
-            ocr, on_error, cropped, self.background, self.slider.value(),
-            rect, audio_bytes, audio_start_time,
-            audio_end_time)  # test need better thread arrangement
+        self._in_lookup = True                   # start() checks it
+        try:
+            run_ocr_and_display(
+                ocr, on_error, cropped, self.background, self.slider.value(),
+                rect, audio_bytes, audio_start_time,
+                audio_end_time)  # test need better thread arrangement
+        finally:
+            self._in_lookup = False
 
 
 def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                         audio_bytes, audio_start_time, audio_end_time):
+    global _ocr_done_at
     round_reset()
-    ocr_result = run_ocr(image, ocr, on_error, 2)
-
+    ocr_result = run_ocr_waiting(image, ocr, on_error, 2)
+    _ocr_done_at = time.time()
     word = ''
     if ocr_result:
         word = ocr_result[0][0]
@@ -2316,6 +2326,10 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             print('path: merge into ' + str(merge_target)
                   if merge_target else 'path: new note')
         if word_info['spell'] != '':
+            # this capture's note does not exist yet: drop the previous
+            # note's id, or the fill below lights save up against that
+            # note's snapshot until anki_new_note_after sets the new one
+            window.anki_id = None
             window_display_word(word_info['spell'], word_info['pron'],
                                 word_info['definition'], word_info['fuzzy'], None,
                                 False, True)
@@ -2333,7 +2347,6 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                                    merge_target),
                              daemon=True).start()
         else:  # test maybe delete, won't happen
-            print(1/0)  # test
             window_display_word_blank()
             refresh_window(False)
             show_and_exclude_from_capture(window)
@@ -2343,6 +2356,9 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             print('search dict fail for ' + word)
             screenshot_logout()
             round_finish_all()
+            # test: should never run. Last, so the round above is already
+            # closed while the box waits for OK
+            ask_front('else branch reached: empty spell for ' + word, yes_no=False)
     else:
         screenshot_logout()
         round_finish_all()
@@ -2350,13 +2366,14 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
 
 
 def resize_window_height():
-    content_width = window.width() - 20  # subtract left+right margins (10+10)
+    content_width = window.width() - 22  # border (1+1) + left/right margins (10+10)
 
-    h = 0
+    h = 2                                # border, top + bottom
     # title bar
     h += window.findChild(DraggableTitleBar).sizeHint().height()
-    # search row
-    h += window.word.sizeHint().height()
+    # search row: the layout's hint carries its margins and the fixed-height
+    # input; the input's own hint is shorter than the row it sits in
+    h += window.search_row.sizeHint().height()
     # labels
     for box in [window.label_spell, window.label_pron]:
         box.setVisible(True)
@@ -2712,7 +2729,120 @@ class Toast(QWidget):
         self.close()
 
 
+class TrayHint(QWidget):
+    """Bottom-right note that ACard went to the tray. Opaque on purpose: a
+    translucent (per-pixel alpha) window cannot be excluded from capture, and
+    this one is on screen while ACard keeps grabbing the frames cards are cut
+    from. The corners are rounded by a mask and the body softened by window
+    opacity instead."""
+    _live = None
+
+    def __init__(self, message, duration=6000):
+        super().__init__(
+            None,
+            Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui import QPainterPath, QRegion
+        label = QLabel(message, self)
+        label.setStyleSheet(
+            "background: %s; color: %s; border: 1px solid %s; padding: 7px 13px;"
+            " font-family: 'Microsoft YaHei'; font-size: 13px;"
+            % (THEME['bg'], THEME['fg'], THEME['border']))
+        label.adjustSize()
+        self.resize(label.size())
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 6, 6)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        self.setWindowOpacity(0.9)
+        area = QApplication.primaryScreen().availableGeometry()
+        self.move(area.right() - self.width() - 12,
+                  area.bottom() - self.height() - 12)
+        # excluded before it is ever shown, so no frame can catch it
+        user32.SetWindowDisplayAffinity(int(self.winId()), 0x00000011)
+        if TrayHint._live is not None:
+            TrayHint._live.close()
+        TrayHint._live = self
+        self.show()
+        QTimer.singleShot(duration, self.close)
+
+
+class BusyBox:
+    """The 'processing' box. Put up once where the pointer is and left
+    there (it no longer follows the mouse), and painted on the spot through
+    UpdateWindow, so it shows even while this thread turns no event loop -
+    as during OCR. Opaque, so it stays out of the captures: it sits right
+    next to the subtitle that was just snipped."""
+    _w = None
+
+    @classmethod
+    def show(cls):
+        if cls._w is not None:
+            return                               # already up: stays where it is
+        from PyQt5.QtCore import QRectF
+        from PyQt5.QtGui import QPainterPath, QRegion
+        w = QWidget(None, Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        w.setAttribute(Qt.WA_ShowWithoutActivating)
+        label = QLabel(ui('processing'), w)
+        label.setStyleSheet(
+            "background: rgb(40,40,40); color: white; padding: 6px 12px;"
+            " font-family: 'Microsoft YaHei'; font-size: 11px;")
+        label.adjustSize()
+        w.resize(label.size())
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(w.rect()), 6, 6)
+        w.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        w.setWindowOpacity(0.0)                  # shown blank first, never half-painted
+        w.move(QCursor.pos() + QPoint(16, 16))
+        hwnd = wintypes.HWND(int(w.winId()))
+        user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        w.show()
+        user32.UpdateWindow(hwnd)                # painted now, event loop or not
+        w.setWindowOpacity(220 / 255)
+        cls._w = w
+
+    @classmethod
+    def hide(cls):
+        if cls._w is not None:
+            cls._w.close()
+            cls._w = None
+
+
+def run_ocr_waiting(image, ocr, on_error, directional):
+    """run_ocr on a worker thread, waited for here WITHOUT turning the event
+    loop: nothing else runs meanwhile, exactly as when OCR ran on this
+    thread. The one difference: a hotkey pressed during OCR (flagged by the
+    hook thread) gets the 'processing' box at once instead of after OCR."""
+    global _ocr_running
+    out = {}
+
+    def work():
+        try:
+            ttt(1)
+            out['result'] = run_ocr(image, ocr, on_error, directional)
+            ttt(2)
+        except BaseException as e:
+            out['error'] = e
+
+    _hotkey_during_ocr.clear()
+    _ocr_running = True
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            if _hotkey_during_ocr.is_set():
+                BusyBox.show()
+            worker.join(0.02)
+    finally:
+        _ocr_running = False
+    if 'error' in out:
+        raise out['error']
+    return out['result']
+
+
 def run_ocr(image, ocr, on_error, directional):
+    if image.isNull():
+        # nothing to read: same outcome as a crop with no text in it
+        return []
     bits = image.bits()
     bits.setsize(image.byteCount())
 
@@ -3336,6 +3466,9 @@ def anki_get_and_display(anki_id, anki_check):
     pixmap = QPixmap()
     pixmap.loadFromData(
         anki_download_media(fields['screenshot']['value'].split('"')[1]))
+    # another note is about to fill the window: until its id is set below,
+    # comparing against the previous note's snapshot would light save up
+    window.anki_id = None
     window_display_word(fields['spell']['value'], fields['pron']['value'],
                         fields['definition']['value'], fields['fuzzy']['value'],
                         pixmap, True, True)
@@ -3733,7 +3866,7 @@ def refresh_history_menu():
     user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
     if anki_list:
         window.history_menu.setStyleSheet(
-            "QMenu::item:selected { background-color: #444; color: white; }")
+            MENU_HOVER)
         for anki_id, word in anki_list:
             action = window.history_menu.addAction(word)
             action.triggered.connect(
@@ -3746,6 +3879,10 @@ def refresh_history_menu():
 
 
 def on_click_snip():
+    # hook thread. During OCR the start() queued below cannot run until
+    # OCR is done: flag it, so the GUI thread puts up the 'processing' box
+    if _ocr_running:
+        _hotkey_during_ocr.set()
     bridge.click_snip.emit()
 
 
@@ -3896,12 +4033,6 @@ OCR_CONFUSION = {
         'ビ': ['ピ'], 'ピ': ['ビ'],
         'ブ': ['プ'], 'プ': ['ブ'],
         'ボ': ['ポ'], 'ポ': ['ボ'],
-        'つ': ['っ'], 'っ': ['つ'],
-        'ヨ': ['ョ'], 'ョ': ['ヨ'],
-        'や': ['ゃ'], 'ゃ': ['や'],
-        'ゆ': ['ゅ'], 'ゅ': ['ゆ'],
-        'よ': ['ょ'], 'ょ': ['よ'],
-        'ッ': ['ツ'],
         '元': ['え'],
         '世': ['せ'], 'せ': ['世'],
         '＜': ['く'], '<': ['く'], '《': ['く'],
@@ -4465,6 +4596,145 @@ def _to_simp(word):
     return ''.join(_trad_map.get(c, c) for c in word)
 
 
+# ---- light theme ------------------------------------------------------------
+# The main window's look lives here: one palette, one stylesheet, and the
+# toolbar icons. The icons are drawn as paths instead of emoji glyphs, so all
+# six share one weight and colour and none depends on which symbol fonts a
+# machine happens to have.
+from PyQt5.QtCore import QPointF, QSize
+from PyQt5.QtGui import QPainterPath
+
+THEME = {
+    'bg': '#f6f7f9', 'fg': '#1a1d21', 'muted': '#6b7280', 'line': '#e1e4e8',
+    'input_bg': '#ffffff', 'input_border': '#d0d4da', 'focus': '#2563eb',
+    'icon': '#4b5563', 'icon_off': '#b9bdc5', 'hover': '#e7e9ed',
+    'pressed': '#dbdee3', 'accent': '#2563eb', 'danger_bg': '#fde8e8',
+    'border': '#c4c8ce',
+}
+
+
+# menus: a light hover instead of the dark #444 bar
+MENU_HOVER = ("QMenu::item:selected { background-color: %s; color: %s; }"
+              % (THEME['hover'], THEME['fg']))
+
+
+def _theme_path(kind):
+    """Icon outline on a 24x24 grid; theme_pixmap() strokes it."""
+    p = QPainterPath()
+    if kind == 'search':
+        p.addEllipse(QPointF(10.5, 10.5), 6.5, 6.5)
+        p.moveTo(15.4, 15.4); p.lineTo(20.5, 20.5)
+    elif kind == 'save':                      # outline floppy
+        p.moveTo(5, 3.5); p.lineTo(15.5, 3.5); p.lineTo(20.5, 8.5)
+        p.lineTo(20.5, 18.5); p.quadTo(20.5, 20.5, 18.5, 20.5)
+        p.lineTo(5.5, 20.5); p.quadTo(3.5, 20.5, 3.5, 18.5)
+        p.lineTo(3.5, 5.5); p.quadTo(3.5, 3.5, 5.5, 3.5)
+        p.moveTo(7.5, 20.5); p.lineTo(7.5, 13.5); p.lineTo(16.5, 13.5)
+        p.lineTo(16.5, 20.5)
+        p.moveTo(7.5, 3.5); p.lineTo(7.5, 7.5); p.lineTo(13.5, 7.5)
+    elif kind == 'trash':
+        p.moveTo(3.5, 6.5); p.lineTo(20.5, 6.5)
+        p.moveTo(8.5, 6.5); p.lineTo(8.5, 4.5); p.quadTo(8.5, 3.5, 9.5, 3.5)
+        p.lineTo(14.5, 3.5); p.quadTo(15.5, 3.5, 15.5, 4.5); p.lineTo(15.5, 6.5)
+        p.moveTo(5.5, 6.5); p.lineTo(6.5, 19); p.quadTo(6.7, 20.5, 8.2, 20.5)
+        p.lineTo(15.8, 20.5); p.quadTo(17.3, 20.5, 17.5, 19); p.lineTo(18.5, 6.5)
+        p.moveTo(10, 10.5); p.lineTo(10, 16.5)
+        p.moveTo(14, 10.5); p.lineTo(14, 16.5)
+    elif kind == 'gear':
+        pts = []
+        for i in range(8):
+            a = math.radians(i * 45 + 22.5)
+            for da, r in ((-15, 7.4), (-8.5, 10), (8.5, 10), (15, 7.4)):
+                t = a + math.radians(da)
+                pts.append(QPointF(12 + r * math.cos(t), 12 + r * math.sin(t)))
+        p.moveTo(pts[0])
+        for q in pts[1:]:
+            p.lineTo(q)
+        p.closeSubpath()
+        p.addEllipse(QPointF(12, 12), 3, 3)
+    elif kind == 'history':                   # clock with a turn-back arrow
+        p.arcMoveTo(3.5, 3.5, 17, 17, 180); p.arcTo(3.5, 3.5, 17, 17, 180, 300)
+        p.moveTo(3.5, 4.5); p.lineTo(3.5, 9); p.lineTo(8, 9)
+        p.moveTo(12, 7.5); p.lineTo(12, 12); p.lineTo(15, 14)
+    elif kind == 'minimize':
+        p.moveTo(6, 12.5); p.lineTo(18, 12.5)
+    elif kind == 'chevron':
+        p.moveTo(7, 10); p.lineTo(12, 15); p.lineTo(17, 10)
+    elif kind == 'chev_left':                 # same angle as the chevron above
+        p.moveTo(15, 6); p.lineTo(9, 12); p.lineTo(15, 18)
+    elif kind == 'chev_right':
+        p.moveTo(9, 6); p.lineTo(15, 12); p.lineTo(9, 18)
+    return p
+
+
+def theme_pixmap(kind, color, px, stroke=1.8):
+    dpr = QApplication.instance().devicePixelRatio()
+    pm = QPixmap(round(px * dpr), round(px * dpr))
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.scale(px / 24.0, px / 24.0)
+    pen = QPen(QColor(color))
+    pen.setWidthF(stroke * 1.2)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(_theme_path(kind))
+    p.end()
+    return pm
+
+
+def theme_icon(kind, color, color_off, px):
+    """Normal and Disabled pixmaps: setEnabled() alone greys a button."""
+    ic = QIcon()
+    ic.addPixmap(theme_pixmap(kind, color, px), QIcon.Normal)
+    ic.addPixmap(theme_pixmap(kind, color_off, px), QIcon.Disabled)
+    return ic
+
+
+def _theme_chevron():
+    """QSS takes the combo-box arrow only from a file, so draw it once into
+    the config folder (named by colour, so a palette change redraws it)."""
+    f = os.path.join(os.path.dirname(config_path),
+                     'chevron_%s.png' % THEME['muted'].strip('#'))
+    if not os.path.exists(f):
+        theme_pixmap('chevron', THEME['muted'], 32, stroke=2.2).save(f)
+    return f.replace('\\', '/')
+
+
+def theme_qss():
+    c = THEME
+    return f"""
+QWidget {{ background-color: {c['bg']}; color: {c['fg']}; }}
+QWidget#central {{ border: 1px solid {c['border']}; }}
+QWidget#titlebar {{ border-bottom: 1px solid {c['line']}; }}
+QToolButton#tb {{ border: none; background: transparent; }}
+QToolButton#tb:hover {{ background: {c['hover']}; }}
+QToolButton#tb:checked, QToolButton#tb:pressed {{ background: {c['pressed']}; }}
+QToolButton#tb::menu-indicator {{ image: none; width: 0px; }}
+QLineEdit#word {{ background: {c['input_bg']}; border: 1px solid {c['input_border']};
+    border-radius: 6px; padding: 0 8px;
+    selection-background-color: {c['accent']}; selection-color: #ffffff; }}
+QLineEdit#word:focus {{ border: 1px solid {c['focus']}; }}
+QToolButton#act, QToolButton#danger {{ border: none; border-radius: 6px; background: transparent; }}
+QToolButton#act:hover {{ background: {c['hover']}; }}
+QToolButton#danger:hover {{ background: {c['danger_bg']}; }}
+QLabel#pagenum {{ color: {c['muted']}; }}
+QToolButton#act:pressed, QToolButton#act:checked,
+QToolButton#danger:pressed, QToolButton#danger:checked {{ background: {c['pressed']}; }}
+QComboBox, QPushButton {{ background: {c['input_bg']}; border: 1px solid {c['input_border']};
+    border-radius: 6px; padding: 3px 8px; }}
+QComboBox:hover, QPushButton:hover {{ border: 1px solid {c['focus']}; }}
+QPushButton:checked {{ border: 1px solid {c['focus']}; color: {c['focus']}; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox::down-arrow {{ image: url({_theme_chevron()}); width: 12px; height: 12px; }}
+QComboBox QAbstractItemView {{ background: {c['input_bg']}; border: 1px solid {c['input_border']};
+    selection-background-color: {c['accent']}; selection-color: #ffffff; outline: 0; }}
+"""
+
+
 class DraggableTitleBar(QWidget):
 
     def __init__(self, parent=None):
@@ -4553,21 +4823,26 @@ def set_qt_layout():
 
     # test also need warm up
     central = QWidget()
+    central.setObjectName('central')    # theme_qss() draws the window border on it
     window.setCentralWidget(central)
     window.setWindowTitle('ACard')
 
     layout = QVBoxLayout(central)
-    layout.setContentsMargins(0, 0, 0, 0)
+    # 1 px all round keeps the children off the border, which they would
+    # paint over otherwise; resize_window_height() counts these 2 px
+    layout.setContentsMargins(1, 1, 1, 1)
     layout.setSpacing(0)
     layout.setAlignment(Qt.AlignTop)
 
     title_widget = DraggableTitleBar(central)
-    title_widget.setStyleSheet("background-color: #2b2b2b;")
+    title_widget.setObjectName('titlebar')
     layout.addWidget(title_widget)
 
     title_margin = max(8, int(screen_h * 0.009))
     title_bar = QHBoxLayout(title_widget)
-    title_bar.setContentsMargins(title_margin, 0, 0, 0)
+    # 1 px at the bottom keeps the label and buttons off the border row:
+    # the label's background would paint over the line otherwise
+    title_bar.setContentsMargins(title_margin, 0, 0, 1)
     title_bar.setSpacing(0)
 
     title_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -4575,40 +4850,36 @@ def set_qt_layout():
         lambda pos: show_title_menu(title_widget.mapToGlobal(pos)))
 
 
-    btn_style = "QToolButton { border: none; color: white; } QToolButton:hover { background-color: #444; } QToolButton:checked { background-color: #666; }"
-    close_style = "QToolButton { border: none; color: white; } QToolButton:hover { background-color: #e81123; }"
-
     window.label_title = QLabel("ACard", title_widget)
     window.label_title.setFont(QFont("Microsoft YaHei", font_size_title))
-    window.label_title.setStyleSheet("color: #ffffff;")
     title_bar.addWidget(window.label_title)
     title_bar.addStretch()
 
-    window.settings_btn = QToolButton(title_widget)
-    window.settings_btn.setText('⚙')
-    window.settings_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
-    window.settings_btn.setStyleSheet(btn_style)
+    # line icons at one fixed size; colours and hover come from theme_qss()
+    tb_icon = max(16, int(bar_height * 0.56))
+
+    def title_button(kind):
+        b = QToolButton(title_widget)
+        b.setObjectName('tb')
+        b.setIcon(theme_icon(kind, THEME['icon'], THEME['icon_off'], tb_icon))
+        b.setIconSize(QSize(tb_icon, tb_icon))
+        b.setFixedSize(bar_height + 10, bar_height)
+        title_bar.addWidget(b)
+        return b
+
+    window.settings_btn = title_button('gear')
     window.settings_btn.clicked.connect(toggle_settings)
     window.settings_btn.setCheckable(True)
-    title_bar.addWidget(window.settings_btn)
 
-    window.history_btn = QToolButton(title_widget)
-    window.history_btn.setText('🕘')
-    window.history_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    window.history_btn = title_button('history')
     window.history_btn.setPopupMode(QToolButton.InstantPopup)
-    window.history_btn.setStyleSheet(btn_style)
     window.history_menu = QMenu(window)
     window.history_menu.setFont(QFont('Segoe UI Symbol', font_size_btn))
     window.history_menu.aboutToShow.connect(refresh_history_menu)
     window.history_btn.setMenu(window.history_menu)
-    title_bar.addWidget(window.history_btn)
 
-    window.close_btn = QToolButton(title_widget)
-    window.close_btn.setText('🗕')
-    window.close_btn.setFont(QFont('Segoe MDL2 Assets', font_size_btn))
+    window.close_btn = title_button('minimize')
     window.close_btn.clicked.connect(window.hide)
-    window.close_btn.setStyleSheet(btn_style)
-    title_bar.addWidget(window.close_btn)
 
     window.stack = QStackedWidget(central)
     layout.addWidget(window.stack)
@@ -4620,11 +4891,20 @@ def set_qt_layout():
     main_layout.setContentsMargins(10, 0, 10, 0)
     main_layout.setSpacing(0)
 
+    # search row: the input and the buttons share one fixed height so they
+    # line up - each used to size itself to its own glyph, a few px apart
+    row_h = bar_height + 4
     row = QHBoxLayout()
+    row.setContentsMargins(0, 8, 0, 6)
+    row.setSpacing(4)
     main_layout.addLayout(row)
+    window.search_row = row          # resize_window_height() measures it
 
     window.word = QLineEdit(central)
-    window.word.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    window.word.setObjectName('word')
+    window.word.setFixedHeight(row_h)
+    window.word.setFont(QFont('Microsoft YaHei UI',
+                              max(13, round(font_size_btn * 0.85))))
     window.word.setContextMenuPolicy(Qt.CustomContextMenu)
     window.word.customContextMenuRequested.connect(
         lambda pos: show_custom_context_menu(window.word, pos, font_size_small
@@ -4663,25 +4943,28 @@ def set_qt_layout():
 
     window.word.focusOutEvent = word_focus_out
 
-    window.search_btn = QToolButton(window)
-    window.search_btn.setText('🔍')
-    window.search_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    row.addSpacing(2)                # input -> buttons: 2 + spacing 4
+    row_icon = int(row_h * 0.56)
+
+    def row_button(kind, obj, color):
+        b = QToolButton(window)
+        b.setObjectName(obj)
+        b.setIcon(theme_icon(kind, color, THEME['icon_off'], row_icon))
+        b.setIconSize(QSize(row_icon, row_icon))
+        b.setFixedSize(row_h, row_h)
+        row.addWidget(b)
+        return b
+
+    window.search_btn = row_button('search', 'act', THEME['icon'])
     window.search_btn.clicked.connect(refresh_word)
     window.word.returnPressed.connect(window.search_btn.animateClick)
-    row.addWidget(window.search_btn)
 
-    window.save_btn = QToolButton(window)
-    window.save_btn.setText('💾')
-    window.save_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    window.save_btn = row_button('save', 'act', THEME['accent'])
     window.save_btn.clicked.connect(save_word_qt_to_anki)
-    row.addWidget(window.save_btn)
 
-    window.delete_btn = QToolButton(window)
-    window.delete_btn.setText('✖')
-    window.delete_btn.setFont(QFont('Segoe UI Symbol', font_size_btn))
+    window.delete_btn = row_button('trash', 'danger', THEME['icon'])
     window.delete_btn.clicked.connect(anki_delete_note)
     window.delete_btn.setCheckable(True)
-    row.addWidget(window.delete_btn)
 
     set_btn_status(False)
 
@@ -4843,27 +5126,40 @@ def set_qt_layout():
     window.label_screenshot.enterEvent = _pic_enter
     window.label_screenshot.mouseMoveEvent = _pic_move
     window.label_screenshot.leaveEvent = _pic_leave
-    # page nav under the image: only visible for multi-capture notes
+    # page nav under the image: only visible for multi-capture notes. Line
+    # chevrons and the hover/press look of the row buttons ('act'); the
+    # pressed look also shows a flip waiting for its round (setDown)
     window.page_nav = QWidget(central)
     _nav_lay = QHBoxLayout(window.page_nav)
-    _nav_lay.setContentsMargins(0, 2, 0, 2)
-    _nav_lay.setSpacing(18)
+    _nav_lay.setContentsMargins(0, 4, 0, 4)
+    _nav_lay.setSpacing(6)
     _nav_lay.addStretch(1)
-    window.page_prev_btn = QToolButton(window.page_nav)
-    window.page_prev_btn.setText('◀')
-    window.page_prev_btn.setFont(QFont('Segoe UI Symbol', int(font_size_btn/2)))
-    window.page_prev_btn.setAutoRaise(True)
-    window.page_prev_btn.clicked.connect(lambda: qt_play_pages(-1, False))
-    _nav_lay.addWidget(window.page_prev_btn)
+    nav_h = int(bar_height * 0.8)
+    nav_icon = int(nav_h * 0.64)
+
+    def nav_button(kind, delta):
+        b = QToolButton(window.page_nav)
+        b.setObjectName('act')
+        b.setIcon(theme_icon(kind, THEME['icon'], THEME['icon_off'], nav_icon))
+        b.setIconSize(QSize(nav_icon, nav_icon))
+        b.setFixedSize(nav_h, nav_h)
+        b.clicked.connect(lambda: qt_play_pages(delta, False))
+        _nav_lay.addWidget(b)
+        return b
+
+    window.page_prev_btn = nav_button('chev_left', -1)
     window.page_nav_label = QLabel('1/1', window.page_nav)
-    window.page_nav_label.setFont(QFont('Segoe UI Symbol', int(font_size_btn/2)))
+    window.page_nav_label.setObjectName('pagenum')
+    window.page_nav_label.setFont(QFont('Microsoft YaHei UI', font_size_small))
+    window.page_nav_label.setAlignment(Qt.AlignCenter)
+    # a 2 px bottom margin lifts the centred text 1 px: YaHei sets digits a
+    # pixel low against the line icons
+    window.page_nav_label.setContentsMargins(0, 0, 0, 2)
+    # room for two-digit pages, so the arrows never shift while flipping
+    window.page_nav_label.setMinimumWidth(
+        window.page_nav_label.fontMetrics().horizontalAdvance('88/88') + 8)
     _nav_lay.addWidget(window.page_nav_label)
-    window.page_next_btn = QToolButton(window.page_nav)
-    window.page_next_btn.setText('▶')
-    window.page_next_btn.setFont(QFont('Segoe UI Symbol', int(font_size_btn/2)))
-    window.page_next_btn.setAutoRaise(True)
-    window.page_next_btn.clicked.connect(lambda: qt_play_pages(1, False))
-    _nav_lay.addWidget(window.page_next_btn)
+    window.page_next_btn = nav_button('chev_right', 1)
     _nav_lay.addStretch(1)
     main_layout.addWidget(window.page_nav)
     window.page_nav.hide()
@@ -4931,7 +5227,6 @@ def set_qt_layout():
     window.hotkey_btn = QPushButton(hotkey_to_str(config['hotkey']))
     window.hotkey_btn.setFont(font_settings)
     window.hotkey_btn.clicked.connect(start_hotkey_capture)
-    btn_style = "QToolButton { border: none; border-top: 2px solid transparent; color: white; padding-top: 2px; } QToolButton:hover { border-top: 2px solid #888; } QToolButton:checked { border-top: 2px solid white; }"
     window.hotkey_btn.setCheckable(True)
     hotkey_row.addWidget(hotkey_label)
     hotkey_row.addWidget(window.hotkey_btn)
@@ -5014,19 +5309,20 @@ def set_qt_layout():
         row.insertStretch(1)   # spring after the label: controls hug the right edge
 
 
+_ACC = THEME['accent']
 _RESULT_STYLE_RO = {
-    QLineEdit: "QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 1px; selection-background-color: #3399ff; selection-color: white; }",
-    QTextEdit: "QTextEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; selection-background-color: #3399ff; selection-color: white; }",
+    QLineEdit: "QLineEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 1px; selection-background-color: %s; selection-color: white; }" % _ACC,
+    QTextEdit: "QTextEdit { background: transparent; border: 1px solid transparent; border-radius: 4px; selection-background-color: %s; selection-color: white; }" % _ACC,
 }
 _RESULT_STYLE_EDIT = {
-    QLineEdit: _RESULT_STYLE_RO[QLineEdit] + "QLineEdit:focus { background: #ffffff; border: 1px solid #3399ff; }",
-    QTextEdit: _RESULT_STYLE_RO[QTextEdit] + "QTextEdit:focus { background: #ffffff; border: 1px solid #3399ff; }",
+    QLineEdit: _RESULT_STYLE_RO[QLineEdit] + "QLineEdit:focus { background: #ffffff; border: 1px solid %s; }" % _ACC,
+    QTextEdit: _RESULT_STYLE_RO[QTextEdit] + "QTextEdit:focus { background: #ffffff; border: 1px solid %s; }" % _ACC,
 }
 
 
 # fuzzy box keeps its separator line and own text color in both states
-_FUZZY_STYLE_RO = "QTextEdit { background: transparent; border: none; margin-top: 4px; color: #333333; selection-background-color: #3399ff; selection-color: white; }"
-_FUZZY_STYLE_EDIT = _FUZZY_STYLE_RO + "QTextEdit:focus { background: #ffffff; border: 1px solid #3399ff; border-radius: 4px; }"
+_FUZZY_STYLE_RO = "QTextEdit { background: transparent; border: none; margin-top: 4px; color: #333333; selection-background-color: %s; selection-color: white; }" % _ACC
+_FUZZY_STYLE_EDIT = _FUZZY_STYLE_RO + "QTextEdit:focus { background: #ffffff; border: 1px solid %s; border-radius: 4px; }" % _ACC
 
 
 def set_result_editable(editable):
@@ -5063,21 +5359,13 @@ def update_save_btn_state(*_):
     changed = (window.anki_id is not None
                and (getattr(window, '_saved_fields', None) != current_fields()
                     or bool(getattr(window, '_qt_pending_del', None))))
-    window.save_btn.setEnabled(changed)
-    window.save_btn.setStyleSheet('' if changed else 'color: grey;')
+    window.save_btn.setEnabled(changed)   # the icon carries its own grey
 
 
 def set_btn_status(enabled):
-    if enabled:
-        window.search_btn.setStyleSheet('')
-        window.search_btn.setEnabled(True)
-        window.delete_btn.setStyleSheet('')
-        window.delete_btn.setEnabled(True)
-    else:
-        window.search_btn.setStyleSheet('color: grey;')
-        window.search_btn.setEnabled(False)
-        window.delete_btn.setStyleSheet('color: grey;')
-        window.delete_btn.setEnabled(False)
+    # the icons carry their own disabled (grey) look
+    window.search_btn.setEnabled(enabled)
+    window.delete_btn.setEnabled(enabled)
 
 
 def on_pick_anki():
@@ -5133,9 +5421,6 @@ class AudioPlayback:
     def set_end_bytes(self, end_byte):
         """end_byte: PCM byte offset from clip start (frame-aligned here)."""
         self._end_frame = int(end_byte) // self.frame_bytes
-
-    def stop_now(self):
-        self._end_frame = -1
 
     def abort(self):
         # hard stop, only for "a new playback replaces this one"
@@ -5211,9 +5496,6 @@ class AudioPlayback:
             pos += n
             if stop_after:
                 break
-
-    def play(self, start_sec):
-        self._play_from(max(0, min(int(start_sec * self.rate), self.total - 1)))
 
     def play_bytes(self, start_byte):
         f = int(start_byte) // self.frame_bytes
@@ -5502,15 +5784,6 @@ def hotkey_to_str(hk_list):
         return f"{mods}+{display_key}" if mods else display_key
 
 
-def str_to_key(key_str):
-    if key_str.startswith('Key.'):
-        return keyboard.Key[key_str.replace('Key.', '')]
-    elif key_str.isdigit():
-        return keyboard.KeyCode(vk=int(key_str))
-    else:
-        return keyboard.KeyCode.from_char(key_str)
-
-
 def start_hotkey_capture():
     global hotkey_mode
     if hotkey_mode == 0:  # currently capturing, cancel
@@ -5567,8 +5840,7 @@ def show_custom_context_menu(widget, pos, font_size):
     menu = QMenu(widget)
     menu.setFont(QFont("Microsoft YaHei", font_size))
     menu.setStyleSheet(
-        "QMenu::item:selected { background-color: #444; color: white; }"
-        "QMenu::item:disabled { color: #bbb; }")
+        MENU_HOVER + "QMenu::item:disabled { color: #bbb; }")
 
     cut = menu.addAction(ui('cut'))
     copy = menu.addAction(ui('copy'))
@@ -5603,19 +5875,6 @@ def show_custom_context_menu(widget, pos, font_size):
     search.setEnabled(has_sel)
 
 
-    menu.exec_(widget.mapToGlobal(pos))
-
-
-def show_copy_context_menu(widget, pos, font_size):
-    selected = widget.selectedText()
-    if not selected:
-        return
-    menu = QMenu(widget)
-    menu.setFont(QFont("Microsoft YaHei", font_size))
-    menu.setStyleSheet(
-        "QMenu::item:selected { background-color: #444; color: white; }")
-    copy = menu.addAction(ui('copy'))
-    copy.triggered.connect(lambda: QApplication.clipboard().setText(selected))
     menu.exec_(widget.mapToGlobal(pos))
 
 
@@ -5724,19 +5983,21 @@ def _log_processing_timeout(event, waited):
 
 
 def check_processing(event):
+    # waits until 5 s after the round's OCR, not 5 s from now: a round still
+    # busy by then is stuck. The deadline is absolute, so a hotkey press run
+    # inside processEvents() below no longer stacks a wait of its own on top
     t0 = time.time()
-    for i in range(100):
-        if event.is_set():
+    while not event.is_set():
+        if time.time() >= _ocr_done_at + 5:
+            try:
+                _log_processing_timeout(event, time.time() - t0)
+            except Exception as e:      # a debug dump must never break a round
+                print('time out in waiting for processing (dump failed: %r)' % e)
             break
-        else:
-            QApplication.processEvents()
-            time.sleep(0.05)
-            window._toast = Toast(ui('processing'), duration=2000)
-    else:
-        try:
-            _log_processing_timeout(event, time.time() - t0)
-        except Exception as e:      # a debug dump must never break a round
-            print('time out in waiting for processing (dump failed: %r)' % e)
+        BusyBox.show()      # once; it stays put instead of following the mouse
+        QApplication.processEvents()
+        time.sleep(0.05)
+    BusyBox.hide()
     if hasattr(window, '_toast') and window._toast:
         window._toast.dismiss()
         window._toast = None
@@ -6051,276 +6312,6 @@ def analyze_audio_trim(frame_duration_ms, rms, rms_moving_average, start_byte, s
     return audio_bytes[
         trim_start_bytes:
         trim_end_bytes], play_start_time, play_end_time, trim_start_bytes
-
-def analyze_audio(audio_bytes, audio_start_time, rms, rms_moving_average,
-                  frame_duration_ms, snip_index_in_sentences,
-                  subtitle_sentences):
-    return
-    subtitle_start_time = 0
-    subtitle_end_time = 0
-
-    # get start and end from subtitle
-    subtitle_diff_min = 0.04
-    subtitle_diff_ideal = 0.15
-
-    subtitle_start_quality = 0
-    subtitle_diff_left = 1
-    subtitle_diff_triggered = False
-    for i in range(snip_index_in_sentences, -1, -1):
-        if subtitle_sentences[i][3] == -1:
-            if subtitle_sentences[i][0] < subtitle_diff_ideal or (
-                    subtitle_sentences[i][1] < subtitle_diff_ideal
-                    and not subtitle_diff_triggered):
-                matched = True
-            else:
-                matched = False
-        elif subtitle_sentences[i][3] == 0:
-            matched = False
-        elif subtitle_sentences[i][3] == 1:
-            matched = True
-        if matched:
-            subtitle_start_time = subtitle_sentences[i][2]
-        else:
-            subtitle_diff_left -= 1
-            subtitle_diff_triggered = True
-            if subtitle_diff_left <= 0:
-                subtitle_start_quality = min(
-                    (subtitle_sentences[i][0] - subtitle_diff_min) /
-                    (subtitle_diff_ideal - subtitle_diff_min), 1)
-                break
-
-    subtitle_end_quality = 0
-    subtitle_diff_left = 1
-    subtitle_diff_triggered = False
-    for i in range(snip_index_in_sentences, len(subtitle_sentences)):
-        if subtitle_sentences[i][3] == -1:
-            if subtitle_sentences[i][0] < subtitle_diff_ideal or (
-                    subtitle_sentences[i][1] < subtitle_diff_ideal
-                    and not subtitle_diff_triggered):
-                matched = True
-            else:
-                matched = False
-        elif subtitle_sentences[i][3] == 0:
-            matched = False
-        elif subtitle_sentences[i][3] == 1:
-            matched = True
-        if matched:
-            subtitle_end_time = subtitle_sentences[i][2]
-        else:
-            subtitle_diff_left -= 1
-            subtitle_diff_triggered = True
-            if subtitle_diff_left <= 0:
-                subtitle_end_quality = min(
-                    (subtitle_sentences[i][0] - subtitle_diff_min) /
-                    (subtitle_diff_ideal - subtitle_diff_min), 1)
-                break
-
-    for i in range(len(play_log)):
-        s = play_log[i][0]
-        e = play_log[i][1]
-        if e < subtitle_start_time or subtitle_end_time < s:
-            pass
-        elif s < subtitle_start_time and subtitle_end_time < e:
-            subtitle_end_time = subtitle_start_time
-        elif s < subtitle_start_time and e < subtitle_end_time:
-            subtitle_start_time = e
-        elif subtitle_start_time < s and subtitle_end_time < e:
-            subtitle_end_time = s
-        elif subtitle_start_time < s and e < subtitle_end_time:
-            seg_a = s - subtitle_start_time
-            seg_b = subtitle_end_time - e
-            if seg_a * 2 < seg_b:  # normally take before, if too short, take after
-                subtitle_start_time = e
-            else:
-                subtitle_end_time = s
-
-    print(f"audio_start_time={audio_start_time:.3f}")
-    print(f"subtitle_start_time={subtitle_start_time:.3f}")
-    print(f"subtitle_end_time={subtitle_end_time:.3f}")
-    print(f"len(rms)={len(rms)}")
-    print(
-        f"rms covers until={audio_start_time + len(rms) * frame_duration_ms / 1000:.3f}"
-    )
-
-    # change to frame
-    length_rms = len(rms)
-    subtitle_start_frame = time_to_audio_frame(audio_start_time,
-                                               frame_duration_ms, length_rms,
-                                               subtitle_start_time)
-    subtitle_end_frame = time_to_audio_frame(audio_start_time,
-                                             frame_duration_ms, length_rms,
-                                             subtitle_end_time)
-
-    # shift start and end to middle to find first letter
-    one_letter_audio_ms = 100
-    letter_audio_frame_target = one_letter_audio_ms // frame_duration_ms
-    letter_audio_frame_now = 0
-    for i in range(subtitle_start_frame, len(rms)):
-        if rms[i] > 0.005:
-            letter_audio_frame_now += 1
-        else:
-            letter_audio_frame_now -= 2
-            letter_audio_frame_now = max(letter_audio_frame_now, 0)
-        if letter_audio_frame_now >= letter_audio_frame_target:
-            subtitle_start_frame_to_right = i
-            break
-    else:
-        subtitle_start_frame_to_right = subtitle_start_frame
-    letter_audio_frame_now = 0
-    for i in range(subtitle_end_frame, -1, -1):
-        if rms[i] > 0.005:
-            letter_audio_frame_now += 1
-        else:
-            letter_audio_frame_now -= 2
-            letter_audio_frame_now = max(letter_audio_frame_now, 0)
-        if letter_audio_frame_now >= letter_audio_frame_target:
-            subtitle_end_frame_to_left = i
-            break
-    else:
-        subtitle_end_frame_to_left = subtitle_end_frame
-
-    # check if abnormal number
-    if subtitle_start_frame_to_right > subtitle_end_frame_to_left:
-        subtitle_start_frame_to_right = subtitle_start_frame
-        subtitle_end_frame_to_left = subtitle_end_frame
-
-    # shift start and end to side to find blank
-    blank_audio_ms_start = 200 - subtitle_start_quality * 100
-    blank_frame_target_start = blank_audio_ms_start // frame_duration_ms
-    blank_frame_now = 0
-    for i in range(subtitle_start_frame_to_right, -1, -1):
-        if rms[i] < 0.01 or rms[i] < rms_moving_average[i]:
-            blank_frame_now += 1
-        else:
-            blank_frame_now -= 2
-            blank_frame_now = max(blank_frame_now, 0)
-        if blank_frame_now >= blank_frame_target_start:
-            subtitle_start_frame_to_right_to_left = i
-            break
-    else:
-        subtitle_start_frame_to_right_to_left = 0
-    blank_audio_ms_end = 200 - subtitle_end_quality * 100
-    blank_frame_target_end = blank_audio_ms_end // frame_duration_ms
-    blank_frame_now = 0
-    for i in range(subtitle_end_frame_to_left, len(rms)):
-        if rms[i] < 0.01 or rms[i] < rms_moving_average[i]:
-            blank_frame_now += 1
-        else:
-            blank_frame_now -= 2
-            blank_frame_now = max(blank_frame_now, 0)
-        if blank_frame_now >= blank_frame_target_end:
-            subtitle_end_frame_to_left_to_right = i
-            break
-    else:
-        subtitle_end_frame_to_left_to_right = len(rms) - 1
-
-    # test need delete
-    debug_frames = (
-        subtitle_start_time,
-        subtitle_end_time,
-        subtitle_start_frame,
-        subtitle_end_frame,
-        subtitle_start_frame_to_right,
-        subtitle_end_frame_to_left,
-        subtitle_start_frame_to_right_to_left,
-        subtitle_end_frame_to_left_to_right,
-    )
-
-    subtitle_start_frame_to_right_to_left, search_ms = check_blank_frame(subtitle_start_frame_to_right_to_left,-200,rms,rms_moving_average,frame_duration_ms,0)
-    play_start_bytes = int(subtitle_start_frame_to_right_to_left *
-                           frame_duration_ms * recorder.BYTES_PER_SEC / 1000)
-    play_start_bytes = snap_to_min_energy(audio_bytes, play_start_bytes,
-                                        recorder.BYTES_PER_SAMPLE,
-                                        recorder.BYTES_PER_SEC, search_ms)
-
-    subtitle_end_frame_to_left_to_right, search_ms = check_blank_frame(subtitle_end_frame_to_left_to_right,400,rms,rms_moving_average,frame_duration_ms,0)
-    play_end_bytes = int(subtitle_end_frame_to_left_to_right *
-                         frame_duration_ms * recorder.BYTES_PER_SEC / 1000)
-    play_end_bytes = snap_to_min_energy(audio_bytes, play_end_bytes,
-                                        recorder.BYTES_PER_SAMPLE,
-                                        recorder.BYTES_PER_SEC, search_ms)
-
-    # trim a bigger range compared to play time
-    min_gap_ms = 80
-    min_gap_frame = int(min_gap_ms / frame_duration_ms)
-
-    min_gap_frame_left = min_gap_frame
-    trim_start_frame = -1
-    trim_time_target_before_play_start = 3.5
-    trim_start_frame_total = int(trim_time_target_before_play_start * 1000 /
-                                frame_duration_ms)
-    trim_start_frame_left = trim_start_frame_total
-    for i in range(subtitle_start_frame_to_right_to_left, -1, -1):
-        if rms[i] > 0.015:
-            min_gap_frame_left = min_gap_frame
-        else:
-            min_gap_frame_left -= 1
-        if min_gap_frame_left < 0:
-            trim_start_frame_left -= 1
-            overshoot = abs(i - subtitle_start_frame_to_right_to_left) - trim_start_frame_total
-            if overshoot > 0:
-                # Decay faster the further we overshoot the target window
-                trim_start_frame_left -= 3 + overshoot // 10
-        if trim_start_frame_left <= 0:
-            trim_start_frame = i
-            break
-
-    min_gap_frame_left = min_gap_frame
-    trim_end_frame = -1
-    trim_time_target_after_play_end = 3
-    trim_end_frame_total = int(trim_time_target_after_play_end * 1000 /
-                              frame_duration_ms)
-    trim_end_frame_left = trim_end_frame_total
-    for i in range(subtitle_end_frame_to_left_to_right, len(rms)):
-        if rms[i] > 0.015:
-            min_gap_frame_left = min_gap_frame
-        else:
-            min_gap_frame_left -= 1
-        if min_gap_frame_left < 0:
-            trim_end_frame_left -= 1
-            if abs(i - subtitle_end_frame_to_left_to_right) > trim_end_frame_total:
-                trim_end_frame_left -= 2
-        if trim_end_frame_left <= 0:
-            trim_end_frame = i
-            break
-
-    if trim_start_frame == -1:
-        trim_start_bytes = play_start_bytes
-    else:
-        trim_start_frame, search_ms = check_blank_frame(trim_start_frame,-2000,rms,rms_moving_average,frame_duration_ms,0.01)
-        trim_start_frame = min(trim_start_frame, subtitle_start_frame_to_right_to_left)
-        trim_start_bytes = int(trim_start_frame * frame_duration_ms *
-                               recorder.BYTES_PER_SEC / 1000)
-        trim_start_bytes = snap_to_min_energy(audio_bytes, trim_start_bytes,
-                                              recorder.BYTES_PER_SAMPLE,
-                                              recorder.BYTES_PER_SEC, search_ms)
-
-    if trim_end_frame == -1:
-        trim_end_bytes = play_end_bytes
-    else:
-        trim_end_frame, search_ms = check_blank_frame(trim_end_frame,1000,rms,rms_moving_average,frame_duration_ms,0.01)
-        trim_end_frame = max(trim_end_frame,subtitle_end_frame_to_left_to_right)
-        trim_end_bytes = int(trim_end_frame * frame_duration_ms *
-                             recorder.BYTES_PER_SEC / 1000)
-        trim_end_bytes = snap_to_min_energy(audio_bytes, trim_end_bytes,
-                                            recorder.BYTES_PER_SAMPLE,
-                                            recorder.BYTES_PER_SEC, search_ms)
-
-    if trim_start_bytes == trim_end_bytes:
-        trim_start_bytes = 0
-        trim_end_bytes = len(audio_bytes) - 1
-
-    play_start_bytes_remove_blank = play_start_bytes - trim_start_bytes
-    play_end_bytes_remove_blank = play_end_bytes - trim_start_bytes
-
-    play_end_bytes_remove_blank = min(play_end_bytes_remove_blank,trim_end_bytes - trim_start_bytes)
-    
-    play_start_time = max(play_start_bytes_remove_blank / recorder.BYTES_PER_SEC, 0)
-    play_end_time = max(play_end_bytes_remove_blank / recorder.BYTES_PER_SEC, 0)
-
-    return audio_bytes[
-        trim_start_bytes:
-        trim_end_bytes], play_start_time, play_end_time, debug_frames
 
 
 def check_blank_frame(raw_frame,raw_search_ms,rms,rms_moving_average,frame_duration_ms,threshold):
@@ -8744,6 +8735,7 @@ DEFAULT_CONFIG = {
         "key": "a"
     }],
     "playback_hint_left": 10,
+    "tray_hint_left": 10,
     "src_lang": "日本語",
     "dst_lang": default_dst_lang,
     "tip": [
@@ -8796,6 +8788,12 @@ round_anki_id_generated = threading.Event()
 round_audio_analysis_start_time_done = threading.Event()
 round_anki_audio_sent = threading.Event()
 _round_events = (round_display, round_anki_id_generated, round_audio_analysis_start_time_done, round_anki_audio_sent)
+# when the latest round's OCR finished: check_processing() waits at most
+# until 5 s after it
+_ocr_done_at = 0.0
+# OCR in progress (read by the hook threads), and a hotkey pressed during it
+_ocr_running = False
+_hotkey_during_ocr = threading.Event()
 
 # --- merge-by-spell: index of existing notes ---------------------------
 _spell_index = {}          # normalized spell -> oldest unsuspended note id
@@ -8856,7 +8854,6 @@ def _spell_index_boot():
 if config['anki_combine_dup']:
     threading.Thread(target=_spell_index_boot, daemon=True).start()
 
-dummy_uuid = str(uuid.uuid4())
 hotkey_mode = 1  # -1 = ignore all, 0 = config, 1 = main, 2 = in snip
 keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 anki_sync_running = False
@@ -9113,6 +9110,14 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         on_quit()
 
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        # the first few times ACard goes out of sight, say where it went
+        left = config.get('tray_hint_left', 0)
+        if left > 0 and not event.spontaneous():
+            update_config('tray_hint_left', left - 1)
+            TrayHint(ui('tray_hint'))
+
     def _nav_reset(self):
         # let the arrows pop back up (round finished or timed out)
         window.page_prev_btn.setDown(False)
@@ -9233,13 +9238,21 @@ def tray_show(reason):
     if reason == QSystemTrayIcon.Trigger:
         hide_on_click = False   # manual summon: disarm auto-hide until next lookup
         window.show()
+        # they found the tray icon on their own: the minimize hint is
+        # needed less
+        left = config.get('tray_hint_left', 0)
+        if left > 0:
+            update_config('tray_hint_left', max(0, left - 3))
+        if TrayHint._live is not None:
+            TrayHint._live.close()
+
 
 
 print('ver ' + __version__)
 window = MainWindow()
 bridge.anki_new_note_done.connect(anki_new_note_after,Qt.BlockingQueuedConnection)
 window.restore_position()
-window.setStyleSheet("background-color: #f0f0f0; color: #000000;")
+window.setStyleSheet(theme_qss())
 window.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
 window.setWindowOpacity(0.9)
 show_and_exclude_from_capture(window)
