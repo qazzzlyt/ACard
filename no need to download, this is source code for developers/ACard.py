@@ -1,4 +1,4 @@
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, shutil, subprocess, sys
@@ -1421,7 +1421,8 @@ def show_and_exclude_from_capture(window, no_activate=True):
             windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
                                          ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         user32.SetWindowDisplayAffinity(hwnd, 0)
-        user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        
+        user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
 
 
 def frame_interview(fps, cut_target, delete_frame_index):
@@ -2758,7 +2759,7 @@ class TrayHint(QWidget):
         self.move(area.right() - self.width() - 12,
                   area.bottom() - self.height() - 12)
         # excluded before it is ever shown, so no frame can catch it
-        user32.SetWindowDisplayAffinity(int(self.winId()), 0x00000011)
+        user32.SetWindowDisplayAffinity(int(self.winId()), EXCLUDE_FROM_CAPTURE)
         if TrayHint._live is not None:
             TrayHint._live.close()
         TrayHint._live = self
@@ -2794,7 +2795,7 @@ class BusyBox:
         w.setWindowOpacity(0.0)                  # shown blank first, never half-painted
         w.move(QCursor.pos() + QPoint(16, 16))
         hwnd = wintypes.HWND(int(w.winId()))
-        user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+        user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
         w.show()
         user32.UpdateWindow(hwnd)                # painted now, event loop or not
         w.setWindowOpacity(220 / 255)
@@ -3863,7 +3864,7 @@ def refresh_history_menu():
     check_processing(round_anki_id_generated)
     hwnd = int(window.history_menu.winId())
     user32.SetWindowDisplayAffinity(hwnd, 0)
-    user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+    user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
     if anki_list:
         window.history_menu.setStyleSheet(
             MENU_HOVER)
@@ -8706,8 +8707,8 @@ def _cleanup_old_mei():
 
 windll.kernel32.SetProcessWorkingSetSize(windll.kernel32.GetCurrentProcess(),
                                          -1, -1)
-ui_index = get_ui_index()
-if ui_index == 1:
+default_ui_index = get_ui_index()
+if default_ui_index == 1:
     default_dst_lang = "中文"
 else:
     default_dst_lang = "English"
@@ -8722,6 +8723,8 @@ DEFAULT_CONFIG = {
     "anki_new_note_left": 30,
     "anki_sync_note": 20,
     "anki_combine_dup": True,
+    "ui_index": default_ui_index,
+    "exclude_from_capture": True,
     "monitor_index": 1,
     "max_fps": [[5, 8], [10, 4], [120, 2]],
     "min_memory_gb": 0.5,
@@ -8750,6 +8753,7 @@ DEFAULT_CONFIG = {
     "mei_folder": [],
 }
 config_path, config = load_config()
+ui_index = config.get('ui_index', 0)
 repair_config()
 _record_mei_folder()
 threading.Timer(15, _cleanup_old_mei).start()
@@ -8763,7 +8767,7 @@ class AppEventFilter(QObject):
         if isinstance(obj, QMenu) and event.type() == QEvent.Show:
             hwnd = int(obj.winId())
             user32.SetWindowDisplayAffinity(hwnd, 0)
-            user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+            user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
         return False
 
 
@@ -9255,6 +9259,10 @@ window.restore_position()
 window.setStyleSheet(theme_qss())
 window.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
 window.setWindowOpacity(0.9)
+if config['exclude_from_capture']:
+    EXCLUDE_FROM_CAPTURE = 0x00000011
+else:
+    EXCLUDE_FROM_CAPTURE = 0
 show_and_exclude_from_capture(window)
 hide_on_click = False
 set_qt_layout()
