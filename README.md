@@ -24,7 +24,7 @@ This project redistributes several DLL binaries derived from:
 github.com/HIllya51/LunaTranslator/tree/461b74e2e27822d84d548f8c3a4cedfa799ae8c7/src/NativeImpl
 
 Original project:
-HIllya51/LunaTranslator
+github.com/HIllya51/LunaTranslator
 
 License:
 GPLv3
