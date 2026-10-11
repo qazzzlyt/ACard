@@ -21,10 +21,10 @@ https://acard.pages.dev/
 
 This project redistributes several DLL binaries derived from:
 
-https://github.com/HIllya51/LunaTranslator/tree/461b74e2e27822d84d548f8c3a4cedfa799ae8c7/src/NativeImpl
+github.com/HIllya51/LunaTranslator/tree/461b74e2e27822d84d548f8c3a4cedfa799ae8c7/src/NativeImpl
 
 Original project:
-https://github.com/HIllya51/LunaTranslator
+HIllya51/LunaTranslator
 
 License:
 GPLv3
