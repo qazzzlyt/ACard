@@ -1,5 +1,5 @@
 ## Download
-[https://github.com/qazzzlyt/ACard/releases/latest/download/ACard.exe](https://acard.pages.dev/)
+https://acard.pages.dev/
 
 ## Dependencies
 
