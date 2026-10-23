@@ -1,4 +1,4 @@
-__version__ = "0.1.3"
+__version__ = "0.7.0"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, shutil, subprocess, sys
@@ -710,7 +710,7 @@ from pathlib import Path
 import pyaudio
 import numpy as np
 import unicodedata
-from ctypes import wintypes, CDLL, create_unicode_buffer, CFUNCTYPE, WINFUNCTYPE, Structure, WinDLL, windll, byref, cast, POINTER, pointer, cdll, string_at, sizeof, c_char, c_bool, c_char_p, c_float, c_int, c_int32, c_uint64, c_void_p, c_wchar_p, c_long, c_longlong, c_ulong, c_short, c_size_t
+from ctypes import wintypes, CDLL, CFUNCTYPE, WINFUNCTYPE, Structure, WinDLL, windll, byref, cast, POINTER, pointer, cdll, string_at, sizeof, c_char, c_bool, c_char_p, c_float, c_int, c_int32, c_uint64, c_void_p, c_wchar_p, c_long, c_longlong, c_ulong, c_short, c_size_t
 
 
 def get_base():
@@ -1408,6 +1408,37 @@ WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
 
 
+DWMWA_CLOAK = 13
+DWMWA_CLOAKED = 14
+DWM_CLOAKED_APP = 1
+
+
+def dwm_cloak(w, on):
+    # DWM 'cloak': the window stays shown as far as Qt and Win32 know, it is
+    # only kept off the screen. A lookup cloaks the main window so its LAST
+    # word never shows while the next one is still being looked up
+    hwnd = wintypes.HWND(int(w.winId()))
+    v = c_int(0)
+    if not on:
+        windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, byref(v),
+                                            sizeof(v))
+        if not v.value & DWM_CLOAKED_APP:
+            return                      # not cloaked by us: nothing to undo
+        # a window that stayed hidden through the lookup gets its first
+        # paint from an expose event only the event loop delivers, and the
+        # after_display thread starting next competes for the GIL: the loop
+        # can get there 100-200 ms late, after the old picture is uncloaked.
+        # Deliver it here, while the window is still cloaked
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        # the new content was painted just now: let DWM take it in first,
+        # or the uncloak can still show one frame of the old content
+        windll.gdi32.GdiFlush()
+        windll.dwmapi.DwmFlush()
+    v.value = 1 if on else 0
+    windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, byref(v),
+                                        sizeof(v))
+
+
 def show_and_exclude_from_capture(window, no_activate=True):
     user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
     user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
@@ -1421,8 +1452,11 @@ def show_and_exclude_from_capture(window, no_activate=True):
             windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
                                          ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         user32.SetWindowDisplayAffinity(hwnd, 0)
-        
+
         user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
+    # new content is painted by now (refresh_window, or show() itself for
+    # this layered window): a lookup's cloak comes off here, see _do_snip
+    dwm_cloak(window, False)
 
 
 def frame_interview(fps, cut_target, delete_frame_index):
@@ -1851,6 +1885,7 @@ class Snip(QWidget):
             self._starting = False
         hotkey_mode = 2
         _snip_open_close_time = time.time()
+        anki_sync_cancel()      # user first: ACard's own sync gives way
         if config['anki_combine_dup']:
             # refresh the note index for THIS round; anki add/merge joins
             # this thread first (a stale index degrades to a plain add)
@@ -2243,6 +2278,10 @@ class Snip(QWidget):
         click_time = time.time()
         audio_bytes, audio_start_time, audio_end_time = recorder.capture_last(
             self.snip_time, click_time)  # test need move to thread
+        # the main window may still be up with the LAST word: closing the
+        # snip would show it until OCR and the dictionary are done. Keep it
+        # cloaked until the new word is painted (uncloaked when shown)
+        dwm_cloak(window, True)
         self.close_snip(True)
         print('lock_length ' + str(lock_length - 1) + ' slider value ' +
               str(self.slider.value()))  # text
@@ -2261,6 +2300,9 @@ class Snip(QWidget):
                 audio_end_time)  # test need better thread arrangement
         finally:
             self._in_lookup = False
+            # no word found (the window is not re-shown) or an error: bring
+            # the window back as it was
+            dwm_cloak(window, False)
 
 
 def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
@@ -2427,9 +2469,12 @@ def after_display(word_info, word, points, audio_bytes, snip_index,
         threading.Thread(target=process_audio,args=(audio_bytes,audio_start_time, points, snip_index, audio_end_time, rect, word, anki_new_note_time_stamp,anki_new_note_thread,word_info.get('spell') or word),daemon=True,).start()
     else:
         anki_new_note_thread.join()
-        qt_note_pages_ready(anki_new_note_time_stamp)
+        preload = qt_note_pages_ready(anki_new_note_time_stamp)
         screenshot_logout()
         round_finish_all()
+        # a round without audio is over here: its sync try, after the preload
+        threading.Thread(target=anki_sync, kwargs={'after': preload},
+                         daemon=True).start()
 
 
 # Per-capture debug dump: a timestamped folder under Downloads\acard with
@@ -2540,6 +2585,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
     round_anki_id_generated.wait(timeout=5)
     anki_id_processed = None
     _mp3_name = ''   # stays empty when this round writes no mp3
+    preload = None   # the round's media preload thread, if it starts one
     anki_last_new_note_snapshot = anki_last_new_note  # avoid anki_last_new_note changed during matching
     if anki_new_note_time_stamp == anki_last_new_note_snapshot[0]:
         anki_id_processed = int(anki_last_new_note_snapshot[1])
@@ -2589,7 +2635,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                 # fresh note, previous captures for a merge target
                 old_audio = ''
                 old_shot = ''
-                r = invoke('notesInfo', notes=[int(anki_id_processed)])
+                r = invoke_retry('notesInfo', notes=[int(anki_id_processed)])
                 if r and not r.get('error') and r.get('result') \
                         and r['result'][0].get('fields'):
                     old_audio = r['result'][0]['fields']['audio']['value']
@@ -2599,7 +2645,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                     print('process_audio: old audio read FAILED:',
                           r and r.get('error'))
                 fields['audio'] = new_tag + old_audio
-        r = invoke("updateNoteFields",
+        r = invoke_retry("updateNoteFields",
                 note={
                     "id": anki_id_processed,
                     "fields": fields
@@ -2620,7 +2666,7 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
         # that never sets it leaves an arrow visibly stuck down until the
         # 20 s wait in qt_play_pages gives up. Re-read the note rather than
         # reconstruct it - it is one rpc, and it is the truth.
-        _info = invoke('notesInfo', notes=[int(anki_id_processed)])
+        _info = invoke_retry('notesInfo', notes=[int(anki_id_processed)])
         if _info and not _info.get('error') and _info.get('result') \
                 and _info['result'][0].get('fields'):
             window._qt_caps = parse_captures(_info['result'][0]['fields'])
@@ -2630,10 +2676,13 @@ def process_audio(audio_bytes,audio_start_time,points,snip_index,audio_end_time,
                   _info and _info.get('error'))
         window.show_page_signal.emit(None, 0, len(window._qt_caps))
         _qt_caps_event.set()
-        qt_preload_pages()
+        preload = qt_preload_pages()
     
     anki_new_note_thread.join()
     round_finish_all()
+    # the round is over: its sync try, once the media preload is done
+    threading.Thread(target=anki_sync, kwargs={'after': preload},
+                     daemon=True).start()
         
     # the detection trace, positions on the Anki mp3's timeline. Written
     # from its own thread once the round is over, all of it in one go
@@ -2818,9 +2867,7 @@ def run_ocr_waiting(image, ocr, on_error, directional):
 
     def work():
         try:
-            ttt(1)
             out['result'] = run_ocr(image, ocr, on_error, directional)
-            ttt(2)
         except BaseException as e:
             out['error'] = e
 
@@ -3310,9 +3357,9 @@ def _merge_bump_schedule_sync(cards):
     # so a word grown to a 30-day interval keeps that curve instead of
     # restarting from scratch. Cards already due sooner than that are left
     # alone - rescheduling those would push them further out and add a
-    # pointless manual entry to the revlog. Cards still new: stay new (the
-    # daily new-card limit keeps applying) but move to the head of the
-    # queue so they are the first new word served.
+    # pointless manual entry to the revlog. Cards still new stay where they
+    # are in the new-card queue: AnkiConnect for Anki 26.08+ refuses to set
+    # a card's 'due', so there is no way to move them to the head any more.
     # invoke() returns the whole AnkiConnect envelope {'result':..,'error':..},
     # and iterating that dict yields its key strings, not the cards
     r = invoke('cardsInfo', cards=cards)
@@ -3320,7 +3367,6 @@ def _merge_bump_schedule_sync(cards):
     if not info:
         return
     review = [c['cardId'] for c in info if c.get('type') in (2, 3)]
-    fresh = [c['cardId'] for c in info if c.get('type') in (0, 1)]
     if review:
         # prop:due counts whole days from today, so >1 means "later than
         # tomorrow". Letting Anki do the date maths beats deriving it from
@@ -3333,22 +3379,19 @@ def _merge_bump_schedule_sync(cards):
             far = review
         if far:
             invoke('setDueDate', cards=far, days='1')  # no "!": keeps ivl
-    if not fresh:
+
+
+def anki_drop_page_tags(note_id, tags):
+    # a capture merged in FRONT of a note sends the card back to page 1:
+    # drop the start page the card template keeps in an acard::p:: tag
+    # (its localStorage records lapse by themselves, they are keyed by
+    # page 1's file)
+    drop = [t for t in (tags or []) if t.lower().startswith('acard::p::')]
+    if not drop:
         return
-    try:
-        found = invoke('findCards', query=f'deck:{DECK_NAME} is:new')
-        others = invoke('cardsInfo', cards=(found or {}).get('result') or [])
-        lowest = min([c['due'] for c in (others or {}).get('result') or []]
-                     or [1])
-    except Exception:
-        lowest = 1
-    for cid in fresh:
-        try:
-            # newValues must be an int here, a string raises
-            invoke('setSpecificValueOfCard', card=cid, keys=['due'],
-                   newValues=[lowest - 1], warning_check=True)
-        except Exception as e:
-            print('merge: reposition failed:', e)
+    r = invoke_retry('removeTags', notes=[int(note_id)], tags=' '.join(drop))
+    if not r or r.get('error'):
+        print('merge: page tag not dropped:', r and r.get('error'))
 
 
 def anki_merge_into(target_id, fields):
@@ -3357,23 +3400,25 @@ def anki_merge_into(target_id, fields):
     # to the same note later (it follows anki_last_new_note). Returns
     # False when the target cannot be read/updated -> caller adds a new
     # note instead
-    r = invoke('notesInfo', notes=[int(target_id)])
+    r = invoke_retry('notesInfo', notes=[int(target_id)])
     if not r or r.get('error') or not r.get('result') \
             or not r['result'][0].get('fields'):
         return False
     old = r['result'][0]['fields']
     cards = r['result'][0].get('cards') or []
+    tags = r['result'][0].get('tags') or []
     upd = {
         'screenshot': fields.get('screenshot', '')
                       + old['screenshot']['value'],
     }
-    r = invoke('updateNoteFields',
-               note={'id': int(target_id), 'fields': upd})
+    r = invoke_retry('updateNoteFields',
+                     note={'id': int(target_id), 'fields': upd})
     if not r or r.get('error'):
         print('merge: updateNoteFields failed:', r and r.get('error'))
         return False
     if cards:
         _merge_bump_schedule(cards)
+    anki_drop_page_tags(target_id, tags)
     print(f"merged '{fields.get('spell', '')}' into note {target_id}")
     return True
 
@@ -3410,17 +3455,23 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp,
         fields['definition'] += '<div><br></div>'
     # word is not a field any more: it rides in the media filenames
     _word = fields.pop('word', '')
-    result = invoke("addNote",
-                    note={
-                        "deckName": DECK_NAME,
-                        "modelName": MODEL_NAME,
-                        "fields": fields,
-                        "options": {"allowDuplicate": True}
-                    })
+    result = invoke_retry("addNote",
+                          note={
+                              "deckName": DECK_NAME,
+                              "modelName": MODEL_NAME,
+                              "fields": fields,
+                              "options": {"allowDuplicate": True}
+                          })
     if result:
         if result['error']:
             print(result['error'])
         else:
+            # the new note joins the merge index at once: should the next
+            # snip's index rebuild fail (Anki busy), re-snipping this word
+            # still merges into it. Oldest note wins, as in the rebuild
+            _s = norm_spell(fields.get('spell'))
+            if _s:
+                _spell_index.setdefault(_s, int(result['result']))
             bridge.anki_new_note_done.emit(anki_new_note_time_stamp,str(result['result']),
                                            _word)
 
@@ -3439,14 +3490,14 @@ def anki_new_note_after(anki_new_note_time_stamp,anki_id, word):
     window.anki_id = anki_id
     set_save_baseline()
     round_anki_id_generated.set()
-    threading.Thread(target=anki_sync, daemon=True).start()
+    # no sync here any more: anki_sync() runs once the round is over
 
 
 def anki_upload_media(media_byte, filename):
     filename = re.sub(r'[\\/:*?"<>|]', "", filename)
     filename = filename.lstrip(" .")
     b64 = base64.b64encode(media_byte).decode("utf-8")
-    return invoke("storeMediaFile", filename=filename, data=b64)
+    return invoke_retry("storeMediaFile", filename=filename, data=b64)
 
 
 def anki_download_media(filename):
@@ -3461,6 +3512,7 @@ def anki_download_media(filename):
 def anki_get_and_display(anki_id, anki_check):
     global anki_check_needed
     anki_check_needed = anki_check
+    anki_sync_yield()       # user first: our sync stops before the read
     result = invoke('notesInfo', notes=[int(anki_id)])
     # test need to consider when note deleted in anki
     fields = result['result'][0]['fields']
@@ -3527,6 +3579,7 @@ def anki_delete_note():  # test need more detailed delete
     window.delete_btn.setChecked(True)
     check_processing(round_anki_id_generated)
     window.delete_btn.setChecked(False)
+    anki_sync_yield()       # user first: our sync stops before the delete
     anki_check_needed = True
     if window.anki_id:  # test need to consider blank
         if config['anki_combine_dup']:
@@ -3561,90 +3614,169 @@ def anki_delete_note():  # test need more detailed delete
             window_display_word_blank()
 
 
-# Window show states / commands (for GetWindowPlacement / SetWindowPlacement)
-SW_SHOWNORMAL = 1
-SW_SHOWMINIMIZED = 2
-SW_SHOWMAXIMIZED = 3
-SW_SHOWNOACTIVATE = 4    # show in normal state without activating (no focus steal)
-SW_SHOWMINNOACTIVE = 7   # minimize without activating
-SW_RESTORE = 9
-class WINDOWPLACEMENT(Structure):
-    _fields_ = [
-        ("length", wintypes.UINT),
-        ("flags", wintypes.UINT),
-        ("showCmd", wintypes.UINT),
-        ("ptMinPosition", wintypes.POINT),
-        ("ptMaxPosition", wintypes.POINT),
-        ("rcNormalPosition", wintypes.RECT),
-    ]
 anki_pending_note = 0
-def anki_sync():
-    global anki_sync_running, anki_pending_note
+_anki_sync_lock = threading.Lock()
 
-    # my original plan is to sync anki for every single new note
-    # but anki community told me it will put too much load on server
-    # so the strategy is, for new users, it will sync every single note until it reach a certain number, then only sync multiple notes together
-    if config['anki_new_note_left'] > 0:
-        update_config('anki_new_note_left', config['anki_new_note_left'] - 1)
-    else:
+
+def anki_sync_blocked():
+    # why a due sync has to wait (the count stays, so the next try picks it
+    # up), or '' when it may run now
+    if hotkey_mode == 2:
+        return 'snip open'
+    if not round_anki_audio_sent.is_set():
+        return 'round in progress'
+    if getattr(window, '_save_lit', False):
+        return 'unsaved edits'
+    if getattr(window, '_history_open', False):
+        return 'history menu open'
+    if anki_sync_running:
+        return 'sync already running'
+    if not anki_connect_is_running():
+        return 'Anki not running'
+    return ''
+
+
+def anki_sync(after=None):
+    # one try per finished round or save: count the note, and once the count
+    # reaches the threshold, sync through AnkiConnect's v1 API. The v1 sync
+    # shows no 'sync complete' tip, so Anki no longer has to be moved
+    # off-screen meanwhile
+    global anki_sync_running, anki_pending_note, _anki_sync_op
+    if after is not None:
+        after.join(timeout=30)      # the round's media preload goes first
+    with _anki_sync_lock:
+        # my original plan is to sync anki for every single new note
+        # but anki community told me it will put too much load on server
+        # so the strategy is, for new users, it will sync every single note until it reach a certain number, then only sync multiple notes together
+        if config['anki_new_note_left'] > 0:
+            update_config('anki_new_note_left', config['anki_new_note_left'] - 1)
+            threshold = 1
+        else:
+            threshold = config['anki_sync_note']
         anki_pending_note += 1
-        if anki_pending_note < config['anki_sync_note']:
+        if anki_pending_note < threshold:
             return
-        else:
-            anki_pending_note = 0
-
-    if not anki_sync_running:
+        why = anki_sync_blocked()
+        if why:
+            print('sync: skipped (%s), %d notes waiting'
+                  % (why, anki_pending_note))
+            return
+        n, anki_pending_note = anki_pending_note, 0     # sent = counted
         anki_sync_running = True
-
-        # anki will show a status of 'sync complete' after sync
-        # i don't want user keep seeing this
-        # the only solution i found is to move anki outside window and then move back
-        anki_hwnd = user32.FindWindowW(None, None)
-        while anki_hwnd:
-            buf = create_unicode_buffer(256)
-            user32.GetWindowTextW(anki_hwnd, buf, 256)
-            if buf.value.endswith(
-                    '- Anki'):  # test need better way to capture anki window
-                break
-            anki_hwnd = user32.GetWindow(anki_hwnd, 2)  # GW_HWNDNEXT
-        else:
-            anki_hwnd = None
-
-        # Save the full original placement (state + normal size/pos) so we can
-        # restore the exact same state (maximized/minimized/normal) after sync.
-        orig_wp = WINDOWPLACEMENT()
-        orig_wp.length = sizeof(WINDOWPLACEMENT)
-        user32.GetWindowPlacement(anki_hwnd, byref(orig_wp))
-
-        # Restore to normal (no focus steal), then move off-screen for sync.
-        move_wp = WINDOWPLACEMENT()
-        move_wp.length = sizeof(WINDOWPLACEMENT)
-        user32.GetWindowPlacement(anki_hwnd, byref(move_wp))
-        w = move_wp.rcNormalPosition.right - move_wp.rcNormalPosition.left
-        h = move_wp.rcNormalPosition.bottom - move_wp.rcNormalPosition.top
-        # First call: restore to normal state (no focus steal).
-        move_wp.showCmd = SW_SHOWNOACTIVATE
-        user32.SetWindowPlacement(anki_hwnd, byref(move_wp))
-
-        # Now it is in normal state, move it off-screen with MoveWindow.
-        user32.MoveWindow(anki_hwnd, -10000, -10000, w, h, False)
-
-        #time.sleep(1)
-        invoke("sync")
-        time.sleep(10)
-
-        # Restore original size/position, but use no-activate show commands
-        # so a non-topmost window is not briefly raised (which caused a flash).
-        restore_cmd_map = {
-            SW_SHOWMINIMIZED: SW_SHOWMINNOACTIVE,
-            SW_SHOWMAXIMIZED: SW_SHOWMAXIMIZED,  # no no-activate variant exists
-            SW_SHOWNORMAL: SW_SHOWNOACTIVATE,
-        }
-        orig_wp.showCmd = restore_cmd_map.get(orig_wp.showCmd,
-                                              SW_SHOWNOACTIVATE)
-        user32.SetWindowPlacement(anki_hwnd, byref(orig_wp))
-
+    t0 = time.time()
+    state, err = 'failed', None
+    try:
+        res, err = anki_rpc('collection.sync')
+        if not err:
+            _anki_sync_op = res['operationId']
+            state, err = anki_op_wait(_anki_sync_op, 900)
+    finally:
+        _anki_sync_op = None
         anki_sync_running = False
+    # cancelled (the user came first), or refused at once because another
+    # AnkiConnect call was running: nothing went up, so the notes go back
+    # to the count. Anything else counts as done - refused for an open
+    # editor, no AnkiWeb login, a network error: Anki's own sync on close
+    # catches up
+    give_back = state == 'cancelled' or (err is not None and err[0] == 'busy')
+    if give_back:
+        with _anki_sync_lock:
+            anki_pending_note += n
+    print('sync: %s in %.1f s%s%s' % (
+        state, time.time() - t0, ' (%s: %s)' % err if err else '',
+        ', %d notes back to the count' % n if give_back else ''))
+
+
+# --- AnkiConnect v1 API (JSON-RPC, AnkiConnect for Anki 26.08+) ----------
+# Only the sync uses it so far; every other call still goes through
+# invoke(). Errors come back typed: (type, message), e.g. ('busy', '...')
+
+
+def anki_rpc(method, **params):
+    # one v1 call: (result, error), error being (type, message) or None.
+    # Never raises: a dead connection is ('connection', ...)
+    try:
+        r = requests.post(ANKI_URL + '/api/v1',
+                          json={'jsonrpc': '2.0', 'id': 1,
+                                'method': method, 'params': params},
+                          timeout=30).json()
+    except Exception as e:
+        return None, ('connection', repr(e))
+    if r.get('error'):
+        e = r['error']
+        if not isinstance(e, dict):
+            return None, ('unknown', str(e))
+        return None, ((e.get('data') or {}).get('type') or 'unknown',
+                      e.get('message', ''))
+    return r.get('result'), None
+
+
+def anki_op_wait(op_id, timeout, step=0.2):
+    # poll a v1 operation (sync, media.store) until it is over: returns
+    # (state, error) with state succeeded / failed / cancelled - or
+    # 'unknown' when the poll itself failed, 'timeout' when it never ended
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rec, err = anki_rpc('operations.get', operationId=op_id)
+        if err:
+            return 'unknown', err
+        if rec['state'] in ('succeeded', 'failed', 'cancelled'):
+            e = rec.get('error')
+            if e:
+                return rec['state'], ((e.get('data') or {}).get('type')
+                                      or 'unknown', e.get('message', ''))
+            return rec['state'], None
+        time.sleep(step)
+    return 'timeout', None
+
+
+_anki_sync_op = None    # operationId of ACard's own sync while it runs
+
+
+def anki_sync_cancel():
+    # user first: ACard's own sync gives way. Fire and forget, for actions
+    # whose Anki call comes later (snip opened, save lit, history opened)
+    op = _anki_sync_op
+    if op:
+        threading.Thread(target=anki_rpc, args=('operations.cancel',),
+                         kwargs={'operationId': op}, daemon=True).start()
+
+
+def anki_sync_yield(timeout=0.5):
+    # the same, and wait until the sync has really stopped (a cancel takes
+    # ~0.15 s to land), for callers that touch Anki right away. Returns at
+    # once when no sync of ours runs
+    op = _anki_sync_op
+    if op:
+        anki_rpc('operations.cancel', operationId=op)
+        anki_op_wait(op, timeout, step=0.03)
+
+
+# AnkiConnect for Anki 26.08+ refuses calls while a sync (or another
+# whole-collection operation) runs, instead of queueing them
+ANKI_BUSY = ('operation is active', 'active collection operation',
+             'Too many active operations')
+
+
+def invoke_retry(action, **params):
+    # a capture round's call to Anki. ACard's own sync gives way first; a
+    # sync started elsewhere cannot be cancelled, so it is waited out: busy
+    # is retried every 0.5 s, 8 tries at most, and giving up is logged
+    anki_sync_yield()
+    t0 = time.time()
+    for n in range(1, 9):
+        r = invoke(action, **params)
+        err = (r or {}).get('error') or ''
+        if not any(b in str(err) for b in ANKI_BUSY):
+            if n > 1:
+                print('anki busy: %s went through on try %d after %.1f s'
+                      % (action, n, time.time() - t0))
+            return r
+        if n < 8:
+            time.sleep(0.5)
+    print('anki busy: %s GAVE UP after 8 tries in %.1f s: %s'
+          % (action, time.time() - t0, err))
+    return r
 
 
 def invoke(action, **params):
@@ -3697,6 +3829,7 @@ def anki_merge_note_into(target_id, src_id):
     src = r['result'][0]['fields']
     tgt = r['result'][1]['fields']
     cards = r['result'][1].get('cards') or []
+    tags = r['result'][1].get('tags') or []
     upd = {
         'screenshot': src['screenshot']['value'] + tgt['screenshot']['value'],
         'audio': src['audio']['value'] + tgt['audio']['value'],
@@ -3707,6 +3840,7 @@ def anki_merge_note_into(target_id, src_id):
         return False
     if cards:
         _merge_bump_schedule(cards)
+    anki_drop_page_tags(target_id, tags)
     return True
 
 
@@ -3859,6 +3993,8 @@ def save_word_qt_to_anki():
 def refresh_history_menu():
     global hide_on_click
     hide_on_click = False   # user opened history: they need the UI
+    window._history_open = True     # anki_sync() waits while it is open
+    anki_sync_cancel()      # user first: a pick loads the note from Anki
     toggle_to_main()
     window.history_menu.clear()
     check_processing(round_anki_id_generated)
@@ -4877,6 +5013,8 @@ def set_qt_layout():
     window.history_menu = QMenu(window)
     window.history_menu.setFont(QFont('Segoe UI Symbol', font_size_btn))
     window.history_menu.aboutToShow.connect(refresh_history_menu)
+    window.history_menu.aboutToHide.connect(
+        lambda: setattr(window, '_history_open', False))
     window.history_btn.setMenu(window.history_menu)
 
     window.close_btn = title_button('minimize')
@@ -5093,18 +5231,20 @@ def set_qt_layout():
     main_layout.addWidget(window.label_screenshot)
     window.label_screenshot.mousePressEvent = play_audio
 
-    # delete-capture cross. Parented to the image label, so a click on it
+    # delete-capture button: the toolbar's trash icon, drawn white so it
+    # reads on any picture. Parented to the image label, so a click on it
     # never reaches the label's play handler underneath.
-    cross = max(18, int(bar_height * 0.62))
+    cross = max(20, int(bar_height * 0.70))
+    trash_px = max(10, int(cross * 0.84))
     window.pic_del_btn = QToolButton(window.label_screenshot)
-    window.pic_del_btn.setText('✕')
+    window.pic_del_btn.setIcon(QIcon(theme_pixmap('trash', '#ffffff', trash_px)))
+    window.pic_del_btn.setIconSize(QSize(trash_px, trash_px))
     window.pic_del_btn.setCursor(Qt.PointingHandCursor)
     window.pic_del_btn.setFixedSize(cross, cross)
     window.pic_del_btn.setStyleSheet(
-        'QToolButton { background: rgba(0, 0, 0, 150); color: white;'
-        ' border: none; border-radius: 3px; font-size: %dpx; }'
-        'QToolButton:hover { background: rgba(200, 40, 40, 220); }'
-        % max(10, int(cross * 0.55)))
+        'QToolButton { background: rgba(0, 0, 0, 150);'
+        ' border: none; border-radius: 3px; }'
+        'QToolButton:hover { background: rgba(200, 40, 40, 220); }')
     window.pic_del_btn.clicked.connect(delete_current_capture)
     window.pic_del_btn.hide()
     window.label_screenshot.setMouseTracking(True)
@@ -5360,6 +5500,9 @@ def update_save_btn_state(*_):
     changed = (window.anki_id is not None
                and (getattr(window, '_saved_fields', None) != current_fields()
                     or bool(getattr(window, '_qt_pending_del', None))))
+    if changed and not window.save_btn.isEnabled():
+        anki_sync_cancel()      # user first: an edit has begun
+    window._save_lit = changed  # anki_sync() waits while edits are unsaved
     window.save_btn.setEnabled(changed)   # the icon carries its own grey
 
 
@@ -5604,7 +5747,11 @@ def qt_preload_pages():
                 if c['_wav'] is None:
                     print('preload: audio unavailable for ' + str(c['mp3']))
 
-    threading.Thread(target=worker, daemon=True).start()
+    # handed back so the round's sync try can wait for these downloads: a
+    # sync that starts while they run is refused, or refuses them
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t
 
 
 def qt_note_pages_ready(ts):
@@ -5614,13 +5761,13 @@ def qt_note_pages_ready(ts):
     snap = anki_last_new_note
     if ts != snap[0]:
         return
-    r = invoke('notesInfo', notes=[int(snap[1])])
+    r = invoke_retry('notesInfo', notes=[int(snap[1])])
     if r and not r.get('error') and r.get('result') \
             and r['result'][0].get('fields'):
         window._qt_caps = parse_captures(r['result'][0]['fields'])
         window.show_page_signal.emit(None, 0, len(window._qt_caps))
         _qt_caps_event.set()
-        qt_preload_pages()
+        return qt_preload_pages()      # the round's sync try waits for it
 
 
 def qt_play_pages(delta, auto_advance):
@@ -5639,6 +5786,7 @@ def qt_play_pages(delta, auto_advance):
 
     def worker():
         global _play_session
+        anki_sync_yield()       # user first: pages may download from Anki
         # a merge round shows the nav before the note is finalized:
         # block here until the caps are ready, then flip
         if not _qt_caps_event.wait(timeout=20):
@@ -5703,6 +5851,7 @@ def play_audio(event):
     fw = window.focusWidget()
     if fw is not None:
         fw.clearFocus()
+    anki_sync_cancel()          # user first: ACard's own sync gives way
     check_processing(round_audio_analysis_start_time_done)
 
     caps = getattr(window, '_qt_caps', None)
@@ -6519,7 +6668,7 @@ def anki_create_deck():
 
 
 def anki_create_model():
-    ANKI_MODEL_VERSION = 4
+    ANKI_MODEL_VERSION = 6
     FRONT_TEMPLATE = r"""<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
 <script>
    // A lone space inside spell is stray (OCR, hand edits). A run of two
@@ -6782,6 +6931,204 @@ window._apCfg = {
     warmupTries: 5              /* rebuilds before giving up */
 };
 </script>
+<div id="apTagsBack" style="display:none">{{Tags}}</div>
+<script>
+(function () {
+    /* ---- audio ranges + start page in note tags ----------------------
+       acard::t::<capture id>::<start ms>-<end ms>::<unix s>   one per capture
+       acard::p::<capture id>::<unix s>     page to open on; none = page 1
+       Every client reads them through the Tags field. Two can write them:
+       AnkiDroid's study screen (JS API) and AnkiWeb (the site's own editor
+       service). Everywhere the newer of the tag and this device's
+       localStorage wins; where no tag can be written localStorage keeps it.
+       The capture id is the 13-digit timestamp of an L0 name, else the
+       whole name. */
+    var W = window, T_PRE = 'acard::t::', P_PRE = 'acard::p::';
+    W._apCapId = function (fname) {
+        var b = String(fname || '').replace(/\.[^.]+$/, '');
+        var m = b.match(/_(\d{13})_[rp][\d-]+$/);
+        return (m ? m[1] : b.replace(/[\s:]/g, '_')).toLowerCase();
+    };
+    W._apParseTags = function (text) {
+        var out = { t: {}, p: null };
+        String(text || '').split(/\s+/).forEach(function (tag) {
+            var t = tag.toLowerCase(), p;
+            if (t.indexOf(T_PRE) === 0) {
+                p = t.slice(T_PRE.length).split('::');
+                if (p.length !== 3) return;
+                var r = /^(\d+)-(\d+)$/.exec(p[1]), at = +p[2];
+                if (!r || !(+r[2] > +r[1]) || !(at >= 0)) return;
+                if (!out.t[p[0]] || at > out.t[p[0]].t) {
+                    out.t[p[0]] = { s: +r[1] / 1000, e: +r[2] / 1000, t: at };
+                }
+            } else if (t.indexOf(P_PRE) === 0) {
+                p = t.slice(P_PRE.length).split('::');
+                if (p.length !== 2 || !p[0] || !(+p[1] >= 0)) return;
+                if (!out.p || +p[1] > out.p.t) out.p = { id: p[0], t: +p[1] };
+            }
+        });
+        return out;
+    };
+    // the note's tags with ours swapped: a range tag replaces the tag of the
+    // same capture, a page tag replaces any page tag; add = null only drops
+    function swapTags(tags, pre, id, add) {
+        var keep = tags.filter(function (x) {
+            var t = String(x).toLowerCase();
+            if (t.indexOf(pre) !== 0) return true;
+            return pre === T_PRE && t.slice(pre.length).split('::')[0] !== id;
+        });
+        if (add) keep.push(add);
+        return keep;
+    }
+    var droid = typeof AnkiDroidJS !== 'undefined';
+    var web = !droid && /(^|\.)(ankiuser|ankiweb)\.net$/.test((W.location && W.location.hostname) || '') &&
+              typeof TextEncoder === 'function' && typeof fetch === 'function';
+    W._apTagApiOn = function () { return droid || web; };
+    if (!W._apTagQ) W._apTagQ = Promise.resolve();
+
+    /* ---- AnkiDroid ----
+       The API object is made only once the user changes something (drag,
+       page flip): making it already sends a request, and an AnkiDroid whose
+       JS API has moved on shows a notice for every request. That moment
+       also fixes which note this page belongs to. Outside the study screen
+       every call answers success:true with a dummy -1, so only a real note
+       id switches writing on. */
+    var api = null, nidP = null;
+    W._apTagPrime = function () {
+        if (!droid || nidP) return;
+        try {
+            api = new AnkiDroidJS({ version: '0.0.3', developer: 'github.com/qazzzlyt' });
+            nidP = api.ankiGetCardNid().then(function (r) {
+                return r && r.success && typeof r.value === 'number' && r.value > 0 ? r.value : null;
+            }).catch(function () { return null; });
+        } catch (e) {
+            api = null;
+            nidP = Promise.resolve(null);
+        }
+    };
+    function nidNow() {
+        return api.ankiGetCardNid().then(function (r) {
+            return r && r.success ? r.value : null;
+        }).catch(function () { return null; });
+    }
+    // setNoteTags REPLACES every tag of the CURRENT card's note: read, swap
+    // ours, write back - and give up whenever the card on screen is no
+    // longer the one this page belongs to
+    function droidEdit(pre, id, add, gen) {
+        W._apTagPrime();
+        if (!api) return Promise.resolve(false);
+        return nidP.then(function (nid) {
+            if (!nid || gen !== W.top._apGen) return false;
+            return nidNow().then(function (n1) {
+                if (n1 !== nid) return false;
+                return api.ankiGetNoteTags().then(function (r) {
+                    var tags = r && r.success && typeof r.value === 'string' ? JSON.parse(r.value) : null;
+                    if (!Array.isArray(tags)) return false;
+                    var keep = swapTags(tags, pre, id, add);
+                    return nidNow().then(function (n2) {
+                        if (n2 !== nid || gen !== W.top._apGen) return false;
+                        return api.ankiSetNoteTags(keep).then(function (r2) {
+                            return !!(r2 && r2.success && r2.value === true);
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    /* ---- AnkiWeb ----
+       The study page's own editor service (unofficial, may change any
+       time): protobuf over POST, the login cookie authenticates. Plain-number
+       varints, no BigInt: older browsers could not even parse this script
+       then; note ids stay far below 2^53. */
+    function varint(n) {
+        var out = [];
+        while (n > 127) { out.push((n % 128) + 128); n = Math.floor(n / 128); }
+        out.push(n);
+        return out;
+    }
+    function key(no, wt) { return varint(no * 8 + wt); }
+    function bytesField(no, b) { return key(no, 2).concat(varint(b.length), b); }
+    function strField(no, str) {
+        return bytesField(no, Array.prototype.slice.call(new TextEncoder().encode(str)));
+    }
+    function parse(buf) {
+        var out = [], i = 0;
+        function rv() {
+            var r = 0, m = 1, b;
+            do { b = buf[i++]; r += (b & 127) * m; m *= 128; } while (b & 128);
+            return r;
+        }
+        while (i < buf.length) {
+            var k = rv(), no = Math.floor(k / 8), wt = k % 8;
+            if (wt === 0) out.push({ no: no, v: rv() });
+            else if (wt === 2) { var len = rv(); out.push({ no: no, v: buf.subarray(i, i + len) }); i += len; }
+            else if (wt === 1) i += 8;
+            else if (wt === 5) i += 4;
+            else throw new Error('wire type ' + wt);
+        }
+        return out;
+    }
+    function svc(path, body) {
+        return fetch(path, {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: new Uint8Array(body)
+        }).then(function (r) {
+            if (!r.ok) throw new Error(path + ' ' + r.status);
+            return r.arrayBuffer();
+        }).then(function (b) { return new Uint8Array(b); });
+    }
+    function webNid() {
+        var as = document.querySelectorAll('a[href*="edit/"]');
+        for (var i = 0; i < as.length; i++) {
+            var m = /edit\/(\d+)/.exec(as[i].getAttribute('href') || '');
+            if (m) return +m[1];
+        }
+        return null;
+    }
+    // Fields and tags go back whole. The Edit link can still point at the
+    // previous card while this one renders, so only a note that holds this
+    // card's file may be written
+    function webEdit(pre, id, add, gen, fname) {
+        var nid = webNid();
+        if (!nid || !fname) return Promise.resolve(false);
+        var idMsg = key(1, 0).concat(varint(nid));
+        return svc('/svc/editor/get-note-info', idMsg).then(function (buf) {
+            var f = parse(buf), dec = new TextDecoder();
+            var fields = f.filter(function (x) { return x.no === 1; }).map(function (x) { return dec.decode(x.v); });
+            var t = f.filter(function (x) { return x.no === 3; })[0];
+            var tags = (t ? dec.decode(t.v) : '').split(/\s+/).filter(Boolean);
+            if (!fields.some(function (v) { return v.indexOf(fname) >= 0; })) return false;
+            if (gen !== W.top._apGen) return false;
+            var body = [];
+            fields.forEach(function (v) { body = body.concat(strField(1, v)); });
+            body = body.concat(strField(2, swapTags(tags, pre, id, add).join(' ')));
+            body = body.concat(bytesField(4, idMsg));
+            return svc('/svc/editor/add-or-update', body).then(function () { return true; });
+        });
+    }
+
+    // One edit of this note's tags; resolves true only if the note really
+    // changed. Edits queue up, so two quick changes never undo each other.
+    function edit(pre, id, add, fname) {
+        if (!droid && !web) return Promise.resolve(false);
+        var gen = W.top._apGen;
+        var job = W._apTagQ.then(function () {
+            return droid ? droidEdit(pre, id, add, gen) : webEdit(pre, id, add, gen, fname);
+        }).catch(function () { return false; });
+        W._apTagQ = job;
+        return job;
+    }
+    W._apSaveRangeTag = function (id, s, e, at, fname) {
+        return edit(T_PRE, id, T_PRE + id + '::' + Math.round(s * 1000) + '-' + Math.round(e * 1000) + '::' + at, fname);
+    };
+    // id = null: back to page 1, the page tag goes
+    W._apSavePageTag = function (id, at, fname) {
+        return edit(P_PRE, null, id ? P_PRE + id + '::' + at : null, fname);
+    };
+})();
+</script>
 <script>
 (function () {
     // fresh card: the window SURVIVES across cards (that is what makes
@@ -6840,10 +7187,30 @@ window._apCfg = {
         }
     }
     var start = 0, key = 'ap-page:' + (caps.length ? caps[0].stem : '');
+    var _tf = document.getElementById('apTagsBack');
+    var _tg = window._apParseTags(_tf ? _tf.textContent : '');
+    window._apTagRanges = _tg.t;
+    window._apPageTag = _tg.p;
+    // start page: the newer of this note's page tag and this device's
+    // record. The record is keyed by page 1, so a capture merged in front
+    // makes it miss (page 1 again); ACard drops the tag on such merges
+    var _local = null;
     try {
-        var saved = parseInt(localStorage.getItem(key), 10);
-        if (saved >= 0 && saved < caps.length) start = saved;
+        // {page, updated}; a page saved before pages joined Copy Audio
+        // Time is a bare number
+        var saved = JSON.parse(localStorage.getItem(key));
+        if (typeof saved === 'number') saved = { page: saved, updated: 0 };
+        if (saved && typeof saved.page === 'number' && saved.page >= 0 && saved.page < caps.length)
+            _local = saved;
     } catch (e) {}
+    var _tagIdx = -1;
+    if (_tg.p) {
+        for (var _i = 0; _i < caps.length; _i++) {
+            if (window._apCapId(caps[_i].mp3 || caps[_i].img) === _tg.p.id) { _tagIdx = _i; break; }
+        }
+    }
+    if (_tagIdx >= 0 && (!_local || _tg.p.t * 1000 >= (_local.updated || 0))) start = _tagIdx;
+    else if (_local) start = _local.page;
     window._apPageKey = key;
     window._apCaptures = caps;
     window._apCur = start;
@@ -7004,8 +7371,19 @@ window._apCfg = {
                  if (!fbImg || !fbImg.naturalWidth) return;
                  ensureFrame(fbImg.naturalWidth, fbImg.naturalHeight);
              }
+             function showImgError() {
+                 // the image file is not on this device yet (sync not finished):
+                 // say so in the card's language, instead of the app's broken image
+                 fallback.innerHTML = '<div style="color:#c00">Failed to load image' +
+                     '<br>Check if sync is finished</div>';
+             }
              if (fbImg) {
-             fbImg.complete ? syncFallbackWidth() : fbImg.addEventListener('load', syncFallbackWidth);
+             if (fbImg.complete) {
+                 fbImg.naturalWidth ? syncFallbackWidth() : showImgError();
+             } else {
+                 fbImg.addEventListener('load', syncFallbackWidth);
+                 fbImg.addEventListener('error', showImgError);
+             }
              }
              return false;
          }
@@ -7219,29 +7597,53 @@ window._apCfg = {
               });
           }
           function loadRange() {
+              // the newer of the note's tag and this device's localStorage
+              let best = null;
               try {
                   const raw = localStorage.getItem(STORAGE_KEY());
-                  if (!raw) return null;
-                  const obj = JSON.parse(raw);
-                  if (typeof obj.start === "number" && typeof obj.end === "number") {
-                  return obj;
+                  if (raw) {
+                      const obj = JSON.parse(raw);
+                      if (typeof obj.start === "number" && typeof obj.end === "number") {
+                          best = { start: obj.start, end: obj.end, at: (obj.updated || 0) / 1000 };
+                      }
                   }
-                  return null;
-              } catch (e) {
-                  return null;
-              }
+              } catch (e) {}
+              const tg = (window._apTagRanges || {})[window._apCapId(filename)];
+              if (tg && (!best || tg.t >= best.at)) best = { start: tg.s, end: tg.e, at: tg.t };
+              return best;
           }
           function saveRange() {
-              try {
-                  localStorage.setItem(
-                  STORAGE_KEY(),
-                  JSON.stringify({
-                      start: startT,
-                      end: endT,
-                      updated: Date.now(),
-                  }),
-                  );
-              } catch (e) {}
+              const fn = filename, s = startT, e = endT, now = Date.now();
+              function toLocal() {
+                  try {
+                      localStorage.setItem("ap-range:" + fn,
+                          JSON.stringify({ start: s, end: e, updated: now }));
+                  } catch (x) {}
+              }
+              if (!window._apTagApiOn()) {
+                  toLocal();
+                  return;
+              }
+              // AnkiDroid / AnkiWeb: into the note's tag, which syncs
+              // everywhere. This page's copy of the tags follows at once, so
+              // coming back to this capture before the write lands shows the
+              // new range
+              const id = window._apCapId(fn), at = Math.floor(now / 1000);
+              const ranges = window._apTagRanges = window._apTagRanges || {};
+              const prev = ranges[id];
+              ranges[id] = { s: s, e: e, t: at };
+              window._apSaveRangeTag(id, s, e, at, fn).then(function (ok) {
+                  if (ok) {
+                      try { localStorage.removeItem("ap-range:" + fn); } catch (x) {}
+                      return;
+                  }
+                  // not written (not the study screen, card changed...):
+                  // keep it on this device as before
+                  if (ranges[id] && ranges[id].t === at && ranges[id].s === s) {
+                      if (prev) ranges[id] = prev; else delete ranges[id];
+                  }
+                  toLocal();
+              });
           }
           let duration = 0;
           let startT = 0;
@@ -7791,6 +8193,7 @@ window._apCfg = {
           }
           function onDown(e) {
               if (window._apSeqStop) window._apSeqStop();
+              if (window._apTagPrime) window._apTagPrime();   // this page's note, fixed at drag start
               dragging = e.currentTarget.dataset.role;
               dragRect = track.getBoundingClientRect();
               const p = getXY(e);
@@ -7976,7 +8379,7 @@ window._apCfg = {
        const data = {};
        for (let i = 0; i < localStorage.length; i++) {
            const key = localStorage.key(i);
-           if (key.startsWith('ap-range:')) {
+           if (key.startsWith('ap-range:') || key.startsWith('ap-page:')) {
                data[key] = JSON.parse(localStorage.getItem(key));
            }
        }
@@ -8048,16 +8451,20 @@ window._apCfg = {
            var data = JSON.parse(json);
            var count = 0;
            for (var key in data) {
-               if (key.startsWith('ap-range:')) {
-                   var existing = localStorage.getItem(key);
-   if (existing) {
-       var existingObj = JSON.parse(existing);
-       if (existingObj.updated === undefined || data[key].updated === undefined) continue;
-       if (existingObj.updated >= data[key].updated) continue;
-   }
-                   localStorage.setItem(key, JSON.stringify(data[key]));
-                   count++;
+               var isPage = key.startsWith('ap-page:');
+               if (!isPage && !key.startsWith('ap-range:')) continue;
+               var existing = localStorage.getItem(key);
+               if (existing) {
+                   var mine = JSON.parse(existing), theirs = data[key];
+                   var mt = mine && mine.updated, tt = theirs && theirs.updated;
+                   // newer wins; an entry without a time stamp never
+                   // replaces one here. Pages only: one kept here without a
+                   // stamp (saved before pages had one) loses to a stamped one
+                   if (tt === undefined) continue;
+                   if (mt === undefined ? !isPage : mt >= tt) continue;
                }
+               localStorage.setItem(key, JSON.stringify(data[key]));
+               count++;
            }
            alert('Import complete,  ' + count + ' records updated');
        } catch(e) {
@@ -8311,9 +8718,31 @@ window._apCfg = {
             if (window._apReloadAudio) window._apReloadAudio(!!opts.noplay);
         });
         if (!opts.auto) {
-            try {
-                localStorage.setItem(window._apPageKey, String(idx));
-            } catch (e) {}
+            // the start page: page 1 is the default and stores nothing.
+            // Where the note's tag can be written (AnkiDroid, AnkiWeb) the
+            // tag holds it and this device's record goes; elsewhere the
+            // record holds it, and page 1 is written out only to beat an
+            // older page tag
+            var pkey = window._apPageKey, pcap = caps[idx] || {};
+            var pfile = pcap.mp3 || pcap.img || '', pnow = Date.now();
+            var pageLocal = function () {
+                try {
+                    if (idx === 0 && !window._apPageTag) localStorage.removeItem(pkey);
+                    else localStorage.setItem(pkey, JSON.stringify({ page: idx, updated: pnow }));
+                } catch (e) {}
+            };
+            if (window._apTagApiOn && window._apTagApiOn()) {
+                window._apTagPrime();     // this page's note, fixed at the flip
+                var pid = idx === 0 ? null : window._apCapId(pfile);
+                var pat = Math.floor(pnow / 1000);
+                window._apSavePageTag(pid, pat, pfile).then(function (ok) {
+                    if (!ok) { pageLocal(); return; }
+                    window._apPageTag = pid ? { id: pid, t: pat } : null;
+                    try { localStorage.removeItem(pkey); } catch (e) {}
+                });
+            } else {
+                pageLocal();
+            }
         }
         maybeTimerAdvance();
     }
@@ -8540,7 +8969,8 @@ body.landscape #text-wrap {
             ('Copy Audio Time', '复制音频时间'),
             ('Import Audio Time', '导入音频时间'),
             ('Close', '关闭'),
-            ('Failed to load:', '音频获取失败'),
+            ('Failed to load audio', '音频获取失败'),
+            ('Failed to load image', '图片获取失败'),
             ('Check if sync is finished', '检查同步是否完成'),
         )
 
@@ -8606,22 +9036,33 @@ body.landscape #text-wrap {
             model_hash = anki_current_model_hash()
             if model_hash == config['anki_model_version_and_hash'][
                     1] or config['anki_model_version_and_hash'][0] == 0:
-                invoke("updateModelTemplates",
-                       model={
-                           "name": MODEL_NAME,
-                           "templates": {
-                               MODEL_NAME: {
-                                   "Front": FRONT_TEMPLATE,
-                                   "Back": BACK_TEMPLATE,
+                r = invoke("updateModelTemplates",
+                           model={
+                               "name": MODEL_NAME,
+                               "templates": {
+                                   MODEL_NAME: {
+                                       "Front": FRONT_TEMPLATE,
+                                       "Back": BACK_TEMPLATE,
+                                   }
                                }
-                           }
-                       })
-                invoke("updateModelStyling",
-                       model={
-                           "name": MODEL_NAME,
-                           "css": CSS
-                       })
-                need_update_config = True
+                           })
+                if r and not r.get('error'):
+                    r = invoke("updateModelStyling",
+                               model={
+                                   "name": MODEL_NAME,
+                                   "css": CSS
+                               })
+                # AnkiConnect for Anki 26.08+ refuses note type edits while
+                # any Anki editor (browse / add / edit) is open. Record the
+                # new version only once both went through. Otherwise mark
+                # version 0: the next start retries, skipping the hand-edit
+                # check (a half-done update has changed the hash)
+                if r and not r.get('error'):
+                    need_update_config = True
+                else:
+                    update_config('anki_model_version_and_hash', [0, ''])
+                    print('anki: template update refused, retry next start:',
+                          r and r.get('error'))
 
     if need_update_config:
         model_hash = anki_current_model_hash()
@@ -8802,6 +9243,10 @@ _hotkey_during_ocr = threading.Event()
 # --- merge-by-spell: index of existing notes ---------------------------
 _spell_index = {}          # normalized spell -> oldest unsuspended note id
 _spell_index_thread = None
+# what the index is built from: note id -> (normalized spell, mod). After
+# the first full read only new notes and notes whose mod changed are read
+_spell_notes = {}
+_spell_lock = threading.Lock()  # one rebuild at a time (boot vs a snip)
 
 
 def norm_spell(s):
@@ -8812,30 +9257,60 @@ def norm_spell(s):
 
 
 def rebuild_spell_index(wait_prev=False):
-    # snapshot {spell: note id} of every active note in the deck. With
+    # {spell: note id} of every active note in the deck. The first call
+    # reads every note; later calls only read notes that are new or whose
+    # mod time changed. On the AnkiConnect for Anki 26.08+ notesInfo costs
+    # ~0.35 ms a note (4000 notes ~1.4 s), while the ids (findNotes) and
+    # mod times (notesModTime) of all of them take ~0.25 s together. With
     # wait_prev the previous round's note must land in Anki first, so
     # re-snipping the same word sees it as a merge target
     global _spell_index
     if wait_prev:
         round_anki_id_generated.wait(timeout=5)
-    t0 = time.time()
-    r = invoke('findNotes',
-               query=f'deck:{DECK_NAME} note:{MODEL_NAME} -is:suspended')
-    if not r or r.get('error') or r.get('result') is None:
-        print('spell index: findNotes failed, keeping old index')
-        return
-    r = invoke('notesInfo', notes=r['result'])
-    if not r or r.get('error') or r.get('result') is None:
-        print('spell index: notesInfo failed, keeping old index')
-        return
-    idx = {}
-    for n in r['result']:
-        s = norm_spell(n['fields']['spell']['value'])
-        nid = n['noteId']
-        if s and (s not in idx or nid < idx[s]):
-            idx[s] = nid    # duplicate spells: oldest note wins
-    _spell_index = idx
-    print(f'spell index: {len(idx)} entries in {time.time() - t0:.2f}s')
+    # a snip has just cancelled ACard's own sync: make sure it stopped
+    # before reading every note. Refused anyway (a sync from elsewhere):
+    # the old index stays, holding the notes ACard added meanwhile
+    anki_sync_yield()
+    with _spell_lock:
+        t0 = time.time()
+        r = invoke('findNotes',
+                   query=f'deck:{DECK_NAME} note:{MODEL_NAME} -is:suspended')
+        if not r or r.get('error') or r.get('result') is None:
+            print('spell index: findNotes failed, keeping old index')
+            return
+        ids = r['result']
+        # gone from Anki (deleted, suspended, moved out of the deck)
+        alive = set(ids)
+        for nid in list(_spell_notes):
+            if nid not in alive:
+                del _spell_notes[nid]
+        known = [nid for nid in ids if nid in _spell_notes]
+        changed = []
+        if known:
+            r = invoke('notesModTime', notes=known)
+            if not r or r.get('error') or r.get('result') is None:
+                print('spell index: notesModTime failed, keeping old index')
+                return
+            changed = [m['noteId'] for m in r['result']
+                       if m and m['noteId'] in _spell_notes
+                       and _spell_notes[m['noteId']][1] != m['mod']]
+        todo = [nid for nid in ids if nid not in _spell_notes] + changed
+        if todo:
+            r = invoke('notesInfo', notes=todo)
+            if not r or r.get('error') or r.get('result') is None:
+                print('spell index: notesInfo failed, keeping old index')
+                return
+            for n in r['result']:
+                if n.get('fields'):
+                    _spell_notes[n['noteId']] = (
+                        norm_spell(n['fields']['spell']['value']), n['mod'])
+        idx = {}
+        for nid, (s, _) in list(_spell_notes.items()):
+            if s and (s not in idx or nid < idx[s]):
+                idx[s] = nid    # duplicate spells: oldest note wins
+        _spell_index = idx
+    print(f'spell index: {len(idx)} entries, {len(todo)} notes read, '
+          f'in {time.time() - t0:.2f}s')
 
 
 def spell_index_forget(note_id):
@@ -9233,8 +9708,10 @@ def on_quit():
 
 
 def anki_sync_on_quit():
+    # fire and forget: ACard exits right after, and Anki's own sync on
+    # close covers whatever this misses
     if not anki_sync_running:
-        requests.post(ANKI_URL, json={"action": "sync","params": {},"version": 6},timeout=10).json()
+        anki_rpc('collection.sync')
 
 
 def tray_show(reason):
@@ -9264,6 +9741,7 @@ if config['exclude_from_capture']:
 else:
     EXCLUDE_FROM_CAPTURE = 0
 show_and_exclude_from_capture(window)
+user32.SetWindowDisplayAffinity(int(window.winId()), 0)   # launch showing only: recordable; the next showing excludes it again
 hide_on_click = False
 set_qt_layout()
 
