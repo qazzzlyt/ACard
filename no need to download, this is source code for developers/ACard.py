@@ -1,4 +1,4 @@
-__version__ = "0.7.0"
+__version__ = "0.7.2"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, shutil, subprocess, sys
@@ -28,6 +28,8 @@ def _ulog(msg):
 
 _UPDATE_DIR = [None]
 _UPDATE_DIR_LOCK = threading.Lock()
+# when the updater last started a check: the daily ping keeps clear of it
+_UPDATE_STARTED_AT = [0.0]
 
 
 def _update_dir() -> Path:
@@ -589,6 +591,7 @@ def _update_loop():
     except Exception as e:
         _ulog(f"update dir dump failed: {e!r}")
     while True:
+        _UPDATE_STARTED_AT[0] = time.time()
         try:
             _check_and_download()
         except Exception as e:
@@ -9367,6 +9370,7 @@ DEFAULT_CONFIG = {
         ]
     ],
     "mei_folder": [],
+    "ping_day": "",
 }
 config_path, config = load_config()
 ui_index = config.get('ui_index', 0)
@@ -9924,6 +9928,61 @@ show_tip()
 threading.Timer(10, fetch_tips).start()
 threading.Thread(target=anki_check_deck_and_model, args=(True, ),
                  daemon=True).start()
+# ---- daily users (10-27) -------------------------------------------------------
+# One GET of an empty R2 object ("ping") per machine per day, so the stats can
+# count machines: version.json is fetched at every launch and every 6 h. Sent
+# once per launch, only if this machine was not counted today yet; a failure is
+# not retried. A day starts at PING_DAY_START local time, like Anki's "next day
+# starts at" (4 by default); the day last counted is kept in config['ping_day']
+PING_URL = 'https://pub-78bde70cc75344bfb88a764dc7565c84.r2.dev/ping'
+PING_DAY_START = 4
+
+
+def ping_day():
+    # the local date of (now - PING_DAY_START h): 03:00 on the 27th is the 26th
+    return datetime.fromtimestamp(
+        time.time() - PING_DAY_START * 3600).date().isoformat()
+
+
+def ping_busy():
+    # what the ping keeps clear of: the moment an update check starts, an open
+    # snip or a capture round still running, ACard's own Anki sync
+    if time.time() - _UPDATE_STARTED_AT[0] < 20:
+        return 'update check starting'
+    if hotkey_mode == 2 or not all(e.is_set() for e in _round_events):
+        return 'capture'
+    if anki_sync_running:
+        return 'anki sync'
+    return None
+
+
+def ping_once():
+    time.sleep(60)          # after start-up and the updater's first check
+    while ping_busy():
+        time.sleep(20)
+    day = ping_day()
+    if config.get('ping_day') == day:
+        return              # counted today already
+    try:
+        with urlopen(Request(PING_URL + '?d=' + day,
+                             headers={'User-Agent': 'ACard-ping'}),
+                     timeout=15) as r:
+            r.read()
+        update_config('ping_day', day)
+        print('[ping] counted for ' + day)
+    except Exception as e:
+        print('[ping] %s failed: %r (not retried)' % (day, e))
+
+
+# the developer's own PC never pings either, even running the exe: Windows PC
+# names (COMPUTERNAME) of such PCs
+PING_SKIP_PCS = ('DESKTOP-H0GKP8B',)
+if getattr(sys, 'frozen', False):   # runs from source (dev, promo build) are no users
+    if os.environ.get('COMPUTERNAME') in PING_SKIP_PCS:
+        print('[ping] skipped: developer PC')
+    else:
+        threading.Thread(target=ping_once, daemon=True).start()
+
 # Create tray icon
 tray = QSystemTrayIcon(window)
 tray.setIcon(QIcon(resource_path("icon.ico")))
