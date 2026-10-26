@@ -1,12 +1,12 @@
 {
-  "version": "0.7.0",
-  "sha256": "858c48a25f114f82f28cc247a3b959ed60f4216633397717b0774ddb711cc59d",
-  "size": 179815216,
+  "version": "0.7.1",
+  "sha256": "b7aa415e1abee3034c33e5d343d2c7330b4adf1fa6b4c9b0fea7216a85a455a9",
+  "size": 179818984,
   "mirrors": [
-    "https://pub-78bde70cc75344bfb88a764dc7565c84.r2.dev/0.7.0/ACard.exe",
-    "https://github.com/qazzzlyt/ACard/releases/download/0.7.0/ACard.exe",
-    "https://gh-proxy.com/https://github.com/qazzzlyt/ACard/releases/download/0.7.0/ACard.exe"
+    "https://pub-78bde70cc75344bfb88a764dc7565c84.r2.dev/0.7.1/ACard.exe",
+    "https://github.com/qazzzlyt/ACard/releases/download/0.7.1/ACard.exe",
+    "https://gh-proxy.com/https://github.com/qazzzlyt/ACard/releases/download/0.7.1/ACard.exe"
   ],
   "notes": "",
-  "pub_date": "2026-10-23T11:31:29Z"
+  "pub_date": "2026-10-26T12:44:09Z"
 }

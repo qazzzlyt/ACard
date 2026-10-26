@@ -738,6 +738,8 @@ UI_TEXT = {
     'wrong_anki':
     ('File is Wrong. Download Anki and select', '文件错误.下载并选择Anki'),
     'no_anki_connection': ('Failed to connect to Anki', '无法连接Anki'),
+    'anki_not_ready': ('Anki is not set up yet. Please restart ACard',
+                       'Anki还没准备好，请重新启动ACard'),
     'dup': ('ACard is already running', 'ACard已启动'),
     'blank': ('(Blank)', '(无)'),
     'install_anki_connect':
@@ -841,33 +843,77 @@ def ui(key):
     return UI_TEXT[key][ui_index]
 
 
+def alog(msg):
+    # one line per step of setting Anki up, so a user's log shows where it
+    # stopped (10-26: a first run that never reached Anki left no trace)
+    print('[anki %s] %s' % (time.strftime('%H:%M:%S'), msg))
+
+
+def find_anki_exe():
+    # a few likely places, a running anki.exe, the .apkg file association.
+    # Deliberately no disk search: that would be slow
+    env = os.environ.get
+    candidates = [
+        os.path.join(env('LOCALAPPDATA', ''), 'Programs', 'Anki', 'anki.exe'),
+        os.path.join(env('ProgramFiles', r'C:\Program Files'), 'Anki', 'anki.exe'),
+        os.path.join(env('USERPROFILE', ''), 'Desktop', 'Anki', 'anki.exe'),
+        r'C:\Anki\anki.exe',
+        r'D:\Anki\anki.exe',
+        r'D:\Program Files\Anki\anki.exe',
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            alog('anki.exe found: ' + p)
+            return p
+    for proc in psutil.process_iter(['name', 'exe']):
+        exe = proc.info['exe']
+        if (proc.info['name'] or '').lower() == 'anki.exe' and exe \
+                and os.path.exists(exe):
+            alog('anki.exe from a running Anki: ' + exe)
+            return exe
+    try:
+        import winreg
+        prog = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, '.apkg')
+        cmd = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT,
+                                prog + r'\shell\open\command')
+        exe = cmd.split('"')[1] if cmd.startswith('"') else cmd.split()[0]
+        if exe.lower().endswith('anki.exe') and os.path.exists(exe):
+            alog('anki.exe from the .apkg file association: ' + exe)
+            return exe
+    except (OSError, IndexError):
+        pass
+    alog('anki.exe not found in: ' + '; '.join(candidates)
+         + ' (no running anki.exe, no .apkg association)')
+    return None
+
+
 def check_get_anki_path():
-    # check if anki_path is in config
-    if config['anki_path'] == '':
-        if os.name == 'nt':  # Windows
-            localappdata = os.environ.get('LOCALAPPDATA', '')
-            userprofile = os.environ.get('USERPROFILE', '')
-            candidates = [
-                os.path.join(localappdata, 'Programs', 'Anki', 'anki.exe'),
-                os.path.join(userprofile, 'Desktop', 'Anki', 'anki.exe'),
-            ]
-            for auto_path in candidates:
-                if os.path.exists(auto_path):
-                    update_config('anki_path', auto_path)
-                    return auto_path
-        msg = QMessageBox()
-        msg.setWindowTitle(ui('messagebox_title'))
-        msg.setText(ui('no_anki_in_config'))
-        msg.setTextFormat(Qt.RichText)
-        msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
-        result = msg.exec_()
-        if result == QMessageBox.Ok:
-            return pick_anki_exe()
-        elif result == QMessageBox.Cancel:
-            return
-    else:
-        return config['anki_path']
+    # the path in config while it exists; else a few likely places (see
+    # find_anki_exe); else ask the user, as before
+    path = config['anki_path']
+    if path and os.path.exists(path):
+        alog('anki.exe (config): ' + path)
+        return path
+    if path:
+        alog('anki.exe in config is gone: ' + path)
+    if os.name == 'nt':  # Windows
+        auto_path = find_anki_exe()
+        if auto_path:
+            update_config('anki_path', auto_path)
+            return auto_path
+    msg = QMessageBox()
+    msg.setWindowTitle(ui('messagebox_title'))
+    msg.setText(ui('no_anki_in_config'))
+    msg.setTextFormat(Qt.RichText)
+    msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+    msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+    result = msg.exec_()
+    alog('anki.exe: asked the user (%s)'
+         % ('pick' if result == QMessageBox.Ok else 'cancel'))
+    if result == QMessageBox.Ok:
+        return pick_anki_exe()
+    elif result == QMessageBox.Cancel:
+        return
 
 
 def pick_anki_exe():
@@ -895,17 +941,25 @@ def pick_anki_exe():
     return anki_path
 
 
-def open_anki(anki_path):
+def open_anki(anki_path, wait=600):
+    # wait: how long to poll for AnkiConnect (answering, collection open).
+    # The start-up thread waits long, invoke() only briefly
     if anki_path:
         anki_just_closed = False
         # if need to install anki connect
         if not config['anki_connect_successful']:
             if not anki_connect_is_running():
                 for proc in psutil.process_iter(['exe']):
-                    if proc.info['exe'] and 'AnkiProgramFiles' in proc.info[
-                            'exe']:
+                    exe = proc.info['exe'] or ''
+                    # the launcher's Anki runs from AnkiProgramFiles; an older
+                    # install runs as the anki.exe in config itself
+                    if 'AnkiProgramFiles' in exe or (
+                            os.path.normcase(exe)
+                            == os.path.normcase(anki_path)):
                         proc.kill()
                         anki_just_closed = True
+                        alog('closed Anki (pid %d, %s) to install AnkiConnect'
+                             % (proc.pid, exe))
                 auto_install_anki_connect()
 
         if anki_just_closed:
@@ -914,6 +968,7 @@ def open_anki(anki_path):
         # open anki
         for proc in psutil.process_iter(['exe']):
             if proc.info['exe'] and 'AnkiProgramFiles' in proc.info['exe']:
+                alog('Anki is running (pid %d)' % proc.pid)
                 break
         else:
             env = os.environ.copy()
@@ -926,23 +981,33 @@ def open_anki(anki_path):
                 subprocess.Popen([anki_path],
                                  env=env,
                                  cwd=os.path.dirname(anki_path))
+                alog('started Anki: ' + anki_path)
             except Exception as e:
+                alog('could not start Anki: %r' % (e,))
                 qmsg(f"Failed to start Anki: {e}")
-            time.sleep(10)
+        # no fixed sleep: poll until Anki answers (or `wait` runs out)
+        wait_anki_ready(wait)
+    else:
+        alog('no anki.exe: Anki not started')
 
 
     # test need to (1) check if anki is already running (2) check if anki is now opened by acard (3) install anki connect automatically (4) hide anki (5) check deck and model
 def auto_install_anki_connect():
     addons_dir = os.path.join(os.environ['APPDATA'], 'Anki2', 'addons21')
     if not os.path.exists(addons_dir):
-        return
+        # Anki was never opened yet: make the folder, so the very first start
+        # of Anki already loads AnkiConnect (no restart round needed)
+        os.makedirs(addons_dir, exist_ok=True)
+        alog('AnkiConnect: made the add-on folder ' + addons_dir)
 
     dst = os.path.join(addons_dir, '2055492159')
     if os.path.exists(dst):
+        alog('AnkiConnect: already in ' + dst)
         return
 
     src = os.path.join(BASE, '2055492159')
     shutil.copytree(src, dst)
+    alog('AnkiConnect: installed to ' + dst)
 
 
 def check_dup():
@@ -1877,6 +1942,17 @@ class Snip(QWidget):
         # the stack (check_processing pumps events): a second start would log
         # in to the screenshots twice and log out only once
         if hotkey_mode == 2 or self._starting:
+            return
+        if not (config['anki_deck_ok'] and config['anki_model_ok']):
+            # Anki's deck / note type were never confirmed: a round would make
+            # no note and stall (10-26 user log). Say so instead of starting
+            alog('snip refused: deck ok %s, note type ok %s'
+                 % (config['anki_deck_ok'], config['anki_model_ok']))
+            self._starting = True       # a hotkey meanwhile opens no 2nd box
+            try:
+                qmsg(ui('anki_not_ready'))
+            finally:
+                self._starting = False
             return
         self._starting = True
         try:
@@ -3441,6 +3517,8 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp,
             + '_p' + anki_l0_quad(fields.get('position', '')) + '.jpg')
         if screenshot_name:
             fields['screenshot'] = f'<img src="{screenshot_name["result"]}">'
+        else:
+            alog('storeMediaFile: no answer from Anki')
     fields.pop('position', None)   # the quad lives in the filename now
     if merge_target and fields.get('screenshot'):
         if anki_merge_into(merge_target, fields):
@@ -3462,9 +3540,11 @@ def anki_new_note(fields, qimg_full, anki_new_note_time_stamp,
                               "fields": fields,
                               "options": {"allowDuplicate": True}
                           })
+    if not result:
+        alog('addNote: no answer from Anki, no note made')
     if result:
         if result['error']:
-            print(result['error'])
+            alog('addNote error: %s' % result['error'])
         else:
             # the new note joins the merge index at once: should the next
             # snip's index rebuild fail (Anki busy), re-snipping this word
@@ -3786,8 +3866,10 @@ def invoke(action, **params):
         anki_path = config['anki_path']
         if anki_check_needed:
             anki_check_needed = False
-            open_anki(anki_path)
+            open_anki(anki_path, wait=10)
         if not config['anki_connect_successful']:
+            alog('%s: AnkiConnect has never answered -> install message'
+                 % action)
             window.show_msg_signal.emit(ui('install_anki_connect'))
             return
         else:  # Poll for AnkiConnect
@@ -3797,6 +3879,8 @@ def invoke(action, **params):
                     break
                 time.sleep(0.5)
             else:
+                alog('%s: AnkiConnect not up after 15 s -> no connection'
+                     % action)
                 window.show_msg_signal.emit(ui('no_anki_connection'))
                 return
     return requests.post(ANKI_URL,
@@ -3814,6 +3898,39 @@ def anki_connect_is_running():
         if is_running and not config['anki_connect_successful']:
             update_config('anki_connect_successful', True)
         return is_running
+
+
+def anki_ready():
+    # (ready, what was seen): AnkiConnect answers AND the collection is open
+    if not anki_connect_is_running():
+        return False, 'port %d closed' % ANKI_PORT
+    try:
+        r = requests.post(ANKI_URL, json={'action': 'deckNames', 'version': 6},
+                          timeout=5).json()
+    except Exception as e:
+        return False, 'no answer (%s)' % type(e).__name__
+    if isinstance(r, dict) and r.get('error') is None \
+            and isinstance(r.get('result'), list):
+        return True, '%d decks' % len(r['result'])
+    return False, 'answer %s' % str(r)[:160]
+
+
+def wait_anki_ready(limit):
+    # poll instead of a fixed sleep: a slow Anki (many add-ons, a profile to
+    # pick) is waited out. Nothing on screen; the log gets every new state
+    t0, last = time.time(), None
+    while True:
+        ok, seen = anki_ready()
+        if ok:
+            alog('AnkiConnect ready after %.1f s (%s)' % (time.time() - t0, seen))
+            return True
+        if seen != last:
+            alog('waiting for AnkiConnect: %s (%.1f s)' % (seen, time.time() - t0))
+            last = seen
+        if time.time() - t0 > limit:
+            alog('AnkiConnect not ready after %d s: %s' % (limit, seen))
+            return False
+        time.sleep(0.5)
 
 
 def anki_merge_note_into(target_id, src_id):
@@ -6661,10 +6778,22 @@ def mp3_to_wav(mp3_bytes):
 
 
 def anki_create_deck():
-    if DECK_NAME not in (invoke("deckNames") or {}).get("result", []):
-        invoke("createDeck", deck=config['anki_deck_name'])
-    else:
+    # anki_deck_ok only once Anki has SHOWN the deck: no answer means nothing
+    # is known, and is not taken for "missing"
+    names = (invoke("deckNames") or {}).get("result")
+    if names is None:
+        alog('deck: no answer to deckNames, not checked')
+        return
+    if DECK_NAME in names:
+        alog('deck "%s" is there' % DECK_NAME)
         update_config('anki_deck_ok', True)
+        return
+    r = invoke("createDeck", deck=config['anki_deck_name'])
+    if DECK_NAME in ((invoke("deckNames") or {}).get("result") or []):
+        alog('deck "%s" created' % DECK_NAME)
+        update_config('anki_deck_ok', True)
+    else:
+        alog('deck: createDeck failed: %s' % (r and r.get('error'),))
 
 
 def anki_create_model():
@@ -8988,19 +9117,32 @@ body.landscape #text-wrap {
         "audio",
         "time",
     ]
-    if MODEL_NAME not in (invoke("modelNames") or {}).get("result", []):
-        invoke("createModel",
-               modelName=MODEL_NAME,
-               inOrderFields=MODEL_FIELDS,
-               css=CSS,
-               isCloze=False,
-               cardTemplates=[{
-                   "Name": MODEL_NAME,
-                   "Front": FRONT_TEMPLATE,
-                   "Back": BACK_TEMPLATE,
-               }])
-        need_update_config = True
+    model_names = (invoke("modelNames") or {}).get("result")
+    if model_names is None:
+        # no answer: nothing is known, so nothing is created or recorded
+        # (10-26: this branch used to "create" the model anyway and record a
+        # hash of "NoneNoneNone", which then kept the real one from updating)
+        alog('note type: no answer to modelNames, not checked')
+        return
+    if MODEL_NAME not in model_names:
+        r = invoke("createModel",
+                   modelName=MODEL_NAME,
+                   inOrderFields=MODEL_FIELDS,
+                   css=CSS,
+                   isCloze=False,
+                   cardTemplates=[{
+                       "Name": MODEL_NAME,
+                       "Front": FRONT_TEMPLATE,
+                       "Back": BACK_TEMPLATE,
+                   }])
+        if r and not r.get('error'):
+            alog('note type "%s" created' % MODEL_NAME)
+            update_config('anki_model_ok', True)
+            need_update_config = True
+        else:
+            alog('note type: createModel failed: %s' % (r and r.get('error'),))
     else:
+        alog('note type "%s" is there' % MODEL_NAME)
         update_config('anki_model_ok', True)
         # check if any missing fields and add
         fields_in_anki = invoke("modelFieldNames", modelName=MODEL_NAME)
@@ -9032,6 +9174,14 @@ body.landscape #text-wrap {
                            fieldName=field)
         # check model version. however, before overwrite old model, check if it user modified it manually
         # if yes, assume user need the modified model so will not update newer model to anki
+        if config['anki_model_version_and_hash'][1] == NO_ANKI_HASH:
+            # recorded by an older ACard while Anki did not answer: this note
+            # type never got these templates, so install them now
+            alog('note type: recorded hash is the no-answer one, '
+                 'reinstalling the templates')
+            update_config('anki_model_version_and_hash', [0, ''])
+        alog('note type: recorded version %d, this ACard has %d'
+             % (config['anki_model_version_and_hash'][0], ANKI_MODEL_VERSION))
         if config['anki_model_version_and_hash'][0] < ANKI_MODEL_VERSION:
             model_hash = anki_current_model_hash()
             if model_hash == config['anki_model_version_and_hash'][
@@ -9063,11 +9213,24 @@ body.landscape #text-wrap {
                     update_config('anki_model_version_and_hash', [0, ''])
                     print('anki: template update refused, retry next start:',
                           r and r.get('error'))
+            elif model_hash is None:
+                alog('note type: no answer while checking the templates')
+            else:
+                # the one case that keeps old templates on purpose: say so
+                alog('note type: changed by hand (hash %s, recorded %s), '
+                     'templates left at the old version'
+                     % (model_hash, config['anki_model_version_and_hash'][1]))
 
     if need_update_config:
         model_hash = anki_current_model_hash()
-        update_config('anki_model_version_and_hash',
-                      [ANKI_MODEL_VERSION, model_hash])
+        if model_hash is None:
+            # Anki stopped answering: record nothing, version 0 retries
+            alog('note type: no answer for the hash, version not recorded')
+            update_config('anki_model_version_and_hash', [0, ''])
+        else:
+            alog('note type: version %d recorded' % ANKI_MODEL_VERSION)
+            update_config('anki_model_version_and_hash',
+                          [ANKI_MODEL_VERSION, model_hash])
 
     # Mirror the shipped templates next to config.json (debug/backup copy)
     time.sleep(15)
@@ -9086,16 +9249,28 @@ body.landscape #text-wrap {
 def anki_check_deck_and_model(intial_run):
     if intial_run:
         anki_thread.join()
+    if intial_run or not (config['anki_deck_ok'] and config['anki_model_ok']):
+        alog('checking deck and note type (deck ok %s, note type ok %s)'
+             % (config['anki_deck_ok'], config['anki_model_ok']))
     if not config['anki_deck_ok'] or intial_run:
         threading.Thread(target=anki_create_deck, daemon=True).start()
     if not config['anki_model_ok'] or intial_run:
         threading.Thread(target=anki_create_model, daemon=True).start()
 
 
+# the hash older versions recorded when Anki did not answer at all
+NO_ANKI_HASH = hashlib.md5(b'NoneNoneNone').hexdigest()
+
+
 def anki_current_model_hash():
-    model_data = str(invoke("modelTemplates", modelName=MODEL_NAME)) + str(
-        invoke("modelStyling", modelName=MODEL_NAME)) + str(
-            invoke("modelFieldNames", modelName=MODEL_NAME))
+    # None when Anki did not answer: there is nothing to compare or record
+    parts = [invoke("modelTemplates", modelName=MODEL_NAME),
+             invoke("modelStyling", modelName=MODEL_NAME),
+             invoke("modelFieldNames", modelName=MODEL_NAME)]
+    if any(p is None for p in parts):
+        return None
+    # the same string as before, so hashes recorded by older versions match
+    model_data = ''.join(str(p) for p in parts)
     model_data.replace(' ', '').replace('\n',
                                         '').replace('\t',
                                                     '').replace('\r', '')
