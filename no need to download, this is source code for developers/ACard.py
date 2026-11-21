@@ -1,4 +1,4 @@
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 # ── Auto-updater ──────────────────────────────────────────────────────────────
 import hashlib, json, os, shutil, subprocess, sys
@@ -1507,6 +1507,22 @@ def dwm_cloak(w, on):
                                         sizeof(v))
 
 
+def settings_shareable(w):
+    # the settings page may be taken by Windows' screenshot tools (10-29).
+    # Everything else stays out of screen captures - and the settings page
+    # too while ACard's own snip is open, so that snip never shows it
+    stack = getattr(w, 'stack', None)
+    return stack is not None and stack.currentIndex() == 1 and hotkey_mode != 2
+
+
+def sync_capture_affinity():
+    # the main window after its page or the snip changed: set in one call,
+    # never through 0, so the main page shows in no capture on the way
+    user32.SetWindowDisplayAffinity(
+        int(window.winId()),
+        0 if settings_shareable(window) else EXCLUDE_FROM_CAPTURE)
+
+
 def show_and_exclude_from_capture(window, no_activate=True):
     user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
     user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
@@ -1521,7 +1537,8 @@ def show_and_exclude_from_capture(window, no_activate=True):
                                          ex_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
         user32.SetWindowDisplayAffinity(hwnd, 0)
 
-        user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
+        if not settings_shareable(window):
+            user32.SetWindowDisplayAffinity(hwnd, EXCLUDE_FROM_CAPTURE)
     # new content is painted by now (refresh_window, or show() itself for
     # this layered window): a lookup's cloak comes off here, see _do_snip
     dwm_cloak(window, False)
@@ -1589,6 +1606,24 @@ def frame_interview(fps, cut_target, delete_frame_index):
 
 system_drive = os.environ.get("SystemDrive",
                               "C:") + "\\"  # for disk calculation
+
+
+# ---- a snip that is opening has the screen to itself ------------------------
+# Opening the snip window needs `lock` three times in a row (log in, its own
+# grab of the screen, showing the window), and the background thread holds
+# the same lock for every frame it grabs (~35 ms each): a frame started in
+# between makes the snip window wait for it. So from the moment a snip really
+# starts until its window is up, the background thread takes no new frame.
+# It is a deadline, not a flag: left alone it runs out by itself, so nothing
+# that goes wrong while the snip opens can stop the frames for good.
+SCREENSHOT_HOLD_MAX = 0.5  # seconds; 0 = never hold
+screenshot_hold_until = 0.0  # time.perf_counter() value; only the GUI thread writes it
+
+
+def screenshot_hold(on):
+    global screenshot_hold_until
+    screenshot_hold_until = (time.perf_counter() + SCREENSHOT_HOLD_MAX
+                             if on else 0.0)
 
 
 def screenshot_login():
@@ -1736,6 +1771,18 @@ def screenshot_thread():
         this_screenshot_time = next_screenshot_time
 
         time.sleep(sleep_time)
+
+        # a snip window is opening (screenshot_hold): leave out the frame
+        # that is due now and wait for the next one, on the same time grid
+        # as above, until the hold is over
+        while time.perf_counter() < screenshot_hold_until:
+            if screenshot_thread_stop.is_set():
+                return
+            t = time.time() * 1000
+            this_screenshot_time += (int(
+                (t - this_screenshot_time) /
+                lowest_frame_interval) + 1) * lowest_frame_interval
+            time.sleep((this_screenshot_time - t) / 1000)
 
 
 class Bridge(QObject):
@@ -1962,8 +2009,15 @@ class Snip(QWidget):
             check_processing(round_display)
         finally:
             self._starting = False
+        screenshot_hold(True)  # off again once the snip window is up
+        t_snip = time.perf_counter()  # test
         hotkey_mode = 2
         _snip_open_close_time = time.time()
+        if window.stack.currentIndex() == 1:
+            # the settings page was open to screenshot tools: out of the
+            # capture below, once DWM has composed a frame without it
+            sync_capture_affinity()
+            windll.dwmapi.DwmFlush()
         anki_sync_cancel()      # user first: ACard's own sync gives way
         if config['anki_combine_dup']:
             # refresh the note index for THIS round; anki add/merge joins
@@ -2001,6 +2055,8 @@ class Snip(QWidget):
         self.setUpdatesEnabled(True)
         self.update()
         show_and_exclude_from_capture(self)
+        screenshot_hold(False)
+        print('[snip] up in %.0f ms' % ((time.perf_counter() - t_snip) * 1000))  # test
         #self.activateWindow()
         self.audio = None
         prune_play_log()
@@ -2372,6 +2428,7 @@ class Snip(QWidget):
                 if n <= 0:
                     self.hint_label.deleteLater()
         self._in_lookup = True                   # start() checks it
+        ttt(0, 'ocr start')
         try:
             run_ocr_and_display(
                 ocr, on_error, cropped, self.background, self.slider.value(),
@@ -2382,6 +2439,40 @@ class Snip(QWidget):
             # no word found (the window is not re-shown) or an error: bring
             # the window back as it was
             dwm_cloak(window, False)
+            sync_capture_affinity()     # back on the settings page: shareable again
+            fast_display(False)
+        ttt(1, 'ocr done')
+
+
+_fast_display_old = None
+
+
+def fast_display(on):
+    """Around putting a looked-up word into the window and painting it.
+    Qt hands every event to the Python event filters, and each such call
+    may have to wait for another Python thread to give way (up to one
+    switch interval, 5 ms by default); a word is some hundreds of events.
+    While on: the filters are off (none of them has anything to do during
+    these milliseconds - the snip is closed, no menu opens, the boxes are
+    not being clicked) and threads give way after 1 ms. Off puts everything
+    back; calling it twice is harmless."""
+    global _fast_display_old
+    filters = [(QApplication.instance(), f) for f in (app_event_filter, snip)]
+    filters += [(box, window._select_all_filter)
+                for box in window._selection_group]
+    if on:
+        if _fast_display_old is None:
+            _fast_display_old = sys.getswitchinterval()
+            sys.setswitchinterval(0.001)
+            for obj, f in filters:
+                obj.removeEventFilter(f)
+    elif _fast_display_old is not None:
+        # back in the order they were first installed (the one installed
+        # last is asked first, as before)
+        for obj, f in filters:
+            obj.installEventFilter(f)
+        sys.setswitchinterval(_fast_display_old)
+        _fast_display_old = None
 
 
 def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
@@ -2389,11 +2480,15 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
     global _ocr_done_at
     round_reset()
     ocr_result = run_ocr_waiting(image, ocr, on_error, 2)
+    ttt('a', 'ocr itself')  # test
     _ocr_done_at = time.time()
     word = ''
     if ocr_result:
         word = ocr_result[0][0]
         print("ocr: " + word)  # test
+        if ocr_result[0][2]:
+            print('ocr scores: ' + ' '.join(
+                '%s%.2f' % c[0] for c in ocr_result[0][2]))  # test
 
     if word != '':
         # if ocr successful, go search dictionary
@@ -2414,11 +2509,16 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             QPoint(int(ocr_result[0][1][6]), int(ocr_result[0][1][7])),
         ]  # test need to adapt to partial screen shoot
         points = quad_to_rect(points)
+        ttt('b', 'start lookup thread, box corners')  # test
+        fast_display(True)  # off again in _do_snip's finally
+        window._h_before = window.height()  # for size_self_check()
         pixmap = QPixmap.fromImage(qimg_full)
         window.setUpdatesEnabled(False)
         window_change_picture(pixmap)
+        ttt('c', 'screenshot into the window (convert + scale)')  # test
         window.word.setText(word)
         search_dict_thread.join()
+        ttt('d', 'wait for the lookup')  # test
         # merge round: the EXISTING note is what the user sees - its
         # (possibly hand-edited) text wins over the fresh dict lookup;
         # this round only contributes a new capture
@@ -2447,6 +2547,7 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
                     merge_target = None    # unreadable -> plain add
             print('path: merge into ' + str(merge_target)
                   if merge_target else 'path: new note')
+        ttt('e', 'merge check')  # test
         if word_info['spell'] != '':
             # this capture's note does not exist yet: drop the previous
             # note's id, or the fill below lights save up against that
@@ -2455,12 +2556,16 @@ def run_ocr_and_display(ocr, on_error, image, qimg_full, snip_index, rect,
             window_display_word(word_info['spell'], word_info['pron'],
                                 word_info['definition'], word_info['fuzzy'], None,
                                 False, True)
+            ttt('f', 'fill in the text + size the window')  # test
             #window.setMaximumSize(16777215, 16777215)
             refresh_window(False)
+            ttt('g', 'layout + paint')  # test
             show_and_exclude_from_capture(window)
             if window.isMinimized():
                 window.showNormal()
             window.raise_()
+            ttt('h', 'show the window')  # test
+            QTimer.singleShot(300, lambda w=word: size_self_check(w))  # test
             round_display.set()
             threading.Thread(target=after_display,
                              args=(word_info, word, points, audio_bytes,
@@ -2522,11 +2627,62 @@ def resize_window_height():
     # screenshot
     if window.label_screenshot.pixmap():
         h += window.label_screenshot.sizeHint().height()
-    if getattr(window, 'page_nav', None) and window.page_nav.isVisible():
+    # isHidden(), not isVisible(): while the window itself is hidden nothing
+    # inside it counts as visible, and the nav shown for a merge round was
+    # left out - the window came up 33 px short and jumped a moment later
+    if getattr(window, 'page_nav', None) and not window.page_nav.isHidden():
         h += window.page_nav.sizeHint().height()
 
     window.setMinimumHeight(0)
     window.resize(window.width(), h)
+    window._want_h = h  # size_self_check() compares the window with it
+
+
+def size_self_check(word):
+    """Test aid for the rare 'window keeps the previous word's size'. Runs a
+    moment after a looked-up word is shown: compares the window with what
+    resize_window_height() asked for and with its own parts, and logs
+    everything when they disagree. It only looks, it changes nothing."""
+    try:
+        if (not window.isVisible() or window.stack.currentIndex() != 0
+                or window.word.text() != word):
+            return  # the user has moved on: nothing to compare with
+        ex, fz, pic = (window.label_definition, window.label_fuzzy,
+                       window.label_screenshot)
+        nav = getattr(window, 'page_nav', None)
+        parts = {
+            'title': window.findChild(DraggableTitleBar).height(),
+            'row': window.search_row.sizeHint().height(),
+            'spell': window.label_spell.height(),
+            'pron': window.label_pron.height(),
+            'def': ex.height(),
+            'fuzzy': 0 if fz.isHidden() else fz.height(),
+            'pic': pic.height() if pic.pixmap() else 0,
+            'nav': nav.height() if nav and not nav.isHidden() else 0,
+        }
+        got = window.height()
+        want = getattr(window, '_want_h', None)
+        total = 2 + sum(parts.values())
+        def_doc = int(math.ceil(ex.document().size().height()))
+        fz_doc = int(math.ceil(fz.document().size().height()))
+        cut = (def_doc > ex.viewport().height() + 1
+               or (not fz.isHidden() and fz_doc > fz.viewport().height() + 1))
+        if got == want and got == total and not cut:
+            return
+        r = wintypes.RECT()
+        windll.user32.GetWindowRect(int(window.winId()), byref(r))
+        print('[size] WRONG word=%r height=%s asked=%s parts_sum=%s '
+              'before_this_word=%s text_cut_off=%s parts=%s def_doc=%s '
+              'fuzzy_doc=%s pixmap_h=%s min=%s max=%s minimized=%s '
+              'win32=%sx%s content_w=%s' % (
+                  word, got, want, total, getattr(window, '_h_before', None),
+                  cut, parts, def_doc, fz_doc,
+                  pic.pixmap().height() if pic.pixmap() else None,
+                  window.minimumHeight(), window.maximumHeight(),
+                  window.isMinimized(), r.right - r.left, r.bottom - r.top,
+                  window.width() - 22))
+    except Exception as e:
+        print('[size] check failed: ' + repr(e))
 
 
 def after_display(word_info, word, points, audio_bytes, snip_index,
@@ -2966,6 +3122,111 @@ def run_ocr_waiting(image, ocr, on_error, directional):
     return out['result']
 
 
+# characters the recognizer may output, in the form the DLL takes: one byte
+# per class (blank, dict.txt's lines, space). Built off the GUI thread from
+# the dictionaries of the language being studied, kept in memory only;
+# run_ocr hands a new one to the DLL before its next read.
+_ocr_allowed_new = None  # bytes waiting for run_ocr; b'' = lift the limit
+_ocr_allowed_gen = 0
+_ocr_allowed_lock = threading.Lock()
+
+
+def _is_han(ch):
+    return len(ch) == 1 and (0x4e00 <= ord(ch) <= 0x9fff
+                             or 0x3400 <= ord(ch) <= 0x4dbf)
+
+
+def start_ocr_allowed():
+    """(Re)build the allowed characters for the current source language in
+    the background. A Han character is allowed only when a headword of that
+    language's dictionaries has it (Chinese: also the traditional form of
+    such a character). Kana, letters, digits and signs are never limited:
+    a sign the model may not output would come out as a look-alike
+    character instead."""
+    global _ocr_allowed_new, _ocr_allowed_gen
+    if OCR_API < 2:
+        return
+    src = config.get('src_lang', SRC_LANGS[0])
+    with _ocr_allowed_lock:
+        _ocr_allowed_gen += 1
+        gen = _ocr_allowed_gen
+        _ocr_allowed_new = b''  # no limit until the new set is ready
+
+    def work():
+        global _ocr_allowed_new
+        try:
+            started = time.time()
+            dicts = sorted({d for (s, _), names in LOOKUP_ORDER.items()
+                            if s == src for d in names})
+            with open(os.path.join(BASE, 'dict.txt'), 'rb') as f:
+                lines = f.read().decode('utf-8').split('\n')
+            if lines and lines[-1] == '':
+                lines.pop()
+            classes = [''] + [ln.rstrip('\r') for ln in lines] + [' ']
+            # a connection of its own: a lookup never waits for this scan
+            conn = sqlite3.connect(os.path.join(BASE, 'dict.db'))
+            have = set()
+            try:
+                for d in dicts:
+                    big = conn.execute(
+                        "SELECT group_concat(key, '') FROM keys "
+                        "WHERE dict = ?", (d, )).fetchone()[0] or ''
+                    for i in range(0, len(big), 100000):
+                        have.update(big[i:i + 100000])
+                        time.sleep(0.001)  # let the GUI thread in
+                if src == '中文':
+                    have.update([
+                        t for t, s in conn.execute(
+                            'SELECT trad, simp FROM trad_map') if s in have
+                    ])
+            finally:
+                conn.close()
+            mask = bytes(0 if _is_han(ch) and ch not in have else 1
+                         for ch in classes)
+            with _ocr_allowed_lock:
+                if gen != _ocr_allowed_gen:
+                    return  # the language changed meanwhile
+                _ocr_allowed_new = mask
+            print('ocr allowed characters: %s, %d of %d Han characters, '
+                  '%.2f s' % (src, sum(mask[i] for i, ch in enumerate(classes)
+                                       if _is_han(ch)),
+                              sum(1 for ch in classes if _is_han(ch)),
+                              time.time() - started))
+        except Exception as e:
+            print('ocr allowed characters: failed, no limit: ' + repr(e))
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _ocr_apply_allowed(ocr):
+    """OCR thread, before a read: hand a newly built set to the DLL."""
+    global _ocr_allowed_new
+    with _ocr_allowed_lock:
+        mask, _ocr_allowed_new = _ocr_allowed_new, None
+    if mask is None:
+        return
+    n = dll.OcrSetAllowed(ocr, mask, len(mask))
+    if mask and n != len(mask):
+        # the DLL ignores a set of the wrong size: no limit in that case
+        print('ocr allowed characters: dict.txt has %d classes, the model '
+              '%d - not used' % (len(mask), n))
+
+
+def parse_ocr_detail(detail):
+    """OcrDetect2's report on one line -> one list per character:
+    [(char, score), (runner-up, score), (second runner-up, score)]"""
+    chars = []
+    for item in (detail or b'').decode('utf-8', 'ignore').split('\x1e'):
+        f = item.split('\x1f')
+        try:
+            cands = [(f[i], float(f[i + 1])) for i in range(0, len(f) - 1, 2)]
+        except ValueError:
+            continue
+        if cands:
+            chars.append(cands)
+    return chars
+
+
 def run_ocr(image, ocr, on_error, directional):
     if image.isNull():
         # nothing to read: same outcome as a crop with no text in it
@@ -2977,15 +3238,31 @@ def run_ocr(image, ocr, on_error, directional):
                               image.bytesPerLine())
     if not mat:
         raise RuntimeError('cvMatFromRGB888 failed')
+    if OCR_API >= 2:
+        _ocr_apply_allowed(ocr)
 
+    # one entry per line: (text, corners, per-character scores); the scores
+    # list is empty with the older DLL
     ocr_result = []
 
-    @DetectCallback
-    def on_detect(x1, y1, x2, y2, x3, y3, x4, y4, text):
-        ocr_result.append(
-            (text.decode('utf-8', 'ignore'), (x1, y1, x2, y2, x3, y3, x4, y4)))
+    if OCR_API >= 2:
 
-    dll.OcrDetect(ocr, mat, directional, on_detect, on_error)
+        @DetectCallback2
+        def on_detect(x1, y1, x2, y2, x3, y3, x4, y4, text, detail):
+            ocr_result.append(
+                (text.decode('utf-8', 'ignore'), (x1, y1, x2, y2, x3, y3, x4, y4),
+                 parse_ocr_detail(detail)))
+
+        dll.OcrDetect2(ocr, mat, directional, on_detect, on_error)
+    else:
+
+        @DetectCallback
+        def on_detect(x1, y1, x2, y2, x3, y3, x4, y4, text):
+            ocr_result.append(
+                (text.decode('utf-8', 'ignore'), (x1, y1, x2, y2, x3, y3, x4, y4),
+                 []))
+
+        dll.OcrDetect(ocr, mat, directional, on_detect, on_error)
     dll.cvMatDestroy(mat)
 
     return ocr_result
@@ -3585,11 +3862,17 @@ def anki_upload_media(media_byte, filename):
 
 def anki_download_media(filename):
     result = invoke("retrieveMediaFile", filename=filename)
-    if result["result"] is False:
+    b64 = result.get('result') if isinstance(result, dict) else None
+    if not isinstance(b64, str):
+        # False: no such file. None: the call was refused (a sync running:
+        # "Collection lifecycle operation is active.") or Anki is gone.
+        # None back either way; a page left without media is fetched
+        # again when it is shown
+        if b64 is None:
+            print('media: %s not read: %s'
+                  % (filename, (result or {}).get('error')))
         return None
-    b64 = result["result"]
-    data = base64.b64decode(b64)
-    return data
+    return base64.b64decode(b64)
 
 
 def anki_get_and_display(anki_id, anki_check):
@@ -3646,9 +3929,12 @@ def anki_get_and_display(anki_id, anki_check):
     window._qt_caps = parse_captures(fields)
     window.show_page_signal.emit(None, 0, len(window._qt_caps))
     _qt_caps_event.set()
-    qt_preload_pages()
+    preload = qt_preload_pages()
     window.anki_id = anki_id
     set_save_baseline()
+    # the page downloads, handed back so a sync started right after can
+    # wait for them (save-merge): a sync running meanwhile refuses them
+    return preload
 
 
 def anki_delete_note():  # test need more detailed delete
@@ -4015,9 +4301,12 @@ def maybe_merge_on_save():
     anki_list.insert(0, [str(target), window.word.text()])
     window.anki_id = str(target)
     set_save_baseline()
-    anki_get_and_display(window.anki_id, False)
+    preload = anki_get_and_display(window.anki_id, False)
     print(f'save merge: note {src_id} moved into {target}')
-    threading.Thread(target=anki_sync, daemon=True).start()
+    # the sync try waits for the merged note's page downloads, as at a
+    # round's end: a sync started meanwhile refuses them (11-06 crash)
+    threading.Thread(target=anki_sync, kwargs={'after': preload},
+                     daemon=True).start()
     return True
 
 
@@ -4160,42 +4449,66 @@ SRC_LANG_CODE = {'日本語': 'ja', '中文': 'zh', 'English': 'en'}
 
 def get_english_base_forms(word):
     """Rule-based English inflection reversal, most likely first.
-    Irregular forms (ate, mice...) resolve via build-time aliases instead."""
+    Irregular forms (ate, mice...) resolve via build-time aliases instead.
+    Whether a stem lost an e is read from its shape: a consonant-vowel-
+    consonant end (hop-, us-) would have doubled for hop / us, so hoping and
+    used are tried as hope / use first; working, singing as work / sing."""
     cands = [word]
     w = word.lower()
 
     def add(x):
         if len(x) >= 2 and x not in cands:
             cands.append(x)
+
+    def lost_e(stem):
+        s = stem.lower()
+        return (len(s) >= 2 and s[-1] not in 'aeiouwxy' and s[-2] in 'aeiou'
+                and (len(s) < 3 or s[-3] not in 'aeiou'))
+
+    def e_or_bare(stem):
+        if lost_e(stem):
+            add(stem + 'e')
+            add(stem)
+        else:
+            add(stem)
+            add(stem + 'e')
+    if w.endswith(("'s", '\u2019s')) and len(w) > 3:
+        add(word[:-2])                  # John's -> John
     if w.endswith('ies') and len(w) > 4:
         add(word[:-3] + 'y')
     if w.endswith('es') and len(w) > 3:
-        add(word[:-2])
-        add(word[:-1])
+        if re.search('(s|x|z|ch|sh|o)$', w[:-2]):
+            add(word[:-2])              # boxes -> box, does -> do
+            add(word[:-1])
+        else:
+            add(word[:-1])              # uses -> use, horses -> horse
+            add(word[:-2])
     elif w.endswith('s') and len(w) > 3 and not w.endswith('ss'):
         add(word[:-1])
     if w.endswith('ied') and len(w) > 4:
         add(word[:-3] + 'y')
     if w.endswith('ed') and len(w) > 3:
-        add(word[:-2])
-        add(word[:-1])
         if len(w) > 4 and w[-3] == w[-4]:
-            add(word[:-3])          # stopped -> stop
+            add(word[:-3])              # stopped -> stop
+        e_or_bare(word[:-2])            # hoped -> hope, worked -> work
+    if w.endswith('ying') and len(w) > 5:
+        add(word[:-4] + 'ie')           # lying -> lie, dying -> die
     if w.endswith('ing') and len(w) > 4:
-        add(word[:-3])
-        add(word[:-3] + 'e')        # making -> make
         if len(w) > 5 and w[-4] == w[-5]:
-            add(word[:-4])          # running -> run
+            add(word[:-4])              # running -> run
+        e_or_bare(word[:-3])            # making -> make, singing -> sing
     if w.endswith('ier') and len(w) > 4:
-        add(word[:-3] + 'y')        # easier -> easy
+        add(word[:-3] + 'y')            # easier -> easy
     if w.endswith('iest') and len(w) > 5:
         add(word[:-4] + 'y')
     if w.endswith('er') and len(w) > 3:
-        add(word[:-2])
-        add(word[:-1])
+        if len(w) > 4 and w[-3] == w[-4]:
+            add(word[:-3])              # bigger -> big
+        e_or_bare(word[:-2])            # nicer -> nice, faster -> fast
     if w.endswith('est') and len(w) > 4:
-        add(word[:-3])
-        add(word[:-2])
+        if len(w) > 5 and w[-4] == w[-5]:
+            add(word[:-4])              # biggest -> big
+        e_or_bare(word[:-3])            # nicest -> nice, fastest -> fast
     return cands
 
 
@@ -4208,20 +4521,43 @@ def _norm_key(s):
 
 
 def _key_rows(c, dic, w):
+    # e.* rather than named columns: a dict.db built from 10-31 on carries
+    # an Oxford level (entries.level), older builds do not
     return c.execute(
-        "SELECT e.spell, e.pron, e.definition, k.key FROM keys k "
+        "SELECT e.*, k.key FROM keys k "
         "JOIN entries e ON e.id = k.entry_id "
         "WHERE k.dict = ? AND k.key = ? ORDER BY k.rowid",
         (dic, w)).fetchall()
 
 
-def _lookup_one(c, dic, lang, w):
-    # precedence: case-exact key > alias > case-insensitive key
+def _row_level(r):
+    # Oxford 3000/5000 level, 1 (A1) .. 6 (C2); 9 = none, or not Oxford
+    return (r['level'] if 'level' in r.keys() else None) or 9
+
+
+def _lookup_one(c, dic, lang, w, alts=None, spelled=None):
+    # precedence: case-exact key > alias > case-insensitive key.
+    # English only (alts / spelled given, user 10-31):
+    #  - keys carry no spaces, so "by name" and "byname" share one: the
+    #    entry spelled like what was read wins, then one with as many words
+    #  - a word that is both a headword and an inflection of another one
+    #    (saw: the tool / the past of see) goes to the more common of the
+    #    two by Oxford level, a tie keeps the headword; a participle that
+    #    is an adjective of its own (aged, worried) keeps it too. The other
+    #    one is put in alts, to be listed right below the main hit
+    #  - of several alias targets the most common one is taken
     rows = _key_rows(c, dic, w)
-    for r in rows:
-        if r['key'] == w:
-            return r
+    exact = [r for r in rows if r['key'] == w]
+    if len(exact) > 1 and spelled:
+        def fit(r):
+            sp = ' '.join(r['spell'].replace('\u2019', "'").lower().split())
+            return (sp != spelled, (' ' in sp) != (' ' in spelled))
+        exact.sort(key=fit)            # stable: dictionary order otherwise
+    exact = exact[0] if exact else None
+    if exact is not None and alts is None:
+        return exact
     first = None
+    via_alias = None
     for a in c.execute(
             "SELECT target FROM aliases WHERE lang = ? AND alias = ?",
             (lang, w)).fetchall():
@@ -4237,9 +4573,33 @@ def _lookup_one(c, dic, lang, w):
             if first is None:
                 first = hit
             if hit['definition']:  # first alias target with content wins
-                return hit
-    if first is not None and first['definition']:
-        return first
+                if alts is None:
+                    via_alias = hit
+                    break
+                # English: the most common target (were: be, not are)
+                if via_alias is None or _row_level(hit) < _row_level(via_alias):
+                    via_alias = hit
+    if exact is not None:
+        if via_alias is not None and via_alias['id'] != exact['id']:
+            own = spelled is None or spelled == ' '.join(
+                exact['spell'].replace('\u2019', "'").lower().split())
+            regular = via_alias['key'].lower() in [
+                _norm_key(x).lower() for x in get_english_base_forms(w)]
+            if not own:
+                # the key only reached a phrase (tried: tried and tested)
+                swap = True
+            elif regular and exact['definition'].startswith('<i>adjective'):
+                # aged, worried, frozen: an adjective of its own first
+                swap = False
+            else:
+                swap = _row_level(via_alias) < _row_level(exact)
+            if swap:
+                alts.append(exact)
+                return via_alias
+            alts.append(via_alias)
+        return exact
+    if via_alias is not None:
+        return via_alias
     if rows:
         return rows[0]
     return first
@@ -4376,6 +4736,73 @@ def _trim_ocr_edges(s):
     return _OCR_EDGE_RE.sub('', s)
 
 
+# English phrases (10-31). Dropped from what was read when a phrase is not
+# found as it stands: the pronouns that fill a dictionary phrase's somebody
+# / your (gave her heart to him -> give heart to; build_oxford.py keys the
+# dictionary side without its placeholders), and the object that splits a
+# phrasal verb (look it up -> look up)
+EN_PLACEHOLDERS = {'somebody', 'something', 'someone', 'somewhere', 'sb', 'sth', 'your', 'yours',
+                   'yourself', 'yourselves', "one's", 'oneself', 'it', 'its', 'him', 'his',
+                   'her', 'hers', 'them', 'their', 'theirs', 'me', 'my', 'mine', 'us', 'our',
+                   'ours', 'you', 'himself', 'herself', 'itself', 'themselves', 'myself',
+                   'ourselves'}
+EN_SPLITTERS = {'it', 'them', 'him', 'her', 'me', 'us', 'you', 'this', 'that', 'these',
+                'those', 'one'}
+
+
+def _en_strip_placeholders(words):
+    out = []
+    for x in words:
+        lx = x.lower().replace('\u2019', "'")
+        if lx in EN_PLACEHOLDERS or (lx.endswith("'s") and lx[:-2] in EN_PLACEHOLDERS):
+            continue
+        out.append(x)
+    return out
+
+
+def english_candidates(c, word):
+    """Lookup candidates and truncations for English input, likeliest first.
+    One word: its base forms (and without its hyphen). Several: the phrase,
+    without hyphens, with its first word in base form (gave up -> give up),
+    with the object splitting a phrasal verb read as something / somebody,
+    then dropped (look it up -> look something up -> look up), and
+    without pronouns (gave her heart to him -> give heart to). Truncations
+    drop words from the end, longest first (give up smoking -> give up ->
+    give); the caller tries them in the primary dict only (user 10-31)."""
+    words = word.split()
+    if len(words) < 2:
+        cands = get_english_base_forms(word)
+        if '-' in word.strip('-'):
+            cands.append(word.replace('-', ''))     # e-mail -> email
+        return cands, []
+    firsts = get_english_base_forms(words[0])
+    for r in c.execute("SELECT target FROM aliases WHERE lang = 'en' AND alias = ?",
+                       (_norm_key(words[0]),)).fetchall():
+        if r['target'] not in firsts:
+            firsts.append(r['target'])             # gave -> give, took -> take
+    rest = words[1:]
+    cands = [word]
+    if '-' in word:
+        cands.append(word.replace('-', ''))
+    cands += [' '.join([f] + rest) for f in firsts[1:]]
+    if len(words) >= 3:
+        mid = [x for x in words[1:-1] if x.lower() not in EN_SPLITTERS]
+        if len(mid) < len(words) - 2:
+            # look it up -> look something up (looking things up), then look up
+            for fill in ('something', 'somebody'):
+                filled = [fill if x.lower() in EN_SPLITTERS else x for x in words[1:-1]]
+                cands += [' '.join([f] + filled + [words[-1]]) for f in firsts]
+            cands += [' '.join([f] + mid + [words[-1]]) for f in firsts]
+    for f in firsts:
+        kept = _en_strip_placeholders([f] + rest)
+        if 2 <= len(kept) < len(words):
+            cands.append(' '.join(kept))
+    truncs = []
+    for n in range(len(words) - 1, 0, -1):
+        truncs += [' '.join([f] + words[1:n]) for f in firsts]
+    return cands, truncs
+
+
 def search_dict(word):
     result = {
         "spell": word,
@@ -4437,17 +4864,20 @@ def search_dict(word):
             candidates = [word, _to_simp(word)]
             _add_truncs(word, _to_simp)
         else:
-            candidates = get_english_base_forms(word)
+            candidates, trunc_forms = english_candidates(c, word)
         cands = []
+        spelled_of = {}       # English: each key's candidate as read, spaces kept
         for w in candidates:
             n = _norm_key(w)
             if n and n not in cands:
                 cands.append(n)
+                spelled_of[n] = ' '.join(w.replace('\u2019', "'").lower().split())
         truncs = []
         for w in trunc_forms:
             n = _norm_key(w)
             if n and n not in cands and n not in truncs:
                 truncs.append(n)
+                spelled_of[n] = ' '.join(w.replace('\u2019', "'").lower().split())
 
         # OCR-confusion variants: lookalike chars swapped in the raw word.
         # Lower trust than cands: content-bearing exact hits only, tried
@@ -4488,13 +4918,18 @@ def search_dict(word):
         # pull in another language; empty hits never block the chain.
         row = None
         empty_hit = None
+        en = lang == 'en'
+        row_alts = []         # English: the runner-up of a headword / inflection pair
         for dic in order:
             for w in cands:
-                r = _lookup_one(c, dic, lang, w)
+                alts = [] if en else None
+                r = _lookup_one(c, dic, lang, w, alts,
+                                spelled_of.get(w) if en else None)
                 if r is None:
                     continue
                 if r['definition']:
                     row = r
+                    row_alts = alts or []
                     break
                 if empty_hit is None:
                     empty_hit = r
@@ -4516,7 +4951,8 @@ def search_dict(word):
             # partial-match rescue: truncated prefixes, PRIMARY dict only,
             # content-bearing hits only
             for w in truncs:
-                r = _lookup_one(c, order[0], lang, w)
+                r = _lookup_one(c, order[0], lang, w, None,
+                                spelled_of.get(w) if en else None)
                 if r is not None and r['definition']:
                     row = r
                     break
@@ -4547,6 +4983,11 @@ def search_dict(word):
             seen.add(r["spell"])
             seen_text.add(r["definition"])
             fuzzy_entries.append(r)
+
+        # English: the other half of a headword / inflection pair (saw: see
+        # or the tool) is listed first, right below the main hit
+        for r in row_alts:
+            _take_fuzzy(r)
 
         # same-key siblings come first: はし is 端 AND 橋 AND 箸 AND 嘴 in
         # one dict, but only the first became the main hit and the prefix
@@ -6002,6 +6443,7 @@ def on_src_lang_changed(index):
     if new_lang != config.get('src_lang', SRC_LANGS[0]):
         update_config('src_lang', new_lang)
         start_dict()
+        start_ocr_allowed()
 
 
 def on_dst_lang_changed(index):
@@ -6201,11 +6643,13 @@ def toggle_to_main():
     if window.stack.currentIndex() != 0:
         window.stack.setCurrentIndex(0)
         window.settings_btn.setChecked(False)
+        sync_capture_affinity()     # the main page: out of captures again
 
 
 def toggle_to_setting():
     window.stack.setCurrentIndex(1)
     window.settings_btn.setChecked(True)
+    sync_capture_affinity()         # screenshot tools may take this page
 
     def re_elide():
         # re-fit the anki path to the button's current width
@@ -6800,30 +7244,102 @@ def anki_create_deck():
 
 
 def anki_create_model():
-    ANKI_MODEL_VERSION = 6
-    FRONT_TEMPLATE = r"""<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
+    ANKI_MODEL_VERSION = 13
+    FRONT_TEMPLATE = r"""<div id="apHead">
+<div id="spellText" class="ap-big">{{spell}}</div>
+<div id="pronLine" class="ap-small"><span id="pron">{{pron}}</span></div>
+</div>
 <script>
-   // A lone space inside spell is stray (OCR, hand edits). A run of two
-   // or more is deliberate, so leave those alone. Walk text nodes only:
-   // the field can carry html, and touching innerHTML would eat spaces
-   // inside tags. fromCharCode(160) instead of an escape, since
-   // backslashes do not survive the trip through Python and AnkiConnect.
+   // Spaces in spell / pron (user 11-02). Next to kana or kanji a lone
+   // space is stray (OCR, hand edits) and goes; a run of two or more is
+   // deliberate and stays. Anywhere else (English, IPA) a lone space is a
+   // word gap and stays, and a run of two or more becomes one space.
+   // Walk text nodes only: these fields can carry html, and touching
+   // innerHTML would eat spaces inside tags. fromCharCode instead of
+   // escapes, since backslashes do not survive the trip through Python
+   // and AnkiConnect.
    (function () {
-       var SP = new RegExp('[ ' + String.fromCharCode(160) + ']+', 'g');
-       function strip(node) {
+       var C = String.fromCharCode;
+       var SP = new RegExp('[ ' + C(160) + ']+', 'g');
+       // kana, kanji, CJK punctuation and full-width forms
+       var CJK = new RegExp('[' + C(0x3000) + '-' + C(0x30ff) + C(0x31f0) + '-' + C(0x31ff) +
+           C(0x3400) + '-' + C(0x4dbf) + C(0x4e00) + '-' + C(0x9fff) + C(0xff00) + '-' + C(0xffef) + ']');
+       function texts(node, out) {
            for (var n = node.firstChild; n; n = n.nextSibling) {
-               if (n.nodeType === 3) {
-                   n.nodeValue = n.nodeValue.replace(SP, function (m) {
-                       return m.length === 1 ? '' : m;
-                   });
-               } else if (n.nodeType === 1) {
-                   strip(n);
-               }
+               if (n.nodeType === 3) out.push(n);
+               else if (n.nodeType === 1) texts(n, out);
            }
+           return out;
        }
-       var el = document.getElementById('spellText');
-       if (el) strip(el);
+       function tidy(el) {
+           // a run's neighbours may sit in the text next door (<b>pick</b> up)
+           var list = texts(el, []);
+           list.forEach(function (n, k) {
+               var v = n.nodeValue;
+               var before = k > 0 ? list[k - 1].nodeValue : '';
+               var after = k + 1 < list.length ? list[k + 1].nodeValue : '';
+               n.nodeValue = v.replace(SP, function (m, i) {
+                   var a = i > 0 ? v.charAt(i - 1) : before.charAt(before.length - 1);
+                   var b = i + m.length < v.length ? v.charAt(i + m.length) : after.charAt(0);
+                   if (CJK.test(a) || CJK.test(b)) return m.length === 1 ? '' : m;
+                   return m.length === 1 ? m : ' ';
+               });
+           });
+       }
+       ['spellText', 'pron'].forEach(function (id) {
+           var el = document.getElementById(id);
+           if (el) tidy(el);
+       });
    })();
+</script>
+<script>
+   // iPhone: class the card's sound as media playback, so the ring/silent
+   // switch no longer mutes Web Audio (iOS 16.4+; a no-op elsewhere). Must
+   // run before any AudioContext is made
+   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+   // Card settings (10-31): one set for every ACard card, kept in this
+   // device's localStorage (it does not sync). The Settings button at the
+   // bottom of the back edits it
+   window._apSettings = function () {
+       var s = {};
+       try { s = JSON.parse(localStorage.getItem('acard-settings')) || {}; } catch (e) {}
+       // never picked: Chinese only when the system's own language is Chinese
+       var lang = (s.lang === 'zh' || s.lang === 'en') ? s.lang
+           : (/^zh/i.test(navigator.language || '') ? 'zh' : 'en');
+       var all = ['spell', 'pron', 'sound', 'picture', 'meaning'];
+       return {
+           lang: lang,
+           front: ['spell', 'pron', 'both'].indexOf(s.front) >= 0 ? s.front
+               : (lang === 'zh' ? 'spell' : 'pron'),
+           back: Array.isArray(s.back)
+               ? s.back.filter(function (k) { return all.indexOf(k) >= 0; }) : all
+       };
+   };
+   window._apSaveSettings = function (patch) {
+       var s = {};
+       try { s = JSON.parse(localStorage.getItem('acard-settings')) || {}; } catch (e) {}
+       for (var k in patch) s[k] = patch[k];
+       try { localStorage.setItem('acard-settings', JSON.stringify(s)); } catch (e) {}
+   };
+   // what the front shows goes on top and the back keeps that order, so
+   // a flip moves nothing. A note without a reading shows its word
+   window._apHead = function (isFront) {
+       var spell = document.getElementById('spellText');
+       var pron = document.getElementById('pronLine');
+       if (!spell || !pron) return 'spell';
+       var has = function (el) { return el.textContent.trim() !== ''; };
+       var mode = window._apSettings().front;
+       if (mode !== 'spell' && !has(pron)) mode = 'spell';
+       if (mode === 'spell' && !has(spell) && has(pron)) mode = 'pron';
+       var top = mode === 'pron' ? pron : spell;
+       var second = mode === 'pron' ? spell : pron;
+       top.parentNode.insertBefore(top, top.parentNode.firstChild);
+       top.className = 'ap-big';
+       second.className = 'ap-small';
+       if (isFront) second.style.display = mode === 'both' ? '' : 'none';
+       return mode;
+   };
+   window._apHead(true);
 </script>
 <script>
    // Purpose of this script: (1) stop ongoing audio from previous card (2) clean up memory from previous card (3) preload back side because it is heavy
@@ -6920,6 +7436,12 @@ def anki_create_model():
            window._apSeqNext = null;
            window._apReloadAudio = null;
            window._apRenderImage = null;
+           window._apSeqStart = null;
+           window._apReveal = null;
+           window._apApplyBack = null;
+           // a settings panel the back left open goes with that card
+           var _apSet = document.getElementById('apSetWrap');
+           if (_apSet) _apSet.parentNode.removeChild(_apSet);
        } catch (e) {}
        // Invalidate every pending callback (timers/rAF/promise chains)
        // left behind by previous cards: they compare their captured
@@ -7062,6 +7584,137 @@ window._apCfg = {
     warmupProbeTries: 3,        /* extra clock probes before rebuilding */
     warmupTries: 5              /* rebuilds before giving up */
 };
+</script>
+<i id="apCover" style="display:none"></i>
+<script>
+   // iPhone: class the card's sound as media playback, so the ring/silent
+   // switch no longer mutes Web Audio (iOS 16.4+; a no-op elsewhere). Must
+   // run before any AudioContext is made
+   try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+   // Card settings (10-31): one set for every ACard card, kept in this
+   // device's localStorage (it does not sync). The Settings button at the
+   // bottom of the back edits it
+   window._apSettings = function () {
+       var s = {};
+       try { s = JSON.parse(localStorage.getItem('acard-settings')) || {}; } catch (e) {}
+       // never picked: Chinese only when the system's own language is Chinese
+       var lang = (s.lang === 'zh' || s.lang === 'en') ? s.lang
+           : (/^zh/i.test(navigator.language || '') ? 'zh' : 'en');
+       var all = ['spell', 'pron', 'sound', 'picture', 'meaning'];
+       return {
+           lang: lang,
+           front: ['spell', 'pron', 'both'].indexOf(s.front) >= 0 ? s.front
+               : (lang === 'zh' ? 'spell' : 'pron'),
+           back: Array.isArray(s.back)
+               ? s.back.filter(function (k) { return all.indexOf(k) >= 0; }) : all
+       };
+   };
+   window._apSaveSettings = function (patch) {
+       var s = {};
+       try { s = JSON.parse(localStorage.getItem('acard-settings')) || {}; } catch (e) {}
+       for (var k in patch) s[k] = patch[k];
+       try { localStorage.setItem('acard-settings', JSON.stringify(s)); } catch (e) {}
+   };
+   // what the front shows goes on top and the back keeps that order, so
+   // a flip moves nothing. A note without a reading shows its word
+   window._apHead = function (isFront) {
+       var spell = document.getElementById('spellText');
+       var pron = document.getElementById('pronLine');
+       if (!spell || !pron) return 'spell';
+       var has = function (el) { return el.textContent.trim() !== ''; };
+       var mode = window._apSettings().front;
+       if (mode !== 'spell' && !has(pron)) mode = 'spell';
+       if (mode === 'spell' && !has(spell) && has(pron)) mode = 'pron';
+       var top = mode === 'pron' ? pron : spell;
+       var second = mode === 'pron' ? spell : pron;
+       top.parentNode.insertBefore(top, top.parentNode.firstChild);
+       top.className = 'ap-big';
+       second.className = 'ap-small';
+       if (isFront) second.style.display = mode === 'both' ? '' : 'none';
+       return mode;
+   };
+   // the card's own words in both languages; which one is a card setting
+   (function () {
+       var LF = String.fromCharCode(10);
+       window._apI18n = {
+           en: {
+               settings: 'Card settings', settingsBtn: 'Settings', language: 'Language',
+               front: 'Front shows', word: 'Word', pron: 'Pronunciation',
+               both: 'Word + pronunciation', backFirst: 'Back shows at first',
+               sound: 'Sound', picture: 'Picture', meaning: 'Meaning',
+               backHint: 'Unchecked parts start covered: tap any grey box to show them all. Without Sound nothing plays until then, or until you tap the picture',
+               tapShow: 'Tap to show', audioTime: 'Audio time',
+               copyTime: 'Copy Audio Time', importTime: 'Import Audio Time', close: 'Close',
+               exportHelp: '<div style="text-align:center;margin-bottom:6px">Manually sync audio time to another device</div>1. Copy below text<br>2. Click "Edit" in Anki<br>3. Paste to field "time"<br>4. Sync this device<br>5. Sync another device<br>6. On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"',
+               timeEmpty: 'field "time" is empty' + LF + 'sync another device first, then open the same note',
+               importDone: 'Import complete, {n} records updated', error: 'Error: ',
+               imgFail: 'Failed to load image', audioFail: 'Failed to load audio',
+               checkSync: 'Check if sync is finished'
+           },
+           zh: {
+               settings: '卡片设置', settingsBtn: '设置', language: '语言',
+               front: '正面显示', word: '单词', pron: '读音',
+               both: '单词和读音', backFirst: '背面先显示',
+               sound: '声音', picture: '图片', meaning: '意思',
+               backHint: '没选的先盖住，点任意灰块全部显示。没选声音时不自动播放，揭开或点图片时再播',
+               tapShow: '点击显示', audioTime: '音频时间',
+               copyTime: '复制音频时间', importTime: '导入音频时间', close: '关闭',
+               exportHelp: '<div style="text-align:center;margin-bottom:6px">手动复制音频时间到另一设备</div>1.复制以下文本<br>2.点击Anki的"编辑"<br>3.找到"time"字段并黏贴<br>4.同步本设备<br>5.同步另一设备<br>6.在另一设备打开 <span style="text-decoration:underline">同一词条</span> 并点击"导入音频时间"',
+               timeEmpty: 'time字段为空' + LF + '先同步另一设备，再打开同一词条',
+               importDone: '导入完成，更新了 {n} 条记录', error: '解析失败：',
+               imgFail: '图片获取失败', audioFail: '音频获取失败',
+               checkSync: '检查同步是否完成'
+           }
+       };
+       window._apT = function (key) {
+           var I = window._apI18n, L = I[window._apSettings().lang] || I.en;
+           return L[key] != null ? L[key] : (I.en[key] != null ? I.en[key] : key);
+       };
+   })();
+   // which fields have content, filled in by Anki when it renders the card
+   window._apHas = {
+       spell: false{{#spell}} || true{{/spell}},
+       pron: false{{#pron}} || true{{/pron}},
+       meaning: false{{#definition}} || true{{/definition}}{{#fuzzy}} || true{{/fuzzy}}
+   };
+   // what the back covers at first (user 10-31), decided HERE, before any
+   // of it is parsed: a hidden marker goes in front of the card, and the
+   // styling covers the blocks after it by the marker's classes. Nothing
+   // covered can show for a frame, however the page gets painted
+   window._apCoverFlags = function () {
+       var S = window._apSettings(), has = window._apHas;
+       var mode = S.front;
+       if (mode !== 'spell' && !has.pron) mode = 'spell';    // as _apHead decides
+       if (mode === 'spell' && !has.spell && has.pron) mode = 'pron';
+       var shown = (mode === 'both' ? ['spell', 'pron'] : [mode]).concat(S.back);
+       return ['spell', 'pron', 'picture', 'meaning'].filter(function (k) {
+           return shown.indexOf(k) < 0 && (k === 'picture' || has[k]);
+       });
+   };
+   window._apSetCover = function (flags) {
+       var mark = document.getElementById('apCover');
+       if (!mark) return;
+       mark.className = flags.map(function (k) { return 'c-' + k; }).join(' ') +
+           (flags.length ? ' covered' : '');
+       window._apVeiled = flags.length > 0;
+   };
+   (function () {
+       // a settings panel the card before left open (answered by key, or
+       // by the app's own buttons) goes with that card
+       var old = document.getElementById('apSetWrap');
+       if (old) old.parentNode.removeChild(old);
+       // the marker: an empty <i> the template puts right before this
+       // script, so every block it covers comes after it
+       var mark = document.getElementById('apCover');
+       if (mark) {
+           mark.parentNode.style.setProperty('--ap-veil', JSON.stringify(window._apT('tapShow')));
+           window._apSetCover(window._apCoverFlags());
+       }
+       // sound not among what the back shows first: it waits for the rest.
+       // Read where the player below would start playing; a reveal, or the
+       // first tap on the card, lets it go
+       window._apHoldAudio = window._apSettings().back.indexOf('sound') < 0;
+   })();
 </script>
 <div id="apTagsBack" style="display:none">{{Tags}}</div>
 <script>
@@ -7349,31 +8002,52 @@ window._apCfg = {
     window._apCap = function () { return caps[window._apCur] || {}; };
 })();
 </script>
-<div id="spellText" style="font-size: min(48px, 8vh)">{{spell}}</div>
+<div id="apHead">
+<div id="spellText" class="ap-big">{{spell}}</div>
+<div id="pronLine" class="ap-small"><span id="pron">{{pron}}</span></div>
+</div>
+<script>window._apHead(false);</script>
 <div style="font-size: 20px">
-<span id="pron">{{pron}}</span>
 <script>
-   // A lone space inside spell/pron is stray (OCR, hand edits). A run of
-   // two or more is deliberate, so leave those alone. Walk text nodes
-   // only: these fields can carry html, and touching innerHTML would eat
-   // spaces inside tags. fromCharCode(160) instead of an escape, since
-   // backslashes do not survive the trip through Python and AnkiConnect.
+   // Spaces in spell / pron (user 11-02). Next to kana or kanji a lone
+   // space is stray (OCR, hand edits) and goes; a run of two or more is
+   // deliberate and stays. Anywhere else (English, IPA) a lone space is a
+   // word gap and stays, and a run of two or more becomes one space.
+   // Walk text nodes only: these fields can carry html, and touching
+   // innerHTML would eat spaces inside tags. fromCharCode instead of
+   // escapes, since backslashes do not survive the trip through Python
+   // and AnkiConnect.
    (function () {
-       var SP = new RegExp('[ ' + String.fromCharCode(160) + ']+', 'g');
-       function strip(node) {
+       var C = String.fromCharCode;
+       var SP = new RegExp('[ ' + C(160) + ']+', 'g');
+       // kana, kanji, CJK punctuation and full-width forms
+       var CJK = new RegExp('[' + C(0x3000) + '-' + C(0x30ff) + C(0x31f0) + '-' + C(0x31ff) +
+           C(0x3400) + '-' + C(0x4dbf) + C(0x4e00) + '-' + C(0x9fff) + C(0xff00) + '-' + C(0xffef) + ']');
+       function texts(node, out) {
            for (var n = node.firstChild; n; n = n.nextSibling) {
-               if (n.nodeType === 3) {
-                   n.nodeValue = n.nodeValue.replace(SP, function (m) {
-                       return m.length === 1 ? '' : m;
-                   });
-               } else if (n.nodeType === 1) {
-                   strip(n);
-               }
+               if (n.nodeType === 3) out.push(n);
+               else if (n.nodeType === 1) texts(n, out);
            }
+           return out;
+       }
+       function tidy(el) {
+           // a run's neighbours may sit in the text next door (<b>pick</b> up)
+           var list = texts(el, []);
+           list.forEach(function (n, k) {
+               var v = n.nodeValue;
+               var before = k > 0 ? list[k - 1].nodeValue : '';
+               var after = k + 1 < list.length ? list[k + 1].nodeValue : '';
+               n.nodeValue = v.replace(SP, function (m, i) {
+                   var a = i > 0 ? v.charAt(i - 1) : before.charAt(before.length - 1);
+                   var b = i + m.length < v.length ? v.charAt(i + m.length) : after.charAt(0);
+                   if (CJK.test(a) || CJK.test(b)) return m.length === 1 ? '' : m;
+                   return m.length === 1 ? m : ' ';
+               });
+           });
        }
        ['spellText', 'pron'].forEach(function (id) {
            var el = document.getElementById(id);
-           if (el) strip(el);
+           if (el) tidy(el);
        });
    })();
 </script>
@@ -7506,8 +8180,8 @@ window._apCfg = {
              function showImgError() {
                  // the image file is not on this device yet (sync not finished):
                  // say so in the card's language, instead of the app's broken image
-                 fallback.innerHTML = '<div style="color:#c00">Failed to load image' +
-                     '<br>Check if sync is finished</div>';
+                 fallback.innerHTML = '<div style="color:#c00">' + window._apT('imgFail') +
+                     '<br>' + window._apT('checkSync') + '</div>';
              }
              if (fbImg) {
              if (fbImg.complete) {
@@ -8224,7 +8898,8 @@ window._apCfg = {
                   } else {
                   drawWaveform(decoded);
                   }
-                  if (_apSkipPlay) { _apSkipPlay = false; } else { playRangeInternal(); }
+                  // held while the sound is covered (window._apHoldAudio)
+                  if (_apSkipPlay || window._apHoldAudio) { _apSkipPlay = false; } else { playRangeInternal(); }
               }
               const cached = window.top._apCache && window.top._apCache[filename];
               if (cached) {
@@ -8241,8 +8916,8 @@ window._apCfg = {
                   .then(onDecoded)
                   .catch((err) => {
                   document.querySelector(".ap-wrap").innerHTML =
-                      '<div style="color:#c00">Failed to load audio'+
-                      '<br>Check if sync is finished</div>';
+                      '<div style="color:#c00">' + window._apT('audioFail') +
+                      '<br>' + window._apT('checkSync') + '</div>';
                   console.log("Audio load failed:", err);
                   });
           }
@@ -8460,7 +9135,7 @@ window._apCfg = {
    </div>
    </div>
 </div>
-<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 70px; width: fit-content; margin: 14px auto">
+<div id="apSearchRow" style="display: grid; grid-template-columns: 1fr 1fr; gap: 70px; width: fit-content; margin: 14px auto">
    <span id="etymSpell" style="display: none">{{spell}}</span>
    <a
       id="dictBtn"
@@ -8499,10 +9174,6 @@ window._apCfg = {
    Origin
    </a>
 </div>
-<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; width: fit-content; margin: 0 auto">
-   <button onclick="exportRanges()">Copy Audio Time</button>
-   <button onclick="importRanges()">Import Audio Time</button>
-</div>
 <div id="apTimeField" style="display:none">{{time}}</div>
 <script>
    function exportRanges() {
@@ -8538,10 +9209,10 @@ window._apCfg = {
    // and the copy callout work fine on plain text.
    ta.style.cssText = 'width:80%;height:3em;font-size:16px;background:white;color:black;padding:8px;overflow:auto;word-break:break-all;-webkit-user-select:text;user-select:text;';
    var label = document.createElement('div');
-   label.innerHTML = '<div style="text-align:center;margin-bottom:6px">Manually sync audio time to another device</div>1. Copy below text<br>2. Click "Edit" in Anki<br>3. Paste to field "time"<br>4. Sync this device<br>5. Sync another device<br>6. On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"'
+   label.innerHTML = window._apT('exportHelp');
    label.style.cssText = 'color:white;margin-bottom:8px;font-size:14px;text-align:left;';
        var btn = document.createElement('button');
-       btn.textContent = 'Close';
+       btn.textContent = window._apT('close');
        btn.style.cssText = 'margin-top:16px;padding:8px 24px;font-size:16px;';
        btn.onclick = function() {
            div.parentNode.removeChild(div);
@@ -8575,8 +9246,7 @@ window._apCfg = {
        .split(_CR).join('')
        .trim();
        if (!json) {
-           alert(`field "time" is empty
-   sync another device first, then open the same note`);
+           alert(window._apT('timeEmpty'));
            return;
        }
        try {
@@ -8598,9 +9268,9 @@ window._apCfg = {
                localStorage.setItem(key, JSON.stringify(data[key]));
                count++;
            }
-           alert('Import complete,  ' + count + ' records updated');
+           alert(window._apT('importDone').replace('{n}', count));
        } catch(e) {
-           alert('Error: ' + e.message);
+           alert(window._apT('error') + e.message);
        }
    }
 
@@ -8912,11 +9582,187 @@ window._apCfg = {
         seqOn = false;
         if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
     };
-    // card shown = the sequence starts from the anchor page
-    window._apSeqArm();
-    maybeTimerAdvance();
+    // card shown = the sequence starts from the anchor page; with the sound
+    // covered it starts once the rest is shown (window._apReveal)
+    window._apSeqStart = function () {
+        if (_apMyGen !== window.top._apGen) return;
+        window._apSeqArm();
+        maybeTimerAdvance();
+    };
+    if (!window._apHoldAudio) window._apSeqStart();
 })();
-</script>"""
+</script>
+<div id="apSetOpen"></div>
+<script>
+(function () {
+    // ---- what the back shows first, the rest covered (user 10-31) ----
+    var ORDER = ['spell', 'pron', 'sound', 'picture', 'meaning'];
+    // the block each cover flag hides (styling: #apCover.c-<name> ~ ...).
+    // The picture's column holds its waveform and page bar too
+    var BLOCK = { spell: '#spellText', pron: '#pronLine', picture: '#left-col', meaning: '#text-wrap' };
+    function onFront(mode) { return mode === 'both' ? ['spell', 'pron'] : [mode]; }
+    function coveredBlock(el) {
+        var mark = document.getElementById('apCover');
+        if (!mark || !window._apVeiled || !el.closest) return null;
+        for (var k in BLOCK) {
+            if (mark.classList.contains('c-' + k) && el.closest(BLOCK[k])) return k;
+        }
+        return null;
+    }
+    function releaseAudio() {
+        if (!window._apHoldAudio) return;
+        window._apHoldAudio = false;
+        if (window._apSeqStart) window._apSeqStart();   // several captures: the sequence
+        if (window.playRange) window.playRange();       // plays once decoded if not yet
+    }
+    function relabel() {
+        var mark = document.getElementById('apCover');
+        if (mark) mark.parentNode.style.setProperty('--ap-veil', JSON.stringify(window._apT('tapShow')));
+        var open = document.getElementById('apSetOpen');
+        if (open && open.lastChild) open.lastChild.textContent = window._apT('settingsBtn');
+    }
+    // meaning covered: its grey reaches the bottom of the screen at least,
+    // however short the text under it is. The block keeps its own size (the
+    // page gets no longer, nothing below it moves); only the grey drawn on
+    // top of it goes further down, and CSS does that from --ap-veil-top,
+    // the block's place on the page - the one thing measured here
+    function fitVeil() {
+        var w = document.getElementById('text-wrap');
+        if (!w) return;
+        var top = w.getBoundingClientRect().top + (window.pageYOffset || 0);
+        w.style.setProperty('--ap-veil-top', Math.round(top) + 'px');
+    }
+    window._apApplyBack = function () {
+        window._apHead(false);
+        window._apSetCover(window._apCoverFlags());
+        relabel();
+        fitVeil();
+        if (window._apSettings().back.indexOf('sound') >= 0) releaseAudio();
+    };
+    window._apReveal = function () {
+        window._apSetCover([]);
+        fitVeil();
+        releaseAudio();
+    };
+    // a tap on any grey box shows everything; caught before the block's own
+    // handlers (the picture plays on a tap) and before Anki's tap gestures
+    function onTap(e) {
+        var t = e.target;
+        if (!t || t.nodeType !== 1) return;
+        if (coveredBlock(t)) {
+            e.stopPropagation();
+            if (e.type === 'click') {
+                e.preventDefault();
+                window._apReveal();
+            }
+            return;
+        }
+        // no grey box: the first tap on the card ends a held sound, so the
+        // tap's own action (the picture plays, a page turn plays) runs
+        if (e.type === 'click' && window._apHoldAudio && !t.closest('#apSetWrap, #apSetOpen')) {
+            window._apHoldAudio = false;
+        }
+    }
+    if (!window.top._apListeners) window.top._apListeners = [];
+    // the block moves whenever something above it changes size: the
+    // picture's frame is sized by script once the picture is known (no
+    // event tells), the head re-wraps, the window turns. Watch those two
+    if (window.top._apVeilWatch) window.top._apVeilWatch.disconnect();
+    window.top._apVeilWatch = null;
+    if (typeof ResizeObserver === 'function') {
+        window.top._apVeilWatch = new ResizeObserver(fitVeil);
+        ['apHead', 'left-col'].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el) window.top._apVeilWatch.observe(el);
+        });
+    }
+    window.addEventListener('resize', fitVeil);
+    window.top._apListeners.push({ target: window, type: 'resize', fn: fitVeil });
+    // where nothing can be watched, look again a few times
+    [300, 1200, 3000].forEach(function (ms) { setTimeout(fitVeil, ms); });
+    ['click', 'pointerdown', 'mousedown', 'touchstart'].forEach(function (type) {
+        document.addEventListener(type, onTap, true);
+        // removed by the next card's front, like the player's listeners
+        window.top._apListeners.push({ target: document, type: type, fn: onTap, opts: true });
+    });
+
+    // ---- the settings, behind a button at the very bottom of the back ----
+    // its place: an empty div the template puts right before this script
+    var open = document.getElementById('apSetOpen');
+    if (open) open.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg><span></span>';
+    if (open) open.onclick = openSettings;
+    window._apApplyBack();
+
+    function openSettings() {
+        if (document.getElementById('apSetWrap')) return;
+        var wrap = document.createElement('div');
+        wrap.id = 'apSetWrap';
+        // modal: taps stay here, never reach the card or Anki behind it
+        ['click', 'dblclick', 'mousedown', 'mouseup', 'pointerdown', 'pointerup',
+         'touchstart', 'touchmove', 'touchend'].forEach(function (ev) {
+            wrap.addEventListener(ev, function (e) {
+                e.stopPropagation();
+                if (e.type === 'click' && e.target === wrap) close();
+            });
+        });
+        function close() {
+            if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
+        }
+        function seg(name, opts, cur) {
+            return '<div class="ap-seg">' + opts.map(function (o) {
+                return '<button data-' + name + '="' + o[0] + '" class="' +
+                    (o[0] === cur ? 'on' : '') + '">' + o[1] + '</button>';
+            }).join('') + '</div>';
+        }
+        function render() {
+            var S = window._apSettings(), T = window._apT;
+            var fixed = onFront(S.front);
+            var label = { spell: T('word'), pron: T('pron'), sound: T('sound'),
+                          picture: T('picture'), meaning: T('meaning') };
+            // what the front shows is always on the back: not offered
+            var chips = ORDER.filter(function (k) { return fixed.indexOf(k) < 0; }).map(function (k) {
+                return '<button class="ap-chip' + (S.back.indexOf(k) >= 0 ? ' on' : '') +
+                    '" data-back="' + k + '">' + label[k] + '</button>';
+            }).join('');
+            wrap.innerHTML = '<div class="ap-set">' +
+                '<div class="ap-set-title">' + T('settings') +
+                '<span class="ap-set-x" data-close="1">×</span></div>' +
+                '<div class="ap-set-lab">' + T('language') + '</div>' +
+                seg('lang', [['en', 'English'], ['zh', '中文']], S.lang) +
+                '<div class="ap-set-lab">' + T('front') + '</div>' +
+                seg('front', [['spell', T('word')], ['pron', T('pron')], ['both', T('both')]], S.front) +
+                '<div class="ap-set-lab">' + T('backFirst') + '</div>' +
+                '<div class="ap-chips">' + chips + '</div>' +
+                '<div class="ap-set-hint">' + T('backHint') + '</div>' +
+                '<div class="ap-set-lab">' + T('audioTime') + '</div>' +
+                '<div class="ap-set-btns"><button data-act="export">' + T('copyTime') +
+                '</button><button data-act="import">' + T('importTime') + '</button></div>' +
+                '<button class="ap-set-close" data-close="1">' + T('close') + '</button>' +
+                '</div>';
+            var bs = wrap.querySelectorAll('button, .ap-set-x');
+            for (var i = 0; i < bs.length; i++) bs[i].onclick = onButton;
+        }
+        function onButton(e) {
+            var b = e.currentTarget, d = b.dataset, S = window._apSettings();
+            if (d.close) { close(); return; }
+            if (d.act === 'export') { exportRanges(); return; }
+            if (d.act === 'import') { importRanges(); return; }
+            if (d.lang) window._apSaveSettings({ lang: d.lang });
+            if (d.front) window._apSaveSettings({ front: d.front });
+            if (d.back) {
+                var list = S.back.slice(), at = list.indexOf(d.back);
+                if (at >= 0) list.splice(at, 1); else list.push(d.back);
+                window._apSaveSettings({ back: list });
+            }
+            render();
+            window._apApplyBack();      // the card behind follows at once
+        }
+        render();
+        document.documentElement.appendChild(wrap);
+    }
+})();
+</script>
+"""
     CSS = r"""img {
   max-width: 100%;
   height: auto;
@@ -9082,32 +9928,266 @@ body.landscape #text-wrap {
 
 .ap-handle-end:active .ap-handle-visual {
   border-right: 1px solid #0b57c4;
-}"""
+}
+
+/* ---- head: whatever the front shows is on top, big (10-31) ---- */
+.ap-big {
+  font-size: min(48px, 8vh);
+}
+
+.ap-small {
+  font-size: 20px;
+}
+
+/* ---- covered blocks (10-31). The back's first script puts the hidden
+   marker #apCover in front of the card before any block is parsed; its
+   classes name the blocks to cover. Layout kept, content hidden, a grey
+   box on top, labelled from --ap-veil (set by that script) ---- */
+#apCover.c-spell ~ #apHead #spellText,
+#apCover.c-pron ~ #apHead #pronLine,
+#apCover.c-picture ~ * #left-col,
+#apCover.c-meaning ~ * #text-wrap {
+  position: relative;
+  visibility: hidden;
+  cursor: pointer;
+}
+
+#apCover.c-spell ~ #apHead #spellText *,
+#apCover.c-pron ~ #apHead #pronLine *,
+#apCover.c-picture ~ * #left-col *,
+#apCover.c-meaning ~ * #text-wrap * {
+  visibility: hidden !important;
+}
+
+#apCover.c-spell ~ #apHead #spellText::after,
+#apCover.c-pron ~ #apHead #pronLine::after,
+#apCover.c-picture ~ * #left-col::after,
+#apCover.c-meaning ~ * #text-wrap::after {
+  content: var(--ap-veil);
+  visibility: visible;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #e5e7eb;
+  color: #6b7280;
+  border-radius: 8px;
+  font: 15px/1.2 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+#apCover.c-spell ~ #apHead #spellText::after,
+#apCover.c-pron ~ #apHead #pronLine::after {
+  left: 50%;
+  right: auto;
+  width: min(100%, 12em);
+  transform: translateX(-50%);
+}
+
+/* the lookups come once everything is out */
+#apCover.covered ~ #apSearchRow,
+#apCover.covered ~ #apSetOpen {
+  display: none !important;
+}
+
+/* meaning covered: its grey is as wide as the card and reaches the bottom
+   of the screen at least. The block is not made taller - only its grey is,
+   from --ap-veil-top (where the block starts on the page, kept up to date
+   by the script) - so the page gets no longer and never scrolls for it */
+#apCover.c-meaning ~ * #text-wrap {
+  width: auto !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  align-self: stretch;
+}
+
+#apCover.c-meaning ~ * #text-wrap::after {
+  bottom: auto;
+  /* the label a fixed way below the top, not in the middle: the height
+     below changes once the script has measured, and a centred label
+     jumped with it */
+  align-items: flex-start;
+  padding-top: 80px;
+  box-sizing: border-box;
+  /* not measured yet (the page can be painted before the script at the
+     end has run): a full screen high - too long for a moment, never a
+     short box that then grows */
+  height: max(100%, calc(100vh + var(--ap-veil-more, 0px) - var(--ap-veil-top, 0px)));
+  height: max(100%, calc(100dvh + var(--ap-veil-more, 0px) - var(--ap-veil-top, 0px)));
+}
+
+/* AnkiMobile keeps a strip at the bottom of the card area for its gear
+   button. The strip is outside the page: nothing can be drawn in it and a
+   tap there reaches nothing, unless the page is that much longer. So on
+   AnkiMobile only (the classes Anki sets there), the grey goes this far
+   below the bottom of the screen; while the meaning is covered the card
+   can then be pushed up by as much */
+.iphone #text-wrap,
+.ipad #text-wrap {
+  --ap-veil-more: 40px;
+}
+
+/* ---- settings ---- */
+#apSetOpen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: fit-content;
+  margin: 22px auto 12px;
+  padding: 6px 14px;
+  border: 1px solid #d1d5db;
+  border-radius: 9px;
+  color: #6b7280;
+  font: 14px/1.2 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  cursor: pointer;
+}
+
+#apSetOpen svg {
+  fill: currentColor;
+}
+
+#apSetWrap {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 9998;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  box-sizing: border-box;
+  padding: calc(env(safe-area-inset-top) + 6vh) 12px 12px;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.ap-set {
+  width: min(420px, 100%);
+  max-height: 86vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 16px 18px 14px;
+  border-radius: 14px;
+  background: #fff;
+  color: #111827;
+  text-align: left;
+  font: 15px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+
+/* desktop Anki styles every <button> (margin, radius, shadow, min-width):
+   undo it here, each kind of button below sets its own look */
+.ap-set button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  margin: 0;
+  min-width: 0;
+  box-sizing: border-box;
+  box-shadow: none;
+  border-radius: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.ap-set-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.ap-set-x {
+  padding: 0 6px;
+  font-size: 22px;
+  color: #9ca3af;
+  cursor: pointer;
+}
+
+.ap-set-lab {
+  margin: 14px 0 6px;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.ap-seg {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid #d1d5db;
+  border-radius: 9px;
+}
+
+.ap-seg button {
+  flex: 1;
+  padding: 8px 4px;
+  border: 0;
+  background: transparent;
+}
+
+.ap-seg button + button {
+  border-left: 1px solid #d1d5db;
+}
+
+.ap-seg button.on {
+  background: #4f46e5;
+  color: #fff;
+}
+
+.ap-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ap-set .ap-chip {
+  padding: 6px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 16px;
+  background: transparent;
+}
+
+.ap-chip.on {
+  border-color: #4f46e5;
+  background: #eef2ff;
+  color: #3730a3;
+}
+
+.ap-set-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.ap-set-btns {
+  display: flex;
+  gap: 10px;
+}
+
+.ap-set .ap-set-btns button,
+.ap-set .ap-set-close {
+  flex: 1;
+  padding: 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 9px;
+  background: #f9fafb;
+}
+
+.ap-set .ap-set-close {
+  display: block;
+  width: 100%;
+  margin-top: 18px;
+}
+"""
     FRONT_TEMPLATE = FRONT_TEMPLATE.strip('\n')
     BACK_TEMPLATE = BACK_TEMPLATE.strip('\n')
     CSS = CSS.strip('\n')
-
-    if ui_index == 1:
-        SYNC_UI = (
-            ('field "time" is empty', 'time字段为空'),
-            ('sync another device first, then open the same note',
-             '先同步另一设备，再打开同一词条'),
-            ('Import complete, ', '导入完成，更新了'),
-            ('records updated', '条记录'),
-            ('Error: ', '解析失败：'),
-            ('<div style="text-align:center;margin-bottom:6px">Manually sync audio time to another device</div>1. Copy below text<br>2. Click "Edit" in Anki<br>3. Paste to field "time"<br>4. Sync this device<br>5. Sync another device<br>6. On another device, open <span style="text-decoration:underline">the same note</span> and click "Import Audio Time"',
-             '<div style="text-align:center;margin-bottom:6px">手动复制音频时间到另一设备</div>1.复制以下文本<br>2.点击Anki的"编辑"<br>3.找到"time"字段并黏贴<br>4.同步本设备<br>5.同步另一设备<br>6.在另一设备打开 <span style="text-decoration:underline">同一词条</span> 并点击"导入音频时间"'
-             ),
-            ('Copy Audio Time', '复制音频时间'),
-            ('Import Audio Time', '导入音频时间'),
-            ('Close', '关闭'),
-            ('Failed to load audio', '音频获取失败'),
-            ('Failed to load image', '图片获取失败'),
-            ('Check if sync is finished', '检查同步是否完成'),
-        )
-
-        for en, zh in SYNC_UI:
-            BACK_TEMPLATE = BACK_TEMPLATE.replace(en, zh)
 
     need_update_config = False
 
@@ -9280,13 +10360,13 @@ def anki_current_model_hash():
     return hashlib.md5(model_data.encode()).hexdigest()
 
 
-def ttt(label=""):  # test need delete
+def ttt(label="", note=""):  # test need delete
     global _last_time
     now = time.time()
     if _last_time is not None:
-        print(f"[{label}] {now - _last_time:.3f}s")
+        print(f"[{label}] {now - _last_time:.3f}s {note}")
     else:
-        print(f"[{label}] start")
+        print(f"[{label}] start {note}")
     _last_time = now
 
 
@@ -9377,7 +10457,10 @@ ui_index = config.get('ui_index', 0)
 repair_config()
 _record_mei_folder()
 threading.Timer(15, _cleanup_old_mei).start()
-app = QApplication(sys.argv)
+# FreeType instead of Windows' GDI for drawing text: the first drawing of a
+# character costs about a quarter as much, which a new word's definition
+# is full of
+app = QApplication(sys.argv + ['-platform', 'windows:fontengine=freetype'])
 app.setQuitOnLastWindowClosed(False)
 
 
@@ -9690,6 +10773,18 @@ dll.OcrDetect.argtypes = (OcrHandle, CvMat, c_int32, DetectCallback,
 dll.OcrDetect.restype = None
 dll.OcrDestroy.argtypes = (OcrHandle, )
 dll.OcrDestroy.restype = None
+# rebuilt CVUtils.dll (OcrApiVersion >= 2): every character comes with its
+# score and runner-ups, and the output can be limited to allowed characters.
+# With the older DLL these do not exist and OCR_API stays 1.
+OCR_API = dll.OcrApiVersion() if hasattr(dll, 'OcrApiVersion') else 1
+DetectCallback2 = CFUNCTYPE(None, c_float, c_float, c_float, c_float, c_float,
+                            c_float, c_float, c_float, c_char_p, c_char_p)
+if OCR_API >= 2:
+    dll.OcrDetect2.argtypes = (OcrHandle, CvMat, c_int32, DetectCallback2,
+                               ErrorCallback)
+    dll.OcrDetect2.restype = None
+    dll.OcrSetAllowed.argtypes = (OcrHandle, c_void_p, c_int)
+    dll.OcrSetAllowed.restype = c_int
 # for mp3 test put to warm up
 _bass_code_cast = native_dll.bass_code_cast
 _bass_code_cast_CB = CFUNCTYPE(None, POINTER(c_char), c_size_t)
@@ -9707,6 +10802,7 @@ ocr, on_error = init_ocr(
     os.path.join(BASE, 'rec.onnx'),
     os.path.join(BASE, 'dict.txt'),
 )
+start_ocr_allowed()
 
 
 class MainWindow(QMainWindow):
@@ -9767,6 +10863,24 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         on_quit()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # a button keeps counting as under the mouse while its window is
+        # hidden until Qt gets the mouse's leave, and a window hidden right
+        # after a click can miss it: delete, then a click outside while the
+        # GUI thread is still loading the previous card (10-29). The hover
+        # colour then shows on the next showing - the red delete button.
+        # Drop every hover the cursor is not over; Qt sets real ones itself
+        pos = QCursor.pos()
+        stale = [w for w in self.findChildren(QWidget)
+                 if w.underMouse() and not w.rect().contains(w.mapFromGlobal(pos))]
+        for w in stale:
+            QApplication.sendEvent(w, QEvent(QEvent.Leave))
+            w.update()
+        if stale:
+            print('[ui] stale hover cleared: '
+                  + ', '.join(w.objectName() or type(w).__name__ for w in stale))
 
     def hideEvent(self, event):
         super().hideEvent(event)
